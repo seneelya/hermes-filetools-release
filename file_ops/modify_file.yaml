@@ -1,0 +1,29 @@
+# Source: prototype SCHEMA_MOC__patch_tool.py, TRIMMED per decision Q6 (2026-08-23):
+# the multi-file V4A branch is CUT — parameters `mode` and `patch` removed, the
+# "PATCH MODE …" description block dropped. The tool = exact find/replace in ONE file.
+name: patch
+description: >
+  Targeted find-and-replace edits in a single file. Use this instead of
+  sed/awk in terminal. Find an exact string and replace it; returns the
+  resolved path and replacement count.
+
+  REQUIRED PARAMETERS: path, old_string, new_string.
+required: [path, old_string, new_string]
+properties:
+  path:
+    type: string
+    description: File path to edit.
+  old_string:
+    type: string
+    description: >
+      Exact text to find and replace. Must be unique in the file unless
+      replace_all=true. Include surrounding context lines to ensure uniqueness.
+  new_string:
+    type: string
+    description: >
+      Changed replacement text; it must differ from old_string. Pass empty
+      string '' to delete the matched text.
+  replace_all:
+    type: boolean
+    description: "Replace all occurrences instead of requiring a unique match (default: false)"
+    default: false

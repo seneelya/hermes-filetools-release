@@ -1,0 +1,28 @@
+# Source: prototype SCHEMA_MOC__write_file_tool.py, description originally copied
+# verbatim from core's write_file. Corrected 2026-08-24 after live-agent testing
+# caught it promising capabilities create_file_core.py doesn't have: no
+# verified:true field (no hash check), no auto syntax-check. Also dropped
+# cross_profile: it advertised a "cross-profile soft guard" that create_file_core.py
+# never implemented and __init__.py's handler never read - the parameter did
+# nothing, misleadingly implying protection that doesn't exist.
+name: write_file
+description: >
+  Write content to a file, completely replacing existing content. 
+  Use this instead of terminal. Creates parent directories automatically.
+  OVERWRITES the entire file — use 'patch' for targeted edits.
+required: [path, content]
+properties:
+  path:
+    type: string
+    description: >
+      Path to the file to write (will be created if it doesn't exist,
+      overwritten if it does)
+  content:
+    type: string
+    description: Complete content to write to the file
+
+
+#OLD
+#  Write content to a file, completely replacing existing content. Use this
+#  instead of echo/cat heredoc in terminal. Creates parent directories
+#  automatically. OVERWRITES the entire file — use 'patch' for targeted edits.

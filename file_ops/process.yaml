@@ -1,0 +1,63 @@
+# process — override of Hermes' own built-in `process` tool. This YAML is OUR
+# OWN copy of their PROCESS_SCHEMA (tools/process_registry.py:3239 in
+# hermes-agent), taken deliberately so we can diverge from upstream's wording
+# without waiting on/tracking their changes (Plan03 decision, 2026-09-01,
+# applied here by Plan04 task 5).
+#
+# A copy is worth having HERE, unlike for execute_code: nothing in
+# model_tools.py rebuilds this schema per session (verified 2026-09-02 - only
+# execute_code and the two discord tools get that treatment), so our wording
+# actually reaches the model. Edited from upstream only where it describes OUR
+# output instead of their JSON.
+#
+# The process management itself is NOT reimplemented - process_core.py calls
+# their live _handle_process() and reformats only the returned string.
+# Upstream renamed this tool `process` -> `process_manage` (afc3d9d34, commit
+# e16ad33a9). This is their CURRENT name, but the value here does not decide:
+# register() resolves the name from their LIVE registry
+# (__init__.py::_upstream_name), so the plugin still shadows correctly on a
+# Hermes older than that rename. Shadowing a name upstream no longer uses fails
+# silently - ours becomes a parallel plugin tool and gets deferred behind the
+# tool_search bridge instead of replacing anything.
+name: process_manage
+description: >
+  Manage background processes started with terminal(background=true).
+  Actions: 'list' (show all), 'poll' (check status + new output),
+  'log' (full output with pagination), 'wait' (block until done or timeout),
+  'kill' (terminate), 'write' (send raw stdin data without newline),
+  'submit' (send data + Enter, for answering prompts), 'close' (close
+  stdin/send EOF).
+
+
+  Response is plain text, not JSON — labeled lines (Status:, Session id:,
+  Command:, Exit code:, ...) above the process's own output, separated by
+  ○○○. 'list' puts one process per line below the separator.
+required: [action]
+properties:
+  action:
+    type: string
+    enum: [list, poll, log, wait, kill, write, submit, close]
+    description: Action to perform on background processes
+  session_id:
+    type: string
+    description: >
+      Process session ID (from terminal background output). Required for all
+      actions except 'list'. A unique ID prefix works too (e.g. 'proc_4dae'
+      or just '4dae' for proc_4dae56ca81f6).
+  data:
+    type: string
+    description: Text to send to process stdin (for 'write' and 'submit' actions)
+  timeout:
+    type: integer
+    description: >
+      Max seconds to block for 'wait' action. Returns partial output on
+      timeout. A wait window elapsing is NOT an error — the response says so
+      in its Note: line.
+    minimum: 1
+  offset:
+    type: integer
+    description: "Line offset for 'log' action (default: last 200 lines)"
+  limit:
+    type: integer
+    description: Max lines to return for 'log' action
+    minimum: 1

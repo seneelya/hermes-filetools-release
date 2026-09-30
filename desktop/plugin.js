@@ -1,0 +1,9075 @@
+// desktop/src/adapter.js
+import * as sdk from "@hermes/plugin-sdk";
+
+// desktop/src/core-format.js
+var KIND_TONE = { ok: "good", "no-change": "muted", error: "bad" };
+var CAPTION_MAX_LINES = 2;
+var CAPTION_MAX_CHARS = 180;
+function interimCaption(text) {
+  if (typeof text !== "string") return "";
+  const lines = stripThink(text).split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  if (lines.length === 0) return "";
+  let out = lines.slice(0, CAPTION_MAX_LINES).join(" ");
+  if (out.length > CAPTION_MAX_CHARS) out = out.slice(0, CAPTION_MAX_CHARS - 1).trimEnd() + "\u2026";
+  return out;
+}
+function stripThink(text) {
+  if (typeof text !== "string") return "";
+  return text.replace(/<think>[\s\S]*?<\/think>/g, " ").replace(/<think>[\s\S]*$/g, " ");
+}
+function boxOf(action) {
+  const label = action && typeof action.label === "string" ? action.label : "";
+  const verb = label.split(" ")[0] || "";
+  if (!verb) return "";
+  let sharing = 0;
+  for (const key of Object.keys(CONTEXT_ACTIONS)) {
+    const other = CONTEXT_ACTIONS[key].label || "";
+    if (other.split(" ")[0] === verb) sharing += 1;
+  }
+  return sharing > 1 ? label : verb;
+}
+function tokensLabel(tokens) {
+  const n2 = typeof tokens === "number" && isFinite(tokens) ? Math.max(0, Math.round(tokens)) : 0;
+  if (n2 < 1e3) return String(n2);
+  if (n2 < 1e4) return `${(n2 / 1e3).toFixed(1).replace(/\.0$/, "")}k`;
+  return `${Math.round(n2 / 1e3)}k`;
+}
+var READ_STATE_TONE = {
+  verbatim: "good",
+  // строка всё ещё держит наши байты
+  compacted: "warn",
+  // строку переписала ИХ компакция
+  removed_from_context: "bad",
+  // человек убрал операцию из контекста: содержимого НОЛЬ
+  evicted: "bad",
+  // строки в активном окне больше нет
+  unknown: "muted"
+  // сопоставить не удалось — и мы этого НЕ скрываем
+};
+var READ_STATE_LABEL = {
+  verbatim: "verbatim",
+  compacted: "compacted",
+  // Ровно то слово, что стоит в заголовке строки, и ровно в том же виде. Русский перевод
+  // рядом с английским токеном давал двуязычную кашу («удалено из контекста — removed from
+  // the context by a human») — владелец 2026-09-09: «статус — removed from context! точка».
+  // Здесь единственное место во всём словаре, где подпись НЕ по-русски, и это не
+  // небрежность: остальные состояния — наши слова о чужом факте, а это слово ЗАПИСАНО в
+  // строке, которую читает модель, и расходиться с ней нельзя.
+  removed_from_context: "removed from context",
+  evicted: "evicted",
+  unknown: "unmatched"
+};
+function formatWhen(ts) {
+  const ms = typeof ts === "number" && isFinite(ts) ? ts * 1e3 : NaN;
+  if (!isFinite(ms)) return "";
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return "";
+  const p = (n2) => String(n2).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function formatDuration(sec) {
+  if (typeof sec !== "number" || !isFinite(sec) || sec < 0) return "";
+  if (sec < 10) return `${sec.toFixed(2)}s`;
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  const m = Math.floor(sec / 60);
+  return `${m}m ${Math.round(sec - m * 60)}s`;
+}
+
+// desktop/src/format-vocab.js
+var FORMAT_DEFAULTS = Object.freeze({
+  block_symbol: "\u25A0",
+  anchor_symbol: "\u2693",
+  separator_symbol: "\u25CB",
+  comment_fallback: "\u25C6",
+  header_separator: "\u25CB\u25CB\u25CB",
+  block_open: "\u25A0BLOCK",
+  block_close: "\u25A0END"
+});
+var HEADER_WORDS = Object.freeze(["File:", "Size:", "Modified:", "Encoding:", "FileTag:"]);
+var vocab = { ...FORMAT_DEFAULTS };
+var cache = null;
+function escapeRe(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function applyFormatting(formatting) {
+  const src = formatting && typeof formatting === "object" ? formatting : {};
+  const next = {};
+  for (const key of Object.keys(FORMAT_DEFAULTS)) {
+    const value = src[key];
+    next[key] = typeof value === "string" && value !== "" ? value : FORMAT_DEFAULTS[key];
+  }
+  vocab = next;
+  cache = null;
+  return vocab;
+}
+function formatVocab() {
+  return vocab;
+}
+function blockOpen() {
+  return vocab.block_open;
+}
+function built() {
+  if (cache) return cache;
+  const block = escapeRe(vocab.block_open);
+  const end = escapeRe(vocab.block_close);
+  const anchor = escapeRe(vocab.anchor_symbol);
+  const sep = escapeRe(vocab.header_separator);
+  const hash = escapeRe(vocab.comment_fallback);
+  const words = HEADER_WORDS.map(escapeRe).join("|");
+  cache = {
+    // Маркер может быть голым или обёрнутым: в markdown его прячут в HTML-комментарий, в
+    // JS/Python — за `//` или `#`, у файлов без известного комментария — за `comment_fallback`.
+    // Тег между маркером и телом (`■BLOCK x0a :`) не мешает — матчим только НАЧАЛО строки.
+    own: new RegExp(`^\\s*(\u2192\\s*)?(<!--\\s*)?(\\/\\/\\s*|#\\s*|${hash}\\s*)?(${block}(?!\\w)|${end}(?!\\w)|${anchor}|${sep}|${words})`),
+    separator: new RegExp(sep),
+    blockTag: new RegExp(`${block}\\s*(x[0-9a-fA-F]{2,4})\\s*:`)
+  };
+  return cache;
+}
+function ownMarkerRe() {
+  return built().own;
+}
+function separatorRe() {
+  return built().separator;
+}
+function blockTagRe() {
+  return built().blockTag;
+}
+
+// desktop/src/core.js
+var OUR_TOOLS = [
+  "read_file",
+  "write_file",
+  "patch",
+  "search_files",
+  "terminal",
+  "execute_code",
+  "vision_analyze"
+];
+var COMMAND_TOOLS = ["terminal", "execute_code"];
+function isCommandTool(name) {
+  return COMMAND_TOOLS.includes(name);
+}
+function isOurTool(name) {
+  return typeof name === "string" && OUR_TOOLS.includes(name);
+}
+function coerceBody(result) {
+  if (result == null) return "";
+  if (typeof result === "string") return result;
+  try {
+    return JSON.stringify(result, null, 2);
+  } catch {
+    return String(result);
+  }
+}
+function asRecord(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+}
+function brickTitles(tool, args) {
+  const a = asRecord(args) || {};
+  const path = typeof a.path === "string" && a.path ? a.path : "";
+  switch (tool) {
+    case "read_file": {
+      const parts = [];
+      if (Number.isFinite(a.line) && a.line > 1) parts.push(`line ${a.line}`);
+      if (Number.isFinite(a.count) && a.count !== 2e3) parts.push(`+${a.count}`);
+      return { title: path || "read", subtitle: parts.join(", ") };
+    }
+    case "write_file": {
+      const insert = a.insert_line === void 0 ? null : Number.isFinite(a.insert_line) ? a.insert_line : String(a.insert_line);
+      let subtitle;
+      if (insert == null || insert === 0) subtitle = "overwrite";
+      else if (insert === -1) subtitle = "append @ end";
+      else subtitle = `insert @ line ${insert}`;
+      return { title: path || "write", subtitle };
+    }
+    case "patch": {
+      const subtitle = Number.isFinite(a.line) && a.line > 0 ? `@ line ${a.line}` : "";
+      return { title: path || "patch", subtitle };
+    }
+    case "search_files": {
+      const pattern = typeof a.pattern === "string" && a.pattern ? `pattern "${a.pattern}"` : "";
+      const glob = typeof a.glob === "string" && a.glob && a.glob !== "*" ? ` \xB7 ${a.glob}` : "";
+      return { title: path || "search", subtitle: pattern + glob };
+    }
+    case "terminal": {
+      const cmd = typeof a.command === "string" ? a.command.replace(/\s*\n\s*/g, " \u23CE ").trim() : "";
+      const workdir = typeof a.workdir === "string" && a.workdir ? a.workdir : "";
+      return { title: cmd || "terminal", subtitle: workdir };
+    }
+    case "execute_code": {
+      const code = typeof a.code === "string" ? a.code : "";
+      const lines = code.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+      const first = lines.find((l) => !/^(import|from)\s/.test(l)) || lines[0] || "";
+      const subtitle = lines.length > 1 ? `${lines.length} lines` : "";
+      return { title: first || "execute_code", subtitle };
+    }
+    case "vision_analyze": {
+      const src = typeof a.image_url === "string" ? a.image_url : "";
+      const title = src.startsWith("data:") ? "inline image (data: URL)" : src || "vision_analyze";
+      const q = typeof a.question === "string" ? a.question.replace(/\s*\n\s*/g, " \u23CE ").trim() : "";
+      return { title, subtitle: q };
+    }
+    default:
+      return null;
+  }
+}
+var EXIT_CODE_RE = /^Exit code:\s*(-?\d+)/m;
+var EXIT_CODE_TOOLS = ["terminal", "execute_code"];
+function terminalExitCode(body) {
+  const m = typeof body === "string" ? body.match(EXIT_CODE_RE) : null;
+  return m ? Number(m[1]) : null;
+}
+function kindFromExitCode(body) {
+  const code = terminalExitCode(body);
+  if (code == null) return null;
+  return code === 0 ? "ok" : "error";
+}
+var SUCCESS_RE = /^Success:\s*(True|False)\b/m;
+function kindFromSuccess(body) {
+  const m = typeof body === "string" ? body.match(SUCCESS_RE) : null;
+  if (!m) return null;
+  return m[1] === "True" ? "ok" : "error";
+}
+var OP_RE = /Operation ID:\s*([0-9a-fA-F]{4,}(?:x[0-9a-fA-F]{2,4})?)/;
+function opFromHeader(body) {
+  if (typeof body !== "string") return null;
+  const head = body.split("\n", 4);
+  for (const line of head) {
+    const m = line.match(OP_RE);
+    if (m) return m[1];
+  }
+  return null;
+}
+function toMs(v) {
+  if (!Number.isFinite(v)) return null;
+  v = Number(v);
+  if (v <= 0) return null;
+  return v > 1e12 ? Math.round(v) : Math.round(v * 1e3);
+}
+function buildBrick(event) {
+  const p = asRecord(event && event.payload || {}) || {};
+  const tool = typeof p.name === "string" ? p.name : "";
+  if (!isOurTool(tool)) return null;
+  const rawError = p.error == null || p.error === false ? null : p.error;
+  const isError = rawError != null && (typeof rawError !== "string" || rawError.trim() !== "");
+  const body = coerceBody(p.result);
+  const finalBody = !isError || body !== "" ? body : String(rawError);
+  const { facts, rest } = parseEnvelope(finalBody);
+  const t = brickTitles(tool, asRecord(p.args ?? p.arguments)) || { title: tool, subtitle: "" };
+  return {
+    tool,
+    ts: toMs(p.timestamp) || Date.now(),
+    session_id: event && event.session_id || p.session_id || "",
+    tool_id: typeof p.tool_id === "string" ? p.tool_id : "",
+    title: t.title,
+    subtitle: t.subtitle,
+    body: rest,
+    // У обёрнутых тулов конверта нет, поэтому статус берётся из шапки: у terminal и execute_code
+    // это КОД ВОЗВРАТА, у vision_analyze — строка `Success:`. Ни один из них не выдумывает
+    // состояние: не нашёл своего признака — возвращает null, и мы уходим в общий фолбек, тот же
+    // что у файловых тулов.
+    kind: isError ? "error" : EXIT_CODE_TOOLS.includes(tool) && kindFromExitCode(rest) || tool === "vision_analyze" && kindFromSuccess(rest) || kindFromFacts(facts, rest),
+    meta: {
+      duration_s: Number.isFinite(p.duration_s) ? p.duration_s : null,
+      // Счётчики показываем в подзаголовке: «что именно сделано» без раскрытия карточки.
+      replacements: facts && Number.isFinite(facts.replacements) ? facts.replacements : null,
+      added: facts && Number.isFinite(facts.added) ? facts.added : null,
+      removed: facts && Number.isFinite(facts.removed) ? facts.removed : null,
+      // Адрес, которым человек и модель могут СОСЛАТЬСЯ на этот вызов (Plan09).
+      // null у отказов (адрес не печатается) и у карточек, снятых до его появления.
+      op: opFromHeader(rest)
+    }
+  };
+}
+var LIVE_PREFIX = "_live:";
+function writeKeyFor(storedId, liveKey2, eventSid) {
+  if (storedId) return { key: storedId, liveKey: liveKey2 };
+  if (eventSid) {
+    const next = LIVE_PREFIX + eventSid;
+    return { key: next, liveKey: next };
+  }
+  return { key: liveKey2, liveKey: liveKey2 };
+}
+function viewKeyFor(storedId, liveKey2) {
+  return storedId || liveKey2 || null;
+}
+function isPersistableKey(key) {
+  return typeof key === "string" && key !== "" && !key.startsWith(LIVE_PREFIX);
+}
+function parseEnvelope(body) {
+  if (typeof body !== "string" || body === "" || body[0] !== "{") return { facts: null, rest: body || "" };
+  const nl = body.indexOf("\n");
+  const head = nl === -1 ? body : body.slice(0, nl);
+  try {
+    const facts = JSON.parse(head);
+    if (!facts || typeof facts !== "object" || Array.isArray(facts)) return { facts: null, rest: body };
+    return { facts, rest: nl === -1 ? "" : body.slice(nl + 1) };
+  } catch {
+    return { facts: null, rest: body };
+  }
+}
+function kindFromFacts(facts, body) {
+  const text = typeof body === "string" ? body.replace(/^\s+/, "") : "";
+  if (facts) {
+    if (facts.success === false || facts.error) return "error";
+    if (facts.no_change === true) return "no-change";
+    if (facts.replacements === 0 && facts.added === 0 && facts.removed === 0) return "no-change";
+    return "ok";
+  }
+  return text.startsWith("ERROR") || text.startsWith('{"error"') ? "error" : "ok";
+}
+function normalizeHistoryOp(op) {
+  if (!op || typeof op !== "object") return null;
+  const tool = typeof op.tool === "string" ? op.tool : "";
+  if (!isOurTool(tool)) return null;
+  return {
+    tool,
+    ts: toMs(op.ts) || 0,
+    session_id: typeof op.session_id === "string" ? op.session_id : "",
+    tool_id: typeof op.tool_id === "string" ? op.tool_id : "",
+    title: typeof op.title === "string" && op.title ? op.title : tool,
+    subtitle: typeof op.subtitle === "string" ? op.subtitle : "",
+    body: coerceBody(op.body),
+    kind: op.kind === "error" || op.kind === "no-change" ? op.kind : "ok",
+    meta: Object.assign({ from_history: true }, op.meta && typeof op.meta === "object" ? op.meta : {})
+  };
+}
+function mergeBricks(history, live) {
+  live = (live || []).filter((b) => !isErasedBrick(b));
+  const liveIds = new Set((live || []).map((b) => b && b.tool_id).filter(Boolean));
+  const kept = (history || []).filter((o) => o && (!o.tool_id || !liveIds.has(o.tool_id)));
+  const histMeta = /* @__PURE__ */ new Map();
+  for (const o of history || []) {
+    if (!o || !o.tool_id || !liveIds.has(o.tool_id)) continue;
+    if (!o.meta || typeof o.meta !== "object") continue;
+    const rest = Object.assign({}, o.meta);
+    delete rest.from_history;
+    histMeta.set(o.tool_id, rest);
+  }
+  const merged = (live || []).map((b) => {
+    const extra = b && b.tool_id ? histMeta.get(b.tool_id) : null;
+    if (!extra) return b;
+    return Object.assign({}, b, { meta: Object.assign({}, extra, b.meta || {}) });
+  });
+  const all = kept.concat(merged);
+  all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  return all;
+}
+var CONTEXT_ACTIONS = {
+  content: { mode: "content", label: "drop content" },
+  tool: { mode: "tool", label: "erase tool" },
+  // Уносит ШАГ: реплику модели со всеми её вызовами и ответами. Не полный turn — тот
+  // кончается возвратом управления человеку, и это другое.
+  turn: { mode: "turn", label: "erase turn" }
+};
+var SPREADS_TO_STEP = { turn: true };
+function actionOf(mode) {
+  return CONTEXT_ACTIONS[String(mode || "")] || CONTEXT_ACTIONS.content;
+}
+function stepMates(bricks, op) {
+  const list = Array.isArray(bricks) ? bricks : [];
+  const self = list.find((b) => b && b.meta && b.meta.op === op);
+  if (!self) return [];
+  const key = self.meta.step;
+  if (!key) return [{ op, toolId: self.tool_id || "" }];
+  return list.filter((b) => b && b.meta && b.meta.step === key && b.meta.op).map((b) => ({ op: b.meta.op, toolId: b.tool_id || "" }));
+}
+function opTokens(brick) {
+  const meta = brick && brick.meta || {};
+  if (typeof meta.tokens === "number" && isFinite(meta.tokens) && meta.tokens >= 0) {
+    return { tokens: Math.round(meta.tokens), exact: true };
+  }
+  const body = brick && typeof brick.body === "string" ? brick.body : "";
+  if (!body) return { tokens: 0, exact: false };
+  const bytes = typeof TextEncoder === "function" ? new TextEncoder().encode(body).length : Buffer.byteLength(body, "utf8");
+  return { tokens: Math.ceil(bytes / 4), exact: false };
+}
+function indexReadsByToolId(reads) {
+  const byId = /* @__PURE__ */ new Map();
+  for (const r of reads || []) {
+    if (!r || typeof r !== "object") continue;
+    const id = r.meta && typeof r.meta.tool_call_id === "string" ? r.meta.tool_call_id : "";
+    if (!id) continue;
+    const state = READ_STATE_TONE[r.state] ? r.state : "unknown";
+    const prev = byId.get(id);
+    if (!prev || READ_STATE_RANK[state] > READ_STATE_RANK[prev.state]) {
+      byId.set(id, { state, reason: r.reason || "" });
+    }
+  }
+  return byId;
+}
+var READ_STATE_RANK = {
+  verbatim: 0,
+  unknown: 1,
+  compacted: 2,
+  removed_from_context: 3,
+  evicted: 4
+};
+function attachReadState(bricks, byId) {
+  if (!byId || byId.size === 0) return bricks || [];
+  return (bricks || []).map((b) => {
+    const found = b && b.tool_id ? byId.get(b.tool_id) : null;
+    return found ? Object.assign({}, b, { read: found }) : b;
+  });
+}
+function sessionKey(sessionId) {
+  return "bricks:" + String(sessionId || "");
+}
+function appendBrick(store, sessionId, brick) {
+  const k2 = sessionKey(sessionId);
+  const list = Array.isArray(store[k2]) ? store[k2] : [];
+  list.push(brick);
+  store[k2] = list;
+  return list;
+}
+function readBricks(store, sessionId) {
+  const v = store[sessionKey(sessionId)];
+  return Array.isArray(v) ? v : [];
+}
+function opIsGone(fact) {
+  if (!fact) return false;
+  return fact.missing_row === true || fact.state === ERASED_STATE;
+}
+function ghostOps(contextOps2) {
+  const out = /* @__PURE__ */ new Set();
+  for (const fact of contextOps2 || []) {
+    if (!opIsGone(fact)) continue;
+    const op = typeof fact.op === "string" ? fact.op : "";
+    if (op) out.add(op);
+  }
+  return out;
+}
+var ERASED_STATE = "erased";
+function isErasedBrick(brick) {
+  return !!(brick && brick.meta && brick.meta.state === ERASED_STATE);
+}
+function visibleBricks(bricks, showErased) {
+  const list = Array.isArray(bricks) ? bricks : [];
+  if (showErased) return { bricks: list, hidden: 0 };
+  const kept = list.filter((b) => !isErasedBrick(b));
+  return { bricks: kept, hidden: list.length - kept.length };
+}
+function liveContextOps(contextOps2) {
+  return (contextOps2 || []).filter((fact) => !opIsGone(fact));
+}
+function removeBricksByOp(store, sessionId, ops) {
+  const kill = new Set((ops || []).filter(Boolean).map(String));
+  if (kill.size === 0) return 0;
+  const k2 = sessionKey(sessionId);
+  const list = Array.isArray(store[k2]) ? store[k2] : null;
+  if (!list) return 0;
+  const kept = list.filter((b) => {
+    if (isErasedBrick(b)) return true;
+    const op = b && b.meta && typeof b.meta.op === "string" ? b.meta.op : "";
+    return !op || !kill.has(op);
+  });
+  const gone = list.length - kept.length;
+  if (gone > 0) store[k2] = kept;
+  return gone;
+}
+var SEGMENT_TOOLS = /* @__PURE__ */ new Set(["read_file", "patch", "write_file"]);
+var GONE_STATES = /* @__PURE__ */ new Set(["compacted", "removed_from_context"]);
+var REMOVED_STATE = "removed_from_context";
+var isRemoved = (f) => f && f.state === REMOVED_STATE;
+function segmentKind(op) {
+  if (op.tool === "patch" || op.tool === "write_file") return "patch";
+  return op.nested ? "read_nested" : "read";
+}
+function shadows(op, total) {
+  if (op.tool !== "write_file") return true;
+  const first = op.parts[0];
+  const lastPart = op.parts[op.parts.length - 1];
+  return !!first && first[0] === 1 && lastPart[1] >= total;
+}
+function hasPosition(op) {
+  return (op.from || 0) >= 1 && (op.to || 0) >= (op.from || 0);
+}
+function foldParts(parts, at, delta) {
+  const out = [];
+  for (const [from, to] of parts) {
+    if (from >= at) {
+      out.push([from + delta, to + delta]);
+    } else if (to >= at) {
+      if (delta > 0) {
+        out.push([from, at - 1]);
+        out.push([at + delta, to + delta]);
+      } else {
+        out.push([from, Math.max(from, to + delta)]);
+      }
+    } else {
+      out.push([from, to]);
+    }
+  }
+  return out.filter(([from, to]) => to >= from);
+}
+function buildContextView(ops) {
+  const all = (Array.isArray(ops) ? ops.slice() : []).filter(Boolean).sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  const sorted = all.filter((o) => o.path);
+  const byPath = /* @__PURE__ */ new Map();
+  const desync = [];
+  const order = {};
+  for (const op of all) {
+    if (op.op && !(op.op in order)) order[op.op] = op.seq || 0;
+  }
+  for (const op of sorted) {
+    let file = byPath.get(op.path);
+    if (!file) {
+      file = { path: op.path, name: basename(op.path), total: 0, folded: [] };
+      byPath.set(op.path, file);
+    }
+    const positioned = hasPosition(op);
+    const fullReplace = positioned && !!op.total && op.from === 1 && op.to >= op.total;
+    const delta = fullReplace ? 0 : (op.added || 0) - (op.removed || 0);
+    if (delta !== 0 && positioned) {
+      for (const prev of file.folded) {
+        prev.parts = foldParts(prev.parts, op.from, delta);
+      }
+    }
+    if (op.total) {
+      const implied = file.total + delta;
+      if (file.total && !fullReplace && implied !== op.total) {
+        desync.push({ path: op.path, op: op.op, implied, recorded: op.total });
+      }
+      file.total = op.total;
+    }
+    file.folded.push({
+      // Диапазон — НАБОР кусков, а не одна пара чисел: вставка внутрь прочитанного разрывает его
+      // надвое (см. foldParts). Обычный случай — один кусок.
+      parts: positioned ? [[op.from, op.to]] : [],
+      pos: positioned,
+      op: op.op,
+      tool: op.tool,
+      state: op.state,
+      nested: op.nested
+    });
+  }
+  const files = [];
+  const stale = {};
+  for (const file of byPath.values()) {
+    const drawable = file.folded.filter(
+      (f) => f.pos && SEGMENT_TOOLS.has(f.tool) && !GONE_STATES.has(f.state)
+    );
+    if (!drawable.length && (!file.total || file.folded.every((f) => GONE_STATES.has(f.state)))) continue;
+    const total = file.total || Math.max(1, ...file.folded.flatMap((f) => f.parts.map((p) => p[1])), 1);
+    const last = drawable.length - 1;
+    const segments = drawable.flatMap((f, i) => f.parts.map(([from, to]) => ({
+      from,
+      to,
+      kind: segmentKind(f),
+      rank: last - i,
+      op: f.op,
+      // Зажато в [0, 100]. Без этого сегмент физически вылезал за габариты плитки: при вставке
+      // сложенный диапазон может превысить записанную длину (последней операцией по файлу было
+      // чтение, и `total` остался от неё), а тогда правый край уходит за край бара.
+      pct: [
+        round1(clampPct((from - 1) / total * 100)),
+        round1(clampPct(to / total * 100))
+      ]
+    })));
+    files.push({
+      path: file.path,
+      name: file.name,
+      total,
+      segments,
+      // УДАЛЁННЫХ здесь нет — ни в третьей строке карточки, ни в таблице попапа. Требование
+      // владельца 2026-09-09: «уже на карточку не влияют, но в списке они есть». Плитка
+      // отвечает на вопрос «что модель по этому файлу сейчас видит», а удалённая операция на
+      // него не отвечает ничем: ни сегмента, ни данных. Её дом — стакан, где у неё своя
+      // карточка со своим состоянием.
+      //
+      // `compacted` при этом ОСТАЁТСЯ (поправка 1 к шву): её строка всё ещё занимает контекст
+      // и тратит токены, просто опереться на неё нельзя. Разница не косметическая — одна
+      // операция в контексте есть, другой в нём нет вовсе.
+      op_ids: file.folded.filter((f) => f.op && !isRemoved(f)).map((f) => f.op),
+      // Строки для таблицы в попапе: тул + адрес + диапазон, по КАЖДОЙ операции, что касалась
+      // файла, включая беспозиционные и не попавшие на бар. Поправка 3 к шву (владелец,
+      // 2026-09-07): попапу нужно имя тула на операцию, а `segments` знает только `kind`
+      // (read/patch/read_nested) и покрывает лишь нарисованное.
+      rows: file.folded.filter((f) => f.op && !isRemoved(f)).map((f) => ({
+        op: f.op,
+        tool: f.tool || "",
+        // В таблице показываем ОХВАТ операции — от первой прочитанной строки до последней, даже
+        // если посередине образовался разрыв от вставки. Перечислять куски там значило бы менять
+        // ширину колонки от того, что случилось ПОЗЖЕ; сами куски видны на баре.
+        from: f.parts.length ? f.parts[0][0] : null,
+        to: f.parts.length ? f.parts[f.parts.length - 1][1] : null,
+        nested: !!f.nested,
+        state: f.state || ""
+      }))
+    });
+    for (let i = 0; i < file.folded.length; i++) {
+      const own = file.folded[i];
+      if (!own.op || !own.pos || !SEGMENT_TOOLS.has(own.tool)) continue;
+      const span = own.parts.reduce((n2, [from, to]) => n2 + (to - from + 1), 0);
+      if (!span) continue;
+      const laterRanges = [];
+      for (let j = i + 1; j < file.folded.length; j++) {
+        const later = file.folded[j];
+        if (!later.pos || !shadows(later, total)) continue;
+        for (const [ofrom, oto] of own.parts) {
+          for (const [lfrom, lto] of later.parts) {
+            const lo = Math.max(ofrom, lfrom);
+            const hi = Math.min(oto, lto);
+            if (hi >= lo) laterRanges.push([lo, hi]);
+          }
+        }
+      }
+      stale[own.op] = Math.min(100, Math.round(mergedLength(laterRanges) / span * 100));
+    }
+  }
+  return { files, stale, desync, order };
+}
+function mergedLength(ranges) {
+  if (!ranges.length) return 0;
+  const sortedRanges = ranges.slice().sort((a, b) => a[0] - b[0]);
+  let covered = 0;
+  let [lo, hi] = sortedRanges[0];
+  for (let i = 1; i < sortedRanges.length; i++) {
+    const [a, b] = sortedRanges[i];
+    if (a > hi + 1) {
+      covered += hi - lo + 1;
+      lo = a;
+      hi = b;
+    } else if (b > hi) {
+      hi = b;
+    }
+  }
+  return covered + hi - lo + 1;
+}
+function basename(path) {
+  const parts = String(path || "").split(/[\/]/);
+  return parts[parts.length - 1] || String(path || "");
+}
+function round1(n2) {
+  return Math.round(n2 * 10) / 10;
+}
+function clampPct(n2) {
+  if (!Number.isFinite(n2)) return 0;
+  return Math.min(100, Math.max(0, n2));
+}
+function contextOpsFrom(res) {
+  const r = asRecord(res);
+  if (!r) return { ops: [], note: "the route answered with a non-object" };
+  const ops = (Array.isArray(r.ops) ? r.ops : []).filter((o) => asRecord(o));
+  const err = typeof r.error === "string" ? r.error : "";
+  const note = typeof r.note === "string" ? r.note : "";
+  if (ops.length > 0) return { ops, note: err };
+  return { ops, note: err || note };
+}
+function layoutMessages(carriages, messages) {
+  const facts = /* @__PURE__ */ new Map();
+  const order = [];
+  (Array.isArray(messages) ? messages : []).forEach((m) => {
+    const f = asRecord(m);
+    if (!f) return;
+    const address = String(f.msg || "");
+    order.push({ address, fact: f });
+    if (address && !facts.has(address)) facts.set(address, f);
+  });
+  const seen = /* @__PURE__ */ new Set();
+  const rows = [];
+  (Array.isArray(carriages) ? carriages : []).forEach((c, ci) => {
+    const car = asRecord(c);
+    if (!car) return;
+    const steps = Array.isArray(car.steps) ? car.steps : [];
+    const foreign = new Set((Array.isArray(car.foreign) ? car.foreign : []).map(String));
+    const unrecorded = new Set((Array.isArray(car.unrecorded) ? car.unrecorded : []).map(String));
+    const opener = car.opener ? String(car.opener) : "";
+    rows.push({
+      kind: "carriage",
+      key: `car-${ci}`,
+      index: ci + 1,
+      opener,
+      count: steps.reduce((n2, s) => n2 + (Array.isArray(s) ? s.length : 0), 0)
+    });
+    let stepNo = 0;
+    steps.forEach((step, si) => {
+      const members = (Array.isArray(step) ? step : []).map(String);
+      const isOpener = members.length === 1 && members[0] === opener && opener;
+      if (!isOpener) {
+        stepNo += 1;
+        rows.push({
+          kind: "step",
+          key: `car-${ci}-step-${si}`,
+          index: stepNo,
+          count: members.length
+        });
+      }
+      members.forEach((address) => {
+        seen.add(address);
+        rows.push({
+          kind: "msg",
+          key: `msg-${address || `${ci}-${si}-${rows.length}`}`,
+          address,
+          opener: address === opener && !!opener,
+          foreign: foreign.has(address),
+          unrecorded: unrecorded.has(address),
+          fact: facts.get(address) || { msg: address }
+        });
+      });
+    });
+  });
+  const orphans = order.filter((o) => !o.address || !seen.has(o.address));
+  orphans.forEach((o, i) => {
+    rows.push({
+      kind: "orphan",
+      key: `orphan-${o.address || i}`,
+      address: o.address,
+      foreign: false,
+      unrecorded: false,
+      fact: o.fact
+    });
+  });
+  return { rows, placed: seen.size, orphans: orphans.length };
+}
+function shouldRefetchOnStatus(event) {
+  const e = asRecord(event);
+  const p = asRecord(e && e.payload) || {};
+  return p.kind === "compacted";
+}
+function sameMessages(cur, res) {
+  const a = asRecord(cur) || {};
+  const b = asRecord(res) || {};
+  const msgs = (x) => Array.isArray(x.messages) ? x.messages : [];
+  const cars = (x) => Array.isArray(x.carriages) ? x.carriages : [];
+  if (msgs(a).length !== msgs(b).length || cars(a).length !== cars(b).length) return false;
+  return JSON.stringify([msgs(a), cars(a)]) === JSON.stringify([msgs(b), cars(b)]);
+}
+
+// desktop/src/adapter.js
+var CONTENT_MODE = CONTEXT_ACTIONS.content.mode;
+var ACTION_MODES = Object.keys(CONTEXT_ACTIONS);
+function makeAtom(initial) {
+  const mk = typeof sdk.atom === "function" ? sdk.atom : null;
+  if (mk) return mk(initial);
+  let cur = initial;
+  return { get: () => cur, set: (x) => {
+    cur = x;
+  }, listen: () => () => {
+  } };
+}
+var VIEW_INITIAL = {
+  sessionId: null,
+  bricks: [],
+  note: "",
+  mode: "mirror",
+  showErased: false
+};
+var $view = makeAtom(VIEW_INITIAL);
+function useView() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($view) || VIEW_INITIAL;
+}
+function setShowErased(on) {
+  const cur = $view.get() || VIEW_INITIAL;
+  $view.set(Object.assign({}, cur, { showErased: !!on }));
+}
+var $fileContext = makeAtom({ ops: [], selectedOp: null });
+function useFileContext() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($fileContext) || { ops: [], selectedOp: null };
+}
+var DROP_INITIAL = {
+  open: false,
+  mode: false,
+  action: CONTENT_MODE,
+  picked: {},
+  busy: false,
+  note: "",
+  ok: null
+};
+var $drop = makeAtom(DROP_INITIAL);
+function useDrop() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($drop) || DROP_INITIAL;
+}
+var COMPACT_INITIAL = {
+  open: false,
+  mode: false,
+  picked: {},
+  dragging: false,
+  dragMode: null,
+  confirming: false,
+  busy: false,
+  note: "",
+  ok: null
+};
+var $compact = makeAtom(COMPACT_INITIAL);
+function useCompact() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($compact) || COMPACT_INITIAL;
+}
+var RUN_INITIAL = { running: false, sid: "" };
+var $compactRun = makeAtom(RUN_INITIAL);
+function useCompactRun() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($compactRun) || RUN_INITIAL;
+}
+function pollCompactRun(sid) {
+  const prev = $compactRun.get() || RUN_INITIAL;
+  if (prev.sid !== sid) $compactRun.set(Object.assign({}, RUN_INITIAL, { sid }));
+  adapter.rest(`/context-compact-status?session=${encodeURIComponent(sid)}`).then((res) => {
+    if (viewKey() !== sid) return;
+    const r = res && typeof res === "object" ? res : {};
+    const cur = $compactRun.get() || RUN_INITIAL;
+    if (!r.running && !cur.running) return;
+    const doneAt = !r.running && cur.running ? Date.now() : 0;
+    $compactRun.set(Object.assign({}, r, { sid, doneAt }));
+  }).catch(() => {
+  });
+}
+var memStore = /* @__PURE__ */ Object.create(null);
+var hydrated = /* @__PURE__ */ new Set();
+var adapter = { hasEvents: false, state: null, storageGet: () => Promise.resolve(void 0), storageSet: () => {
+}, onDispose: () => {
+} };
+function createAdapter(ctx) {
+  const h = sdk && typeof sdk === "object" ? sdk.host : void 0;
+  return {
+    // feature-detect двери (таск п.9): новые двери проверять через typeof host.X === 'function'.
+    hasEvents: !!(h && typeof h.onEvent === "function"),
+    state: h && h.state && typeof h.state === "object" ? h.state : null,
+    storageGet(key) {
+      try {
+        const s = ctx && ctx.storage;
+        if (!s || typeof s.get !== "function") return Promise.resolve(void 0);
+        return Promise.resolve(s.get(key));
+      } catch {
+        return Promise.resolve(void 0);
+      }
+    },
+    storageSet(key, value) {
+      try {
+        const s = ctx && ctx.storage;
+        if (!s || typeof s.set !== "function") return;
+        const r = s.set(key, value);
+        if (r && typeof r.catch === "function") r.catch(() => {
+        });
+      } catch {
+      }
+    },
+    hasRest: !!(ctx && typeof ctx.rest === "function"),
+    // `opts` прокидывается насквозь: их `ctx.rest(path, {method, body})` это умеет
+    // (`api/plugins.ts::PluginRestOptions`), а наша обёртка второй аргумент раньше теряла —
+    // и записать что-либо с панели было нечем. Не передан — обычный GET, как и было.
+    rest(path, opts) {
+      try {
+        if (!ctx || typeof ctx.rest !== "function") return Promise.reject(new Error("ctx.rest \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D"));
+        return Promise.resolve(opts === void 0 ? ctx.rest(path) : ctx.rest(path, opts));
+      } catch (err) {
+        return Promise.reject(err);
+      }
+    },
+    // Живой близнец `rest` (Plan11-Task06, дверь из Recon19): вебсокет в наше же пространство,
+    // JSON-фреймы в колбэк, авто-реконнект и disposer — всё на их стороне.
+    // ВАЖНО: на OAuth-развёртывании их реализация резолвится в НО-ОП (`api/plugins.ts:106`), и
+    // комментарий к типу говорит прямо — «accelerator over your polling, never a replacement».
+    // Поэтому ни одна ветка UI не вправе зависеть от того, приехал ли фрейм; несущий путь — HTTP.
+    hasSocket: !!(ctx && typeof ctx.socket === "function"),
+    socket(path, onMessage) {
+      try {
+        if (!ctx || typeof ctx.socket !== "function") return () => {
+        };
+        const off = ctx.socket(path, onMessage);
+        return typeof off === "function" ? off : () => {
+        };
+      } catch {
+        return () => {
+        };
+      }
+    },
+    onDispose(fn) {
+      try {
+        ctx && typeof ctx.onDispose === "function" && ctx.onDispose(fn);
+      } catch {
+      }
+    }
+  };
+}
+function initAdapter(ctx) {
+  adapter = createAdapter(ctx);
+  historyFetched.clear();
+  readsFetched.clear();
+  contextFetched.clear();
+  return adapter;
+}
+function hasEvents() {
+  return adapter.hasEvents;
+}
+function hasRest() {
+  return adapter.hasRest;
+}
+function loadConfig() {
+  return adapter.rest("/config").then((data) => {
+    if (data && !data.error) applyFormatting(data.formatting);
+    return data;
+  });
+}
+function saveConfig(patch) {
+  return adapter.rest("/config", { method: "POST", body: patch }).then((data) => {
+    if (data && !data.error) applyFormatting(data.formatting);
+    return data;
+  });
+}
+function reloadPlugin() {
+  return adapter.rest("/config-reload", { method: "POST" });
+}
+function checkSeams(full) {
+  return full ? adapter.rest("/seams-check?tests=1", { timeoutMs: 12e5 }) : adapter.rest("/seams-check");
+}
+var STORED_SESSION_ATOM = "focusedStoredSessionId";
+function storedSessionId() {
+  const a = adapter.state && adapter.state[STORED_SESSION_ATOM];
+  if (a && typeof a.get === "function") {
+    const v = a.get();
+    if (typeof v === "string" && v !== "") return v;
+  }
+  return null;
+}
+var liveKey = null;
+function writeKey(eventSid) {
+  const r = writeKeyFor(storedSessionId(), liveKey, eventSid);
+  liveKey = r.liveKey;
+  return r.key;
+}
+function viewKey() {
+  return viewKeyFor(storedSessionId(), liveKey);
+}
+var historyFetched = /* @__PURE__ */ new Set();
+var historyNote = {};
+var readsFetched = /* @__PURE__ */ new Set();
+var readsBySession = {};
+var readsIndex = {};
+function ensureReads(sid) {
+  if (!isPersistableKey(sid) || readsFetched.has(sid)) return;
+  readsFetched.add(sid);
+  if (!adapter.hasRest) return;
+  adapter.rest(`/reads?session=${encodeURIComponent(sid)}`).then((res) => {
+    readsBySession[sid] = res && Array.isArray(res.reads) ? res.reads : [];
+    readsIndex[sid] = indexReadsByToolId(readsBySession[sid]);
+    refresh();
+  }).catch(() => {
+    readsBySession[sid] = [];
+    refresh();
+  });
+}
+var contextFetched = /* @__PURE__ */ new Set();
+var contextOps = {};
+var NO_OPS = [];
+var CONTEXT_REFETCH_MS = 300;
+var contextTimer = null;
+function ensureContextState(sid) {
+  if (!isPersistableKey(sid) || contextFetched.has(sid)) return;
+  contextFetched.add(sid);
+  if (!adapter.hasRest) return;
+  adapter.rest(`/context-state?session=${encodeURIComponent(sid)}`).then((res) => {
+    const { ops, note } = contextOpsFrom(res);
+    contextOps[sid] = ops;
+    if (note) console.info("[hermes-filetools] /context-state:", note);
+    dropGhostBricks(sid, ops);
+    publishFileContext(sid);
+  }).catch((err) => {
+    contextOps[sid] = NO_OPS;
+    console.warn("[hermes-filetools] /context-state \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D:", err && err.message || err);
+    publishFileContext(sid);
+  });
+}
+var MESSAGES_PREVIEW = 100;
+var MESSAGES_INITIAL = {
+  sessionId: null,
+  carriages: [],
+  messages: [],
+  note: "",
+  loading: false
+};
+var $messages = makeAtom(MESSAGES_INITIAL);
+function useMessages() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($messages) || MESSAGES_INITIAL;
+}
+var _fullText = /* @__PURE__ */ new Map();
+function forgetFullText(sid) {
+  const prefix = sid + "|";
+  for (const key of Array.from(_fullText.keys())) if (key.startsWith(prefix)) _fullText.delete(key);
+}
+function loadMessageText(address) {
+  const key = String(address || "");
+  const sid = viewKey();
+  if (!key || !isPersistableKey(sid) || !adapter.hasRest) return Promise.resolve("");
+  const cacheKey = sid + "|" + key;
+  if (_fullText.has(cacheKey)) return Promise.resolve(_fullText.get(cacheKey));
+  return adapter.rest(`/messages?session=${encodeURIComponent(sid)}&preview=1&full=${encodeURIComponent(key)}`).then((res) => {
+    const r = asRecord(res);
+    const list = Array.isArray(r.messages) ? r.messages : [];
+    const hit = list.find((m) => asRecord(m).msg === key);
+    const text = String(asRecord(hit).text || "");
+    if (text) _fullText.set(cacheKey, text);
+    return text;
+  }).catch(() => "");
+}
+function exportMessage(address) {
+  const key = String(address || "");
+  const sid = viewKey();
+  if (!key) return Promise.resolve({ ok: false, note: "no address" });
+  if (!adapter.hasRest || !isPersistableKey(sid)) {
+    return Promise.resolve({ ok: false, note: "this chat is not saved yet" });
+  }
+  return adapter.rest("/context-export", { method: "POST", body: { session: sid, msgs: [key] } }).then((res) => {
+    const r = asRecord(res);
+    if (r.ok !== true) return { ok: false, note: String(r.error || "not saved") };
+    const written = Array.isArray(r.written) ? r.written : [];
+    const path = String(asRecord(written[0]).path || "");
+    return { ok: true, note: path ? `saved ${path}` : "saved" };
+  }).catch((err) => ({ ok: false, note: `request failed: ${err && err.message || err}` }));
+}
+function copyMessage(address, fallback) {
+  const key = String(address || "");
+  return loadMessageText(key).then((text) => {
+    const body = text || String(fallback || "");
+    if (!body) return { ok: false, note: "nothing to copy" };
+    const clip = typeof navigator !== "undefined" && navigator && navigator.clipboard;
+    if (!clip || typeof clip.writeText !== "function") {
+      return { ok: false, note: "no clipboard in this build" };
+    }
+    return Promise.resolve(clip.writeText(body)).then(() => ({ ok: true, note: `copied ${body.length} chars` })).catch((err) => ({ ok: false, note: `copy failed: ${err && err.message || err}` }));
+  }).catch((err) => ({ ok: false, note: `copy failed: ${err && err.message || err}` }));
+}
+function readClipboard() {
+  const clip = typeof navigator !== "undefined" && navigator && navigator.clipboard;
+  if (!clip || typeof clip.readText !== "function") return Promise.resolve("");
+  return Promise.resolve(clip.readText()).then((t) => String(t || "")).catch(() => "");
+}
+function catchNextPaste(onText) {
+  if (typeof window === "undefined" || !window || typeof window.addEventListener !== "function") {
+    return () => {
+    };
+  }
+  const handler = (e) => {
+    const data = e && e.clipboardData;
+    const text = data && typeof data.getData === "function" ? String(data.getData("text/plain") || data.getData("text") || "") : "";
+    if (e && typeof e.preventDefault === "function") e.preventDefault();
+    if (e && typeof e.stopPropagation === "function") e.stopPropagation();
+    window.removeEventListener("paste", handler, true);
+    onText(text);
+  };
+  window.addEventListener("paste", handler, true);
+  return () => window.removeEventListener("paste", handler, true);
+}
+function pasteMessage(address, text) {
+  const key = String(address || "");
+  const sid = viewKey();
+  if (!key) return Promise.resolve({ ok: false, note: "no address" });
+  if (!adapter.hasRest || !isPersistableKey(sid)) {
+    return Promise.resolve({ ok: false, note: "this chat is not saved yet" });
+  }
+  return adapter.rest("/context-edit", { method: "POST", body: { session: sid, msg: key, content: String(text || "") } }).then((res) => {
+    const r = asRecord(res) || {};
+    if (r.ok !== true) return { ok: false, note: String(r.summary && r.summary !== "not applied" ? r.summary : r.error || "not replaced") };
+    loadMessages();
+    return { ok: true, note: String(r.summary || "replaced") };
+  }).catch((err) => ({ ok: false, note: `request failed: ${err && err.message || err}` }));
+}
+var EXPORT_INITIAL = { mode: false, picked: {}, busy: false, note: "", ok: null, dir: "" };
+var $exportRail = makeAtom(EXPORT_INITIAL);
+function useExportRail() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($exportRail) || EXPORT_INITIAL;
+}
+function setExportRail(patch) {
+  $exportRail.set(Object.assign({}, $exportRail.get() || EXPORT_INITIAL, patch));
+}
+function setExportMode(on, initialPicked) {
+  if (!on) {
+    const prev = $exportRail.get() || EXPORT_INITIAL;
+    setExportRail(Object.assign({}, EXPORT_INITIAL, { note: prev.note, ok: prev.ok, dir: prev.dir }));
+    return;
+  }
+  setExportRail({
+    mode: true,
+    picked: Object.assign({}, initialPicked || {}),
+    busy: false,
+    note: "",
+    ok: null,
+    dir: ""
+  });
+  setDropMode(false);
+  setCompactMode(false);
+  setAddrOpMode(false);
+}
+function setExportPicks(picked) {
+  const cur = $exportRail.get() || EXPORT_INITIAL;
+  if (!cur.mode) return;
+  setExportRail({ picked: Object.assign({}, picked || {}) });
+}
+function applyExport() {
+  const cur = $exportRail.get() || EXPORT_INITIAL;
+  if (!cur.mode || cur.busy) return Promise.resolve();
+  const msgs = Object.keys(cur.picked || {});
+  const sid = viewKey();
+  if (!msgs.length) {
+    setExportRail({ note: "nothing ticked", ok: false });
+    return Promise.resolve();
+  }
+  if (!adapter.hasRest || !isPersistableKey(sid)) {
+    setExportRail({ note: "this chat is not saved yet", ok: false });
+    return Promise.resolve();
+  }
+  setExportRail({ busy: true, note: "", ok: null, dir: "" });
+  return adapter.rest("/context-export", { method: "POST", body: { session: sid, msgs, snapshot: true } }).then((res) => {
+    const r = asRecord(res);
+    const written = Array.isArray(r.written) ? r.written.length : 0;
+    const missing = Array.isArray(r.missing) ? r.missing.length : 0;
+    if (r.ok !== true) {
+      setExportRail({ busy: false, ok: false, note: String(r.error || (r.errors || [])[0] || "not exported") });
+      return;
+    }
+    const paired = Array.isArray(r.paired) ? r.paired.length : 0;
+    const note = `exported ${written}` + (paired ? ` (+${paired} calls)` : "") + ` \u2192 ${String(r.dir || "")}` + (missing ? ` \xB7 ${missing} not found` : "");
+    setExportRail(Object.assign({}, EXPORT_INITIAL, { note, ok: true, dir: String(r.dir || "") }));
+  }).catch((err) => setExportRail({ busy: false, ok: false, note: `request failed: ${err && err.message || err}` }));
+}
+function copyExportDir() {
+  const dir = String(($exportRail.get() || EXPORT_INITIAL).dir || "");
+  const clip = typeof navigator !== "undefined" && navigator && navigator.clipboard;
+  if (!dir || !clip || typeof clip.writeText !== "function") return Promise.resolve(false);
+  return Promise.resolve(clip.writeText(dir)).then(() => true).catch(() => false);
+}
+var IMPORT_INITIAL = {
+  open: false,
+  folder: "",
+  checking: false,
+  check: null,
+  busy: false,
+  note: "",
+  ok: null
+};
+var $importOp = makeAtom(IMPORT_INITIAL);
+function useImportOp() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($importOp) || IMPORT_INITIAL;
+}
+function setImportOp(patch) {
+  $importOp.set(Object.assign({}, $importOp.get() || IMPORT_INITIAL, patch));
+}
+function clipboardPath(text) {
+  const t = String(text || "").trim().replace(/^["']|["']$/g, "");
+  if (!t || t.length > 400 || /[\r\n]/.test(t)) return "";
+  return /[\\/]/.test(t) ? t : "";
+}
+function openImport() {
+  const cur = $importOp.get() || IMPORT_INITIAL;
+  const fallback = cur.folder || String(($exportRail.get() || EXPORT_INITIAL).dir || "");
+  setImportOp({ open: true, folder: fallback, check: null, checking: false, busy: false });
+  const usePath = (text) => {
+    const path = clipboardPath(text);
+    const now = $importOp.get() || IMPORT_INITIAL;
+    if (!path || !now.open) return void 0;
+    setImportOp({ folder: path, check: null });
+    return checkImport();
+  };
+  return readClipboard().then((text) => {
+    if (clipboardPath(text)) return usePath(text);
+    stopImportPaste();
+    importPasteOff = catchNextPaste((pasted) => {
+      importPasteOff = null;
+      usePath(pasted);
+    });
+    return void 0;
+  });
+}
+var importPasteOff = null;
+function stopImportPaste() {
+  if (importPasteOff) {
+    importPasteOff();
+    importPasteOff = null;
+  }
+}
+function closeImport() {
+  stopImportPaste();
+  setImportOp({ open: false, checking: false, busy: false });
+}
+function setImportFolder(folder) {
+  setImportOp({ folder: String(folder || ""), check: null });
+}
+function checkImport() {
+  const cur = $importOp.get() || IMPORT_INITIAL;
+  const folder = String(cur.folder || "").trim();
+  if (!folder || cur.checking || !adapter.hasRest) return Promise.resolve();
+  setImportOp({ checking: true, check: null });
+  return adapter.rest("/context-import", { method: "POST", body: { session: viewKey() || "", folder } }).then((res) => {
+    const r = asRecord(res) || {};
+    setImportOp({ checking: false, check: Object.assign({ folder }, r) });
+  }).catch((err) => setImportOp({
+    checking: false,
+    check: { folder, ok: false, error: `request failed: ${err && err.message || err}` }
+  }));
+}
+function applyImport() {
+  const cur = $importOp.get() || IMPORT_INITIAL;
+  const sid = viewKey();
+  const check = cur.check || {};
+  if (cur.busy || check.ok !== true || check.folder !== cur.folder) return Promise.resolve();
+  if (!adapter.hasRest || !isPersistableKey(sid)) {
+    setImportOp({ note: "this chat is not saved yet", ok: false });
+    return Promise.resolve();
+  }
+  setImportOp({ busy: true });
+  return adapter.rest("/context-import", { method: "POST", body: { session: sid, folder: cur.folder, apply: true } }).then((res) => {
+    const r = asRecord(res) || {};
+    const ok = r.ok === true;
+    const note = ok ? `imported ${r.rows_after || 0} messages (was ${r.rows_before || 0}) \u2190 ${cur.folder}` : String(r.summary && r.summary !== "not applied" ? r.summary : r.error || r.summary || "not imported");
+    if (ok) stopImportPaste();
+    setImportOp({ busy: false, ok, note, open: !ok });
+    if (ok) {
+      loadMessages();
+      refresh();
+    }
+  }).catch((err) => setImportOp({ busy: false, ok: false, note: `request failed: ${err && err.message || err}` }));
+}
+var ADDR_OP_INITIAL = { mode: false, kind: "content", picked: {}, busy: false, note: "", ok: null };
+var $addrOp = makeAtom(ADDR_OP_INITIAL);
+function useAddrOp() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($addrOp) || ADDR_OP_INITIAL;
+}
+function setAddrOp(patch) {
+  $addrOp.set(Object.assign({}, $addrOp.get() || ADDR_OP_INITIAL, patch));
+}
+function setAddrOpMode(on, kind) {
+  if (!on) {
+    const prev = $addrOp.get() || ADDR_OP_INITIAL;
+    setAddrOp(Object.assign({}, ADDR_OP_INITIAL, { note: prev.note, ok: prev.ok }));
+    return;
+  }
+  setAddrOp({
+    mode: true,
+    kind: kind === "erase" ? "erase" : "content",
+    picked: {},
+    busy: false,
+    note: "",
+    ok: null
+  });
+  setDropMode(false);
+  setCompactMode(false);
+  setExportMode(false);
+}
+function setAddrOpPicks(picked) {
+  const cur = $addrOp.get() || ADDR_OP_INITIAL;
+  if (!cur.mode) return;
+  setAddrOp({ picked: Object.assign({}, picked || {}) });
+}
+function applyAddrOp() {
+  const cur = $addrOp.get() || ADDR_OP_INITIAL;
+  if (!cur.mode || cur.busy) return Promise.resolve();
+  const msgs = Object.keys(cur.picked || {});
+  const sid = viewKey();
+  if (!msgs.length) {
+    setAddrOp({ note: "nothing ticked", ok: false });
+    return Promise.resolve();
+  }
+  if (!adapter.hasRest || !isPersistableKey(sid)) {
+    setAddrOp({ note: "this chat is not saved yet \u2014 nothing to apply to", ok: false });
+    return Promise.resolve();
+  }
+  setAddrOp({ busy: true, note: "", ok: null });
+  return adapter.rest("/context-operation", { method: "POST", body: { session: sid, operation: cur.kind, msgs } }).then((res) => {
+    const r = asRecord(res);
+    const ok = r.ok === true;
+    if (!ok) {
+      setAddrOp({ busy: false, ok: false, note: String(r.summary || r.error || "not applied") });
+      return;
+    }
+    if (cur.kind === "erase") {
+      const gone = removeBricksByOp(memStore, sid, Array.isArray(r.ops) ? r.ops : []);
+      if (gone > 0) adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
+    }
+    setAddrOp(Object.assign({}, ADDR_OP_INITIAL, { ok: true, note: String(r.summary || "applied") }));
+    contextFetched.delete(sid);
+    readsFetched.delete(sid);
+    historyFetched.delete(sid);
+    refresh();
+  }).catch((err) => setAddrOp({ busy: false, ok: false, note: `request failed: ${err && err.message || err}` }));
+}
+var ZONES_KEY = "mirror-zones";
+var ZONES_INITIAL = { operations: true, status: true, files: true };
+var $zones = makeAtom(ZONES_INITIAL);
+function useZones() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($zones) || ZONES_INITIAL;
+}
+var zonesLoaded = false;
+function loadZones() {
+  if (zonesLoaded) return Promise.resolve();
+  zonesLoaded = true;
+  return adapter.storageGet(ZONES_KEY).then((saved) => {
+    if (saved && typeof saved === "object") $zones.set(Object.assign({}, ZONES_INITIAL, saved));
+  }).catch(() => {
+  });
+}
+function toggleZone(id) {
+  const cur = $zones.get() || ZONES_INITIAL;
+  const next = Object.assign({}, cur, { [id]: !cur[id] });
+  $zones.set(next);
+  adapter.storageSet(ZONES_KEY, next);
+}
+function loadMessages() {
+  const sid = viewKey();
+  if (!isPersistableKey(sid)) {
+    $messages.set(Object.assign({}, MESSAGES_INITIAL, { note: "no stored session yet" }));
+    return Promise.resolve();
+  }
+  if (!adapter.hasRest) {
+    $messages.set(Object.assign({}, MESSAGES_INITIAL, { sessionId: sid, note: "this build has no REST door" }));
+    return Promise.resolve();
+  }
+  forgetFullText(sid);
+  $messages.set(Object.assign(
+    {},
+    $messages.get() || MESSAGES_INITIAL,
+    { sessionId: sid, loading: true, note: "" }
+  ));
+  return adapter.rest(`/messages?session=${encodeURIComponent(sid)}&preview=${MESSAGES_PREVIEW}`).then((res) => {
+    if (viewKey() !== sid) return;
+    const r = asRecord(res);
+    $messages.set({
+      sessionId: sid,
+      carriages: Array.isArray(r.carriages) ? r.carriages : [],
+      messages: Array.isArray(r.messages) ? r.messages : [],
+      note: r.error ? String(r.error) : "",
+      loading: false
+    });
+    loadTokens({ exact: "auto" });
+  }).catch((err) => {
+    if (viewKey() !== sid) return;
+    $messages.set(Object.assign({}, MESSAGES_INITIAL, {
+      sessionId: sid,
+      note: `/messages: ${err && err.message || err}`
+    }));
+  });
+}
+var MIRROR_RELOAD_MS = 1500;
+var mirrorTimer = null;
+function scheduleMirrorReload() {
+  if (mirrorTimer) clearTimeout(mirrorTimer);
+  mirrorTimer = setTimeout(() => {
+    mirrorTimer = null;
+    try {
+      const mode = ($view.get() || VIEW_INITIAL).mode || "mirror";
+      if (mode === "mirror") reloadMessagesQuietly();
+    } catch (err) {
+      console.error("[hermes-filetools] mirror reload:", err);
+    }
+  }, MIRROR_RELOAD_MS);
+  if (mirrorTimer && typeof mirrorTimer.unref === "function") mirrorTimer.unref();
+}
+function stopMirrorReload() {
+  if (mirrorTimer) clearTimeout(mirrorTimer);
+  mirrorTimer = null;
+}
+function reloadMessagesQuietly() {
+  const sid = viewKey();
+  if (!isPersistableKey(sid) || !adapter.hasRest) return Promise.resolve();
+  return adapter.rest(`/messages?session=${encodeURIComponent(sid)}&preview=${MESSAGES_PREVIEW}`).then((res) => {
+    if (viewKey() !== sid) return;
+    const r = asRecord(res) || {};
+    if (r.error) return;
+    const cur = $messages.get() || MESSAGES_INITIAL;
+    loadTokens({ exact: false });
+    if (cur.sessionId === sid && sameMessages(cur, r)) return;
+    forgetFullText(sid);
+    $messages.set({
+      sessionId: sid,
+      carriages: Array.isArray(r.carriages) ? r.carriages : [],
+      messages: Array.isArray(r.messages) ? r.messages : [],
+      note: "",
+      loading: false
+    });
+  }).catch(() => {
+  });
+}
+function dropGhostBricks(sid, ops) {
+  const ghosts = ghostOps(ops);
+  if (ghosts.size === 0) return;
+  const gone = removeBricksByOp(memStore, sid, Array.from(ghosts));
+  if (gone > 0 && isPersistableKey(sid)) {
+    adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
+  }
+}
+function publishFileContext(sid) {
+  if (sid !== viewKey()) return;
+  const cur = $fileContext.get() || {};
+  const next = contextOps[sid] || NO_OPS;
+  if (cur.ops === next) return;
+  $fileContext.set(Object.assign({}, cur, { ops: next }));
+}
+function scheduleContextRefetch(sid) {
+  if (!isPersistableKey(sid)) return;
+  if (contextTimer) clearTimeout(contextTimer);
+  contextTimer = setTimeout(() => {
+    contextTimer = null;
+    contextFetched.delete(sid);
+    ensureContextState(sid);
+  }, CONTEXT_REFETCH_MS);
+}
+function handleStatusUpdate(event) {
+  try {
+    if (!shouldRefetchOnStatus(event)) return;
+    const sid = viewKey();
+    if (!isPersistableKey(sid)) return;
+    contextFetched.delete(sid);
+    readsFetched.delete(sid);
+    historyFetched.delete(sid);
+    refresh();
+    scheduleMirrorReload();
+  } catch (err) {
+    console.error("[hermes-filetools] status.update handler:", err);
+  }
+}
+var socketSid = null;
+var socketOff = null;
+function handleSocketFrame(data) {
+  const frame = asRecord(data) || {};
+  if (frame.kind === "hello") {
+    console.info("[hermes-filetools] /events: \u043A\u0430\u043D\u0430\u043B \u043E\u0442\u043A\u0440\u044B\u0442", frame.session || "");
+    return;
+  }
+  if (frame.kind === "context-changed") {
+    try {
+      const sid = viewKey();
+      if (!isPersistableKey(sid)) return;
+      if (frame.session && frame.session !== sid) return;
+      contextFetched.delete(sid);
+      readsFetched.delete(sid);
+      historyFetched.delete(sid);
+      refresh();
+    } catch (err) {
+      console.error("[hermes-filetools] context-changed handler:", err);
+    }
+    return;
+  }
+}
+var focusSid = null;
+function ensureFocus(sid) {
+  if (!adapter.hasRest || focusSid === sid) return;
+  focusSid = sid;
+  if (!isPersistableKey(sid)) return;
+  adapter.rest("/context-focus", { method: "POST", body: { session: sid } }).catch(() => {
+  });
+}
+function ensureEventSocket(sid) {
+  if (!adapter.hasSocket || socketSid === sid) return;
+  closeEventSocket();
+  socketSid = sid;
+  if (!isPersistableKey(sid)) return;
+  socketOff = adapter.socket(`/events?session=${encodeURIComponent(sid)}`, handleSocketFrame);
+}
+var REVISION_POLL_MS = 2e3;
+var revisionTimer = null;
+var revisionSeen = {};
+function pollRevision() {
+  const sid = viewKey();
+  if (!isPersistableKey(sid) || !adapter.hasRest) return;
+  pollCompactRun(sid);
+  adapter.rest(`/context-revision?session=${encodeURIComponent(sid)}`).then((res) => {
+    const rev = res && Number.isFinite(Number(res.revision)) ? Number(res.revision) : 0;
+    if (!(sid in revisionSeen)) {
+      revisionSeen[sid] = rev;
+      return;
+    }
+    if (rev === revisionSeen[sid]) return;
+    revisionSeen[sid] = rev;
+    contextFetched.delete(sid);
+    readsFetched.delete(sid);
+    historyFetched.delete(sid);
+    refresh();
+    loadMessages();
+  }).catch(() => {
+  });
+}
+function startRevisionPoll() {
+  if (revisionTimer || !adapter.hasRest) return;
+  revisionTimer = setInterval(pollRevision, REVISION_POLL_MS);
+  if (revisionTimer && typeof revisionTimer.unref === "function") revisionTimer.unref();
+}
+function stopRevisionPoll() {
+  if (revisionTimer) {
+    clearInterval(revisionTimer);
+    revisionTimer = null;
+  }
+}
+function closeEventSocket() {
+  if (socketOff) {
+    try {
+      socketOff();
+    } catch {
+    }
+    socketOff = null;
+  }
+  socketSid = null;
+}
+function ensureHistory(sid) {
+  if (!isPersistableKey(sid) || historyFetched.has(sid)) return;
+  historyFetched.add(sid);
+  if (!adapter.hasRest) {
+    historyNote[sid] = "this build gives the plugin no REST, so history is unavailable";
+    return;
+  }
+  adapter.rest(`/ops?session=${encodeURIComponent(sid)}&limit=200`).then((res) => {
+    const raw = res && Array.isArray(res.ops) ? res.ops : [];
+    const ops = raw.map(normalizeHistoryOp).filter(Boolean);
+    const k2 = sessionKey(sid);
+    memStore[k2] = mergeBricks(ops, memStore[k2] || []);
+    if (res && typeof res.note === "string" && ops.length === 0) historyNote[sid] = res.note;
+    if (res && typeof res.error === "string") historyNote[sid] = res.error;
+    refresh();
+  }).catch((err) => {
+    historyNote[sid] = `history unavailable: ${err && err.message || err}`;
+    refresh();
+  });
+}
+function refresh() {
+  const sid = viewKey();
+  ensureHydration(sid);
+  ensureHistory(sid);
+  ensureReads(sid);
+  ensureContextState(sid);
+  ensureEventSocket(sid);
+  ensureFocus(sid);
+  startRevisionPoll();
+  publishFileContext(sid);
+  const cur = $view.get() || {};
+  $view.set(Object.assign({}, cur, {
+    sessionId: sid,
+    bricks: attachReadState(readBricks(memStore, sid || ""), readsIndex[sid] || null),
+    note: sid ? historyNote[sid] || "" : ""
+  }));
+}
+var DROP_EMPTY = DROP_INITIAL;
+function setDrop(patch) {
+  $drop.set(Object.assign({}, $drop.get() || DROP_EMPTY, patch));
+}
+function setStripOpen(on) {
+  if (on) {
+    setDrop({ open: true });
+    return;
+  }
+  const cur = $drop.get() || DROP_EMPTY;
+  $drop.set(Object.assign({}, DROP_EMPTY, { note: cur.note, ok: cur.ok }));
+}
+function setDropMode(on, action) {
+  const prev = $drop.get() || DROP_EMPTY;
+  if (!on) {
+    $drop.set(Object.assign({}, DROP_EMPTY, { open: prev.open, note: prev.note, ok: prev.ok }));
+    return;
+  }
+  const mode = ACTION_MODES.indexOf(String(action || "")) >= 0 ? String(action) : prev.action || CONTENT_MODE;
+  setDrop({ open: true, mode: true, action: mode, picked: {}, busy: false, note: "", ok: null });
+  setCompactMode(false);
+  setExportMode(false);
+  setAddrOpMode(false);
+  const sid = viewKey();
+  if (isPersistableKey(sid)) {
+    historyFetched.delete(sid);
+    refresh();
+  }
+}
+function toggleDropPick(op, toolId) {
+  if (!op) return;
+  const cur = $drop.get() || DROP_EMPTY;
+  if (!cur.mode) return;
+  const picked = Object.assign({}, cur.picked);
+  const mates = SPREADS_TO_STEP[cur.action] ? stepMates(readBricks(memStore, viewKey()), op) : [{ op, toolId: typeof toolId === "string" ? toolId : "" }];
+  const targets = mates.length ? mates : [{ op, toolId: toolId || "" }];
+  if (op in picked) for (const m of targets) delete picked[m.op];
+  else for (const m of targets) picked[m.op] = m.toolId;
+  setDrop({ picked, note: "", ok: null });
+  syncDropSelection(picked, cur.action);
+}
+function syncDropSelection(picked, action) {
+  const sid = viewKey();
+  if (adapter.hasRest && isPersistableKey(sid)) {
+    adapter.rest("/context-select", {
+      method: "POST",
+      body: {
+        session: sid,
+        items: Object.keys(picked).map((o) => ({ op: o, tool_call_id: picked[o], mode: action || CONTENT_MODE }))
+      }
+    }).catch(() => {
+    });
+  }
+}
+function applyDrop() {
+  const cur = $drop.get() || DROP_EMPTY;
+  const ops = Object.keys(cur.picked || {});
+  const sid = viewKey();
+  if (!ops.length) {
+    setDrop({ note: "nothing to apply \u2014 no operation is ticked", ok: false });
+    return Promise.resolve();
+  }
+  if (!adapter.hasRest || !isPersistableKey(sid)) {
+    setDrop({ note: "this chat is not saved yet \u2014 nothing to apply to", ok: false });
+    return Promise.resolve();
+  }
+  setDrop({ busy: true, note: "", ok: null });
+  return adapter.rest("/context-apply", { method: "POST", body: { session: sid, ops, mode: cur.action } }).then((res) => {
+    const r = res && typeof res === "object" ? res : {};
+    const ok = r.ok === true;
+    if (!ok && cur.action === CONTEXT_ACTIONS.tool.mode) {
+      const gone = removeBricksByOp(memStore, sid, eraseTouched(r));
+      if (gone > 0 && isPersistableKey(sid)) {
+        adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
+      }
+    }
+    setDrop({
+      busy: false,
+      ok,
+      note: dropNote(r),
+      // Применённое снимаем с отметок, остальное оставляем: если из четырёх номеров прошли
+      // два, галочки на непрошедших — единственное, что человеку осталось от его выбора.
+      picked: ok ? dropRest(cur.picked, r.applied) : cur.picked,
+      mode: ok ? false : cur.mode
+    });
+    if (ok) {
+      if (cur.action === CONTEXT_ACTIONS.tool.mode) {
+        const gone = removeBricksByOp(memStore, sid, eraseTouched(r));
+        if (gone > 0 && isPersistableKey(sid)) {
+          adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
+        }
+      }
+      contextFetched.delete(sid);
+      readsFetched.delete(sid);
+      historyFetched.delete(sid);
+      refresh();
+    }
+  }).catch((err) => {
+    setDrop({ busy: false, ok: false, note: `request failed: ${err && err.message || err}` });
+  });
+}
+function eraseTouched(r) {
+  const applied = Array.isArray(r.applied) ? r.applied : [];
+  const absent = Array.isArray(r.absent) ? r.absent : [];
+  return applied.concat(absent);
+}
+function dropRest(picked, applied) {
+  const done = new Set(Array.isArray(applied) ? applied : []);
+  const out = {};
+  for (const op of Object.keys(picked || {})) if (!done.has(op)) out[op] = picked[op];
+  return out;
+}
+function dropNote(r) {
+  if (typeof r.error === "string" && r.error) return r.error;
+  if (typeof r.summary === "string" && r.summary) return r.summary;
+  return r.ok === true ? "applied" : "not applied";
+}
+function setCompact(patch) {
+  $compact.set(Object.assign({}, $compact.get() || COMPACT_INITIAL, patch));
+}
+function armCompactFromServer(share) {
+  const sid = viewKey();
+  if (!isPersistableKey(sid) || !adapter.hasRest) {
+    setCompactMode(true, {});
+    setCompact({ note: "this chat is not saved yet \u2014 nothing to pick from", ok: false });
+    return Promise.resolve();
+  }
+  setCompact({ busy: true, note: "picking\u2026" });
+  return adapter.rest("/context-compact-pick", { method: "POST", body: { session: sid, share } }).then((res) => {
+    const r = asRecord(res) || {};
+    const picked = {};
+    (Array.isArray(r.picked) ? r.picked : []).forEach((a) => {
+      if (a) picked[String(a)] = true;
+    });
+    setCompactMode(true, picked);
+    const why = Array.isArray(r.lines) ? r.lines.join(" \xB7 ") : "";
+    if (r.error || !r.ok) setCompact({ note: String(r.error || why || "nothing to pick"), ok: false });
+  }).catch((err) => {
+    setCompactMode(true, {});
+    setCompact({ note: `/context-compact-pick: ${err && err.message || err}`, ok: false });
+  });
+}
+function setCompactMode(on, initialPicked) {
+  if (!on) {
+    const prev = $compact.get() || COMPACT_INITIAL;
+    setCompact(Object.assign({}, COMPACT_INITIAL, { note: prev.note, ok: prev.ok }));
+    return;
+  }
+  setCompact({
+    open: true,
+    mode: true,
+    picked: Object.assign({}, initialPicked || {}),
+    dragging: false,
+    dragMode: null,
+    confirming: false,
+    busy: false,
+    note: "",
+    ok: null
+  });
+  setDropMode(false);
+  setExportMode(false);
+  setAddrOpMode(false);
+}
+function applyCompactPick(addr, wantPicked) {
+  if (!addr) return;
+  const cur = $compact.get() || COMPACT_INITIAL;
+  if (!cur.mode) return;
+  const already = addr in (cur.picked || {});
+  if (already === wantPicked) return;
+  const picked = Object.assign({}, cur.picked);
+  if (wantPicked) picked[addr] = true;
+  else delete picked[addr];
+  setCompact({ picked });
+}
+function setCompactPicks(picked) {
+  const cur = $compact.get() || COMPACT_INITIAL;
+  if (!cur.mode) return;
+  setCompact({ picked: Object.assign({}, picked || {}) });
+}
+function beginCompactDrag(addr) {
+  const cur = $compact.get() || COMPACT_INITIAL;
+  if (!cur.mode || !addr) return;
+  const dragMode = addr in (cur.picked || {}) ? "remove" : "add";
+  setCompact({ dragging: true, dragMode });
+  applyCompactPick(addr, dragMode === "add");
+}
+function dragCompactOver(addr) {
+  const cur = $compact.get() || COMPACT_INITIAL;
+  if (!cur.dragging || !cur.dragMode) return;
+  applyCompactPick(addr, cur.dragMode === "add");
+}
+function endCompactDrag() {
+  const cur = $compact.get() || COMPACT_INITIAL;
+  if (cur.dragging) setCompact({ dragging: false, dragMode: null });
+}
+function compactMouseUp() {
+  endCompactDrag();
+}
+function openCompactConfirm() {
+  const cur = $compact.get() || COMPACT_INITIAL;
+  if (!Object.keys(cur.picked || {}).length) {
+    setCompact({ note: "nothing to compact \u2014 no message is ticked", ok: false });
+    return;
+  }
+  setCompact({ confirming: true });
+}
+function cancelCompactConfirm() {
+  setCompact({ confirming: false });
+}
+var COMPACT_POLL_MS = 4e3;
+var compactPollTimer = null;
+function stopCompactPoll() {
+  if (compactPollTimer) {
+    clearInterval(compactPollTimer);
+    compactPollTimer = null;
+  }
+}
+function pollCompactStatus(sid) {
+  if (!adapter.hasRest) return;
+  adapter.rest(`/context-compact-status?session=${encodeURIComponent(sid)}`).then((res) => {
+    const r = res && typeof res === "object" ? res : {};
+    if (r.running) return;
+    stopCompactPoll();
+    const lines = Array.isArray(r.lines) ? r.lines : [];
+    setCompact({
+      busy: false,
+      ok: r.ok === true,
+      note: r.error || lines[lines.length - 1] || (r.ok ? "compacted" : "not compacted")
+    });
+    if (r.ok) {
+      contextFetched.delete(sid);
+      readsFetched.delete(sid);
+      historyFetched.delete(sid);
+      refresh();
+      loadMessages();
+    }
+  }).catch(() => {
+  });
+}
+function startCompactPoll(sid) {
+  stopCompactPoll();
+  compactPollTimer = setInterval(() => pollCompactStatus(sid), COMPACT_POLL_MS);
+  if (compactPollTimer && typeof compactPollTimer.unref === "function") compactPollTimer.unref();
+}
+function confirmCompact() {
+  const cur = $compact.get() || COMPACT_INITIAL;
+  const addrs = Object.keys(cur.picked || {});
+  const sid = viewKey();
+  if (!addrs.length) {
+    setCompact({ confirming: false, note: "nothing to compact \u2014 no message is ticked", ok: false });
+    return Promise.resolve();
+  }
+  if (!adapter.hasRest || !isPersistableKey(sid)) {
+    setCompact({ confirming: false, note: "this chat is not saved yet \u2014 nothing to compact", ok: false });
+    return Promise.resolve();
+  }
+  setCompact({ confirming: false, busy: true, note: "", ok: null });
+  return adapter.rest("/context-compact-start", { method: "POST", body: { session: sid, addrs } }).then((res) => {
+    const r = res && typeof res === "object" ? res : {};
+    if (r.ok !== true) {
+      setCompact({ busy: false, ok: false, note: r.error || "not started" });
+      return;
+    }
+    setCompact({ mode: false, open: false, note: "started \u2014 running in the background", ok: null });
+    startCompactPoll(sid);
+  }).catch((err) => {
+    setCompact({ busy: false, ok: false, note: `request failed: ${err && err.message || err}` });
+  });
+}
+function ensureHydration(sid) {
+  if (!isPersistableKey(sid) || hydrated.has(sid)) return;
+  hydrated.add(sid);
+  adapter.storageGet(sessionKey(sid)).then((raw) => {
+    let list = raw;
+    if (typeof list === "string") {
+      try {
+        list = JSON.parse(list);
+      } catch {
+        list = null;
+      }
+    }
+    const k2 = sessionKey(sid);
+    if (Array.isArray(list) && list.length > 0 && !memStore[k2]) {
+      memStore[k2] = list;
+      refresh();
+    }
+  }).catch(() => {
+  });
+}
+var pendingCaption = "";
+var CAPTION_BUFFER_MAX = 4e3;
+var captionBuffer = "";
+function handleTurnStart() {
+  captionBuffer = "";
+  pendingCaption = "";
+}
+function handleTurnEnd() {
+  scheduleMirrorReload();
+  loadTokens({ exact: "auto" });
+}
+var TOKENS_INITIAL = { sessionId: null, rep: null, busy: false, note: "" };
+var TOKENS_RETRIES = 4;
+var TOKENS_RETRY_MS = 1500;
+var $tokens = makeAtom(TOKENS_INITIAL);
+function useTokens() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($tokens) || TOKENS_INITIAL;
+}
+function loadTokens(opts) {
+  const o = opts || {};
+  const sid = viewKey();
+  if (!isPersistableKey(sid) || !adapter.hasRest) return Promise.resolve();
+  const cur = $tokens.get() || TOKENS_INITIAL;
+  const loud = o.exact === true || o.load === true;
+  if (loud) $tokens.set(Object.assign({}, cur, { busy: true, note: o.load ? "loading model\u2026" : "counting\u2026" }));
+  return adapter.rest("/tokens", { method: "POST", body: { session: sid, exact: o.exact || false, load: !!o.load } }).then((res) => {
+    if (viewKey() !== sid) return;
+    const r = asRecord(res) || {};
+    const prev = $tokens.get() || TOKENS_INITIAL;
+    const tries = o.tries || 0;
+    if (r.error && /not among the live/.test(String(r.error)) && tries < TOKENS_RETRIES) {
+      setTimeout(() => {
+        loadTokens(Object.assign({}, o, { tries: tries + 1 }));
+      }, TOKENS_RETRY_MS);
+    }
+    $tokens.set({
+      sessionId: sid,
+      rep: r.error && prev.sessionId === sid && prev.rep ? prev.rep : r,
+      busy: false,
+      note: r.error ? String(r.error) : ""
+    });
+  }).catch((err) => {
+    if (viewKey() !== sid) return;
+    $tokens.set(Object.assign(
+      {},
+      $tokens.get() || TOKENS_INITIAL,
+      { busy: false, note: `/tokens: ${err && err.message || err}` }
+    ));
+  });
+}
+function handleDelta(event) {
+  try {
+    const p = asRecord(event && event.payload || {}) || {};
+    const chunk = typeof p.text === "string" ? p.text : "";
+    if (!chunk) return;
+    captionBuffer = (captionBuffer + chunk).slice(-CAPTION_BUFFER_MAX);
+  } catch (err) {
+    console.error("[hermes-filetools] message.delta handler:", err);
+  }
+}
+function handleInterim(event) {
+  try {
+    const p = asRecord(event && event.payload || {}) || {};
+    const caption = interimCaption(p.text);
+    if (caption) pendingCaption = caption;
+  } catch (err) {
+    console.error("[hermes-filetools] message.interim handler:", err);
+  }
+}
+function handleToolComplete(event) {
+  try {
+    scheduleMirrorReload();
+    const brick = buildBrick(event);
+    if (!brick) return;
+    const sid = writeKey(brick.session_id || "unknown");
+    if (typeof sid !== "string" || sid === "") return;
+    brick.meta = Object.assign({}, brick.meta, { gateway_sid: brick.session_id || "" });
+    brick.session_id = sid;
+    const caption = pendingCaption || interimCaption(captionBuffer);
+    if (caption) brick.note = caption;
+    pendingCaption = "";
+    captionBuffer = "";
+    ensureHydration(sid);
+    appendBrick(memStore, sid, brick);
+    if (isPersistableKey(sid)) adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
+    scheduleContextRefetch(viewKey());
+    refresh();
+  } catch (err) {
+    console.error("[hermes-filetools] tool.complete handler:", err);
+  }
+}
+
+// desktop/src/file-ops-pane.js
+import { jsx as jsx36, jsxs as jsxs35 } from "react/jsx-runtime";
+import { useRef as useRef9, useLayoutEffect as useLayoutEffect6, useMemo as useMemo3, useEffect as useEffect8, useState as useState15, memo } from "react";
+import * as sdk8 from "@hermes/plugin-sdk";
+
+// desktop/src/brick.js
+import { jsx, jsxs } from "react/jsx-runtime";
+import * as sdk2 from "@hermes/plugin-sdk";
+var SELECTABLE = { userSelect: "text", WebkitUserSelect: "text" };
+var CAPPED = { width: "100%", maxWidth: "100%", minWidth: 0 };
+var SCROLLER = { overflowX: "auto", overflowY: "hidden", maxWidth: "100%", minWidth: 0 };
+var PRE = { width: "max-content", minWidth: "100%" };
+var SELECTABLE_SMALL = { ...SELECTABLE, fontSize: "0.7rem" };
+function brickCounts(brick) {
+  const m = brick.meta || {};
+  const bits = [];
+  if (Number.isFinite(m.added) && m.added > 0) bits.push(`+${m.added}`);
+  if (Number.isFinite(m.removed) && m.removed > 0) bits.push(`\u2212${m.removed}`);
+  if (Number.isFinite(m.replacements) && m.replacements > 0) bits.push(`\xD7${m.replacements}`);
+  return bits.length ? bits.join(" ") : brick.subtitle || "";
+}
+function sdkC(Comp, fallbackTag, props) {
+  if (typeof Comp !== "function" && typeof Comp !== "object") return jsx(fallbackTag, props);
+  return jsx(Comp, props);
+}
+function BrickBody({ body }) {
+  return jsxs("div", {
+    className: "rounded-md border border-(--ui-stroke-secondary) p-2",
+    style: CAPPED,
+    children: [
+      // Горизонтальный скролл — на отдельном контейнере, НЕ на самом <pre>: по CSS-спеке у элемента
+      // с overflow-x:auto и высоким контентом overflow-y вычисляется в auto — внутри тела появился бы
+      // ещё и вертикальный скроллбар. Вертикаль — за панелью (ScrollArea), горизонталь — здесь.
+      jsx("div", {
+        className: "",
+        style: SCROLLER,
+        children: jsx("pre", {
+          // Выделение — ИНЛАЙН-стилем (SELECTABLE_SMALL): оболочка наследует user-select:none, а
+          // класса `select-text` в их собранном CSS нет вовсе. whitespace-pre = без переносов.
+          className: "m-0 whitespace-pre leading-snug font-mono text-(--ui-text-primary)",
+          style: Object.assign({}, SELECTABLE_SMALL, PRE),
+          children: body || "(empty answer)"
+        })
+      }),
+      typeof sdk2.CopyButton === "function" && body !== "" ? jsx("span", {
+        className: (
+          // ВСЕГДА видима, приглушённо — а не по наведению. Показ по hover требует
+          // `group-hover:*`, которых в собранном CSS приложения нет: базовое `opacity-0`
+          // применялось, а раскрытие нет, и кнопка была постоянно невидимой И некликабельной.
+          // `:hover` инлайн-стилем не выражается, поэтому выбор между «всегда видно» и
+          // «не видно никогда» — и первое честнее.
+          "ml-auto shrink-0 flex justify-end pb-1"
+        ),
+        style: { opacity: 0.55 },
+        children: jsx(sdk2.CopyButton, { appearance: "icon", buttonSize: "icon", stopPropagation: true, text: body })
+      }) : null
+    ]
+  });
+}
+var KIND_LABEL_CLASS = {
+  error: "text-(--ui-red) font-semibold",
+  ok: "text-(--ui-green)",
+  "no-change": "text-(--ui-text-tertiary)"
+};
+function Brick({ brick }) {
+  const tone = KIND_TONE[brick.kind] || "muted";
+  return jsxs("details", {
+    className: "group rounded-md border border-(--ui-stroke-secondary) mb-1 overflow-hidden bg-(--ui-bg-elevated)",
+    style: CAPPED,
+    children: [
+      // Заголовок тоже выделяется мышью — тем же инлайн-стилем, по той же причине:
+      // Tailwind-класса в собранном CSS приложения не существует.
+      jsxs("summary", {
+        className: "flex items-center gap-2 cursor-pointer list-none px-2 py-1.5 [&::-webkit-details-marker]:hidden",
+        style: SELECTABLE,
+        children: [
+          sdkC(sdk2.StatusDot, "span", { tone }),
+          jsx("code", { className: "text-(--ui-text-quaternary) shrink-0", style: { fontSize: "0.65rem" }, children: brick.tool }),
+          // min-w-0 — позволяет flex-элементу сжиматься ниже ширины контента: длинный текст
+          // уезжает «под» правые элементы (ellipsize), а те всегда остаются на экране.
+          jsx("span", {
+            className: "min-w-0 truncate text-xs font-medium text-(--ui-text-primary)",
+            title: brick.title,
+            children: brick.title || "(no path)"
+          }),
+          brickCounts(brick) ? jsx("span", { className: "min-w-0 truncate text-(--ui-text-secondary)", style: { fontSize: "0.65rem" }, children: brickCounts(brick) }) : null,
+          brick.meta && brick.meta.duration_s != null ? jsx("span", { className: "shrink-0 tabular-nums text-(--ui-text-quaternary)", style: { fontSize: "0.625rem" }, children: formatDuration(brick.meta.duration_s) }) : null,
+          // Состояние прочитанного — вторая метка НА карточке. Появляется только если чтение
+          // сопоставлено со строкой в базе; причину даёт маршрут, своих формулировок не пишем.
+          brick.read ? jsxs("span", {
+            className: "ml-auto shrink-0 inline-flex items-center gap-1",
+            style: { fontSize: "0.65rem" },
+            title: brick.read.reason || "",
+            children: [
+              sdkC(sdk2.StatusDot, "span", { tone: READ_STATE_TONE[brick.read.state] || "muted" }),
+              jsx("span", { className: "text-(--ui-text-quaternary)", children: READ_STATE_LABEL[brick.read.state] || brick.read.state })
+            ]
+          }) : null,
+          jsx("span", {
+            className: (brick.read ? "shrink-0 " : "ml-auto shrink-0 ") + (KIND_LABEL_CLASS[brick.kind] || ""),
+            style: { fontSize: "0.65rem" },
+            children: brick.kind
+          })
+        ]
+      }),
+      // min-w-0/max-w-full — блок не расширяет карточку шире панели: длинная строка тела
+      // скроллится внутри <pre>, а не уезжает за правый край (срез).
+      jsx("div", { className: "px-2 py-1.5 border-t border-(--ui-stroke-secondary)", style: CAPPED, children: jsx(BrickBody, { body: brick.body }) })
+    ]
+  });
+}
+
+// desktop/src/operation-card.js
+import { jsx as jsx5, jsxs as jsxs5 } from "react/jsx-runtime";
+import { useState as useState4 } from "react";
+
+// desktop/src/operation-card-header.js
+import { jsx as jsx3, jsxs as jsxs3 } from "react/jsx-runtime";
+import { useState as useState2, useRef as useRef2, useLayoutEffect } from "react";
+
+// desktop/src/operation-card-primitives.js
+import { jsx as jsx2, jsxs as jsxs2 } from "react/jsx-runtime";
+import { useState, useRef, useEffect } from "react";
+var TONE_COLOR = {
+  good: "var(--ui-green)",
+  warn: "var(--ui-yellow)",
+  bad: "var(--ui-red)",
+  muted: "var(--ui-text-tertiary)"
+};
+var ROW_HEIGHT = "34px";
+var _hoverTipSet = null;
+function GlobalHoverTip() {
+  const [tip, setTip] = useState(null);
+  useEffect(() => {
+    _hoverTipSet = setTip;
+    return () => {
+      _hoverTipSet = null;
+    };
+  }, []);
+  if (!tip) return null;
+  return jsx2("div", {
+    className: "px-2 py-1 rounded-md text-[0.6rem] whitespace-nowrap",
+    style: {
+      position: "fixed",
+      left: `${tip.x}px`,
+      top: `${tip.y}px`,
+      transform: "translate(-50%, calc(-100% - 4px))",
+      zIndex: 999,
+      backgroundColor: "var(--ui-bg-elevated)",
+      border: "1px solid var(--ui-stroke-secondary)",
+      color: "var(--ui-text-primary)"
+    },
+    children: tip.hint
+  });
+}
+function HoverTip({ hint, children }) {
+  const showingRef = useRef(false);
+  useEffect(() => () => {
+    if (showingRef.current && _hoverTipSet) _hoverTipSet(null);
+  }, []);
+  return jsx2("span", {
+    style: { display: "inline-flex" },
+    onMouseEnter: (e) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      showingRef.current = true;
+      if (_hoverTipSet) _hoverTipSet({ x: r.left + r.width / 2, y: r.top, hint });
+    },
+    onMouseLeave: () => {
+      showingRef.current = false;
+      if (_hoverTipSet) _hoverTipSet(null);
+    },
+    children
+  });
+}
+function StatusMark({ tone, hint, glyph, offset }) {
+  return jsx2(HoverTip, {
+    hint,
+    children: glyph ? jsx2("span", { style: { fontSize: "0.6rem", fontWeight: 700, lineHeight: 1, cursor: "help", color: TONE_COLOR[tone], transform: offset }, children: glyph }) : jsx2("span", { style: { width: "6px", height: "6px", borderRadius: "50%", backgroundColor: TONE_COLOR[tone], cursor: "help", flexShrink: 0, transform: offset } })
+  });
+}
+function StatusColumn({ statuses }) {
+  return jsx2("div", {
+    style: { width: "8px", display: "flex", flexDirection: "column", alignSelf: "stretch", flexShrink: 0 },
+    children: statuses.slice(0, 2).map((s, i) => jsx2("div", {
+      key: i,
+      style: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center" },
+      children: jsx2(StatusMark, Object.assign({}, s, { offset: i === 0 ? "translateY(-2px)" : "translateY(2px)" }))
+    }))
+  });
+}
+function CloseButton({ onClick }) {
+  return jsx2("button", {
+    onClick,
+    title: "collapse",
+    className: "cursor-pointer leading-none",
+    style: { position: "absolute", top: "2px", right: "3px", zIndex: 11, color: "var(--ui-text-quaternary)", fontSize: "0.7rem", background: "transparent", border: "none", padding: "2px" },
+    children: "\xD7"
+  });
+}
+function StaleStack({ items }) {
+  return jsx2("div", {
+    style: { display: "flex", flexDirection: "column", height: ROW_HEIGHT, boxSizing: "border-box" },
+    children: items.map((it, i) => jsx2("div", {
+      key: i,
+      style: { flex: 1, display: "flex", alignItems: "center", minHeight: 0 },
+      children: jsx2(HoverTip, {
+        hint: "covered by later operations on this file (buildContextView().stale)",
+        children: jsxs2("span", { className: "flex items-center gap-1", children: [
+          jsx2("span", {
+            className: "flex items-center justify-center",
+            style: { width: "6px", height: "6px", flexShrink: 0 },
+            children: it.glyph ? jsx2("span", { style: { fontSize: "0.5rem", lineHeight: 1, color: "var(--ui-orange)" }, children: it.glyph }) : jsx2("span", { style: { width: "6px", height: "6px", borderRadius: "50%", backgroundColor: "var(--ui-orange)" } })
+          }),
+          jsx2("span", { style: { color: "var(--ui-orange)", fontStyle: "italic", fontSize: "0.65rem", lineHeight: 1.1 }, children: it.label })
+        ] })
+      })
+    }))
+  });
+}
+function StaleBadge({ items }) {
+  const first = (items || [])[0];
+  if (!first) return null;
+  const pct = typeof first.pct === "number" ? `${first.pct}%` : "";
+  return jsx2(HoverTip, {
+    hint: `${first.label} \u2014 covered by later operations on this file`,
+    children: jsxs2("span", { className: "flex items-center gap-1", style: { flexShrink: 0 }, children: [
+      jsx2("span", {
+        style: { width: "6px", height: "6px", borderRadius: "50%", backgroundColor: "var(--ui-orange)", flexShrink: 0 }
+      }),
+      pct ? jsx2("span", { style: { color: "var(--ui-orange)", fontSize: "0.55rem", fontStyle: "italic" }, children: pct }) : null
+    ] })
+  });
+}
+
+// desktop/src/operation-card-header.js
+var DRAWER_BG = "color-mix(in srgb, var(--dt-secondary) 6%, var(--ui-bg-elevated))";
+var DRAWER_EDGE_HINT = `linear-gradient(to right, transparent, ${DRAWER_BG} 16px)`;
+var TOOL_FONT = "0.68rem";
+var DIFF_FONT = "0.6rem";
+var TOOL_ICON_SLOT = 14;
+var TOOL_GAP = 4;
+var DIFF_CH = 4;
+var TOOL_MIN_CH = "patch".length;
+var TOOL_NOISE_WORDS = ["file", "files"];
+function toolWords(name) {
+  const all = String(name || "").split(/[_-]+/).filter(Boolean);
+  const kept = all.filter((w) => !TOOL_NOISE_WORDS.includes(w.toLowerCase()));
+  return kept.length ? kept : all;
+}
+function toolColWidth(toolNames) {
+  let longest = TOOL_MIN_CH;
+  for (const t of toolNames || []) {
+    for (const w of toolWords(t)) longest = Math.max(longest, w.length);
+  }
+  return `calc(${longest}ch + ${DIFF_CH}ch + ${TOOL_ICON_SLOT + TOOL_GAP * 2}px)`;
+}
+function ToolTag({ icon, name }) {
+  return jsxs3("div", { className: "flex items-center gap-1 min-w-0", style: { flex: 1 }, children: [
+    jsx3("span", { className: "shrink-0 text-center", style: { width: `${TOOL_ICON_SLOT}px`, fontSize: "0.7rem", color: "var(--ui-text-tertiary)" }, children: icon }),
+    // items-start — слова прижаты к ЛЕВОМУ краю блока, сразу за значком. Правый край пробовался
+    // (слова у вертикали дифа) и отвергнут вживую: между значком и именем возникала дырка на всю
+    // ширину колонки. После вычистки шумовых слов имена стали 4-6 знаков при колонке в 6, так что
+    // слака справа почти нет — а лесенка многословных имён (execute/code) читается от левого края.
+    jsx3("div", {
+      className: "flex flex-col items-start min-w-0",
+      style: { flex: 1, lineHeight: 1.05 },
+      children: toolWords(name).map((w, i) => jsx3("code", {
+        key: i,
+        className: "truncate min-w-0 block",
+        style: Object.assign({ color: "var(--ui-text-quaternary)" }, SELECTABLE),
+        children: w
+      }))
+    })
+  ] });
+}
+function Diff({ added, removed }) {
+  if (!added && !removed) return null;
+  return jsxs3("div", {
+    // items-end — цифры прижаты к ПРАВОМУ краю колонки, то есть к той самой вертикали, от которой
+    // начинаются имена файлов. Иначе +1 и −12 разной длины давали рваный правый край у самой
+    // границы с файловым блоком.
+    className: "flex flex-col items-end shrink-0 leading-tight",
+    style: Object.assign({ width: `${DIFF_CH}ch`, fontSize: DIFF_FONT }, SELECTABLE),
+    children: [
+      added ? jsx3("span", { style: { color: "var(--ui-green)" }, children: `+${added}` }) : null,
+      removed ? jsx3("span", { style: { color: "var(--ui-red)" }, children: `\u2212${removed}` }) : null
+    ]
+  });
+}
+function ToolColumn({ icon, tool, added, removed, width }) {
+  return jsxs3("div", {
+    className: "flex items-center shrink-0 min-w-0",
+    // fontSize здесь, а не только на самом имени: `ch` в width считается от шрифта ЭТОГО
+    // элемента, и без него единица оказалась бы от базового размера, то есть не той.
+    style: { width: width || toolColWidth([tool]), fontSize: TOOL_FONT, gap: `${TOOL_GAP}px` },
+    children: [
+      jsx3(ToolTag, { icon, name: tool }),
+      jsx3(Diff, { added, removed })
+    ]
+  });
+}
+var FADED_PRIMARY = "color-mix(in srgb, var(--ui-text-primary) 40%, transparent)";
+var FADED_QUATERNARY = "color-mix(in srgb, var(--ui-text-quaternary) 50%, transparent)";
+function FileTarget({ fileName, filePath, strike, faded = false }) {
+  return jsx3("div", {
+    style: { display: "flex", flexDirection: "column", minWidth: "64px", flexShrink: 1, maxWidth: "46%", gap: "1px" },
+    children: [
+      jsx3("span", { className: "truncate font-medium", style: Object.assign({ fontSize: "0.82rem", color: faded ? FADED_PRIMARY : "var(--ui-text-primary)", textDecoration: strike ? "line-through" : "none" }, SELECTABLE), children: fileName }),
+      filePath ? jsx3("span", { className: "truncate", style: Object.assign({ fontSize: "0.64rem", color: faded ? FADED_QUATERNARY : "var(--ui-text-quaternary)", marginTop: "-4px" }, SELECTABLE), children: filePath }) : null
+    ]
+  });
+}
+function OpAddress({ text, onSelectOp, fontSize, color, weight }) {
+  const [hover, setHover] = useState2(false);
+  const clickable = !!onSelectOp;
+  return jsx3("span", {
+    onClick: clickable ? (e) => {
+      e.stopPropagation();
+      onSelectOp();
+    } : void 0,
+    onMouseEnter: clickable ? () => setHover(true) : void 0,
+    onMouseLeave: clickable ? () => setHover(false) : void 0,
+    title: clickable ? "show the context as of this operation" : void 0,
+    style: Object.assign({
+      fontSize,
+      color: clickable && hover ? "var(--ui-text-primary)" : color,
+      whiteSpace: "nowrap",
+      cursor: clickable ? "pointer" : void 0
+    }, weight ? { fontWeight: weight } : null, SELECTABLE),
+    children: text
+  });
+}
+function CollapsedMeta({ opNumber, tag, onSelectOp }) {
+  const items = [opNumber || null, tag ? `tag: ${tag}` : null].filter(Boolean);
+  if (!items.length) return null;
+  return jsx3("div", {
+    style: { display: "flex", flexDirection: "column", gap: "2px", lineHeight: 1.05 },
+    children: items.map((t, i) => {
+      const isOp = t === opNumber && onSelectOp;
+      return jsx3("div", {
+        key: i,
+        children: jsx3(OpAddress, {
+          text: t,
+          onSelectOp: isOp ? onSelectOp : void 0,
+          fontSize: "0.6rem",
+          color: "var(--ui-text-quaternary)"
+        })
+      });
+    })
+  });
+}
+function PickSlot({ pick }) {
+  if (!pick || !pick.enabled) return null;
+  if (!pick.selectable) {
+    return jsx3("span", {
+      title: pick.why || "nothing to select here",
+      style: { color: "var(--ui-text-quaternary)" },
+      children: "\u2014"
+    });
+  }
+  return jsxs3("label", {
+    className: "inline-flex items-center gap-1 cursor-pointer select-none",
+    title: pick.why || void 0,
+    // Клик по галочке НЕ должен всплывать: выше на карточке сидит раскрытие тела, а на
+    // document — снятие режима затенения. Оба сработали бы заодно с постановкой галочки.
+    onClick: (e) => {
+      e.stopPropagation();
+    },
+    // Галочка слева, а справа от неё ДВЕ СТРОКИ — имя действия над ценой (владелец,
+    // 2026-09-09):
+    //
+    //         remove
+    //     []  120 tk
+    //
+    // Компактнее строки в один ряд, и — главное — цена стоит ПОД своим действием. Когда рядом
+    // встанет `delete` со своей цифрой, разные числа будут объяснены тем, над чем они написаны:
+    // у `remove` уходит содержимое, у `delete` — весь шаг, и весить это может по-разному.
+    //
+    // Цена НЕ так жирно, как имя действия: решение принимают по действию, цифра — основание, а
+    // не заголовок.
+    children: [
+      jsx3("input", {
+        type: "checkbox",
+        checked: !!pick.checked,
+        onChange: pick.onPick,
+        style: { accentColor: "var(--ui-red)", width: "10px", height: "10px", flexShrink: 0 }
+      }),
+      jsxs3("span", {
+        style: { display: "flex", flexDirection: "column", gap: "1px", lineHeight: 1.05 },
+        children: [
+          // Имя действия приходит извне (`pick.label`) — карточка не выбирает слов для
+          // операции, которую сама не выполняет. Следующее действие подставит сюда своё.
+          jsx3("span", {
+            style: { color: "var(--ui-text-secondary)", fontWeight: 500 },
+            children: pick.label || ""
+          }),
+          pick.tokensText ? jsx3("span", {
+            title: pick.exact ? "operation weight in tokens: answer plus call arguments" : "approximate: answer only, the call arguments have not loaded yet",
+            style: {
+              color: "var(--ui-text-quaternary)",
+              fontSize: "0.5rem",
+              fontVariantNumeric: "tabular-nums"
+            },
+            children: `${pick.exact ? "" : "~"}${pick.tokensText}`
+          }) : null
+        ]
+      })
+    ]
+  });
+}
+function Drawer({ drawerRef, open, onToggle, durationText, opNumber, tag, pick, staleItems, onSelectOp }) {
+  if (!open) {
+    return jsx3("button", {
+      ref: drawerRef,
+      onClick: onToggle,
+      title: "expand context actions",
+      className: "flex items-center justify-center gap-1 cursor-pointer",
+      style: {
+        position: "absolute",
+        top: 0,
+        bottom: 0,
+        right: 0,
+        zIndex: 10,
+        background: DRAWER_EDGE_HINT,
+        borderTopRightRadius: "6px",
+        borderBottomRightRadius: "6px",
+        padding: "0 8px 0 6px",
+        fontSize: "0.55rem",
+        whiteSpace: "nowrap",
+        color: "var(--ui-text-quaternary)"
+      },
+      children: [
+        jsx3(StaleBadge, { items: staleItems }),
+        jsx3(CollapsedMeta, { opNumber, tag, onSelectOp }),
+        jsx3("span", { children: durationText || "\u2014" })
+      ]
+    });
+  }
+  return jsxs3("div", {
+    ref: drawerRef,
+    className: "flex items-center gap-2",
+    style: {
+      position: "absolute",
+      top: 0,
+      bottom: 0,
+      right: 0,
+      zIndex: 10,
+      background: DRAWER_EDGE_HINT,
+      borderTopRightRadius: "6px",
+      borderBottomRightRadius: "6px",
+      padding: "0 18px 0 16px",
+      fontSize: "0.55rem",
+      whiteSpace: "nowrap"
+    },
+    children: [
+      jsx3(StaleStack, { items: staleItems }),
+      jsx3(PickSlot, { pick }),
+      tag ? jsx3("span", { style: Object.assign({ color: "var(--ui-text-tertiary)", fontSize: "0.68rem", fontWeight: 500 }, SELECTABLE), children: `tag: ${tag}` }) : null,
+      jsx3(OpAddress, {
+        text: opNumber,
+        onSelectOp,
+        fontSize: "0.68rem",
+        color: "var(--ui-text-tertiary)",
+        weight: 500
+      }),
+      jsx3("span", { style: { color: "var(--ui-text-quaternary)" }, children: durationText })
+    ]
+  });
+}
+var DIMMED_BG = "color-mix(in srgb, var(--ui-bg-elevated) 20%, transparent)";
+function OperationCardHeader({
+  statuses,
+  icon,
+  tool,
+  added,
+  removed,
+  fileName,
+  filePath,
+  command,
+  drawerOpen: initialOpen,
+  opNumber,
+  durationText,
+  tag,
+  pick = null,
+  staleItems = [],
+  attachedBelow = false,
+  disabled = false,
+  dimmed = false,
+  onHeaderClick,
+  toolColumnWidth,
+  onSelectOp
+}) {
+  const [localOpen, setOpen] = useState2(initialOpen);
+  const open = pick && pick.enabled ? true : localOpen;
+  const drawerRef = useRef2(null);
+  const [reserve, setReserve] = useState2(40);
+  useLayoutEffect(() => {
+    if (drawerRef.current) setReserve(drawerRef.current.offsetWidth);
+  });
+  return jsxs3("div", {
+    className: "rounded-md border overflow-hidden",
+    // CAPPED — не «на всякий случай»: в боевой панели карточка лежит внутри SDK ScrollArea,
+    // который даёт внутреннему контейнеру ширину ПО СОДЕРЖИМОМУ. Тогда width:100% считать не от
+    // чего (процент от родителя, чья ширина зависит от содержимого), и карточка растёт под самую
+    // длинную строку, уезжая за правый край панели. Ширину приходится прижимать к 100% на КАЖДОМ
+    // уровне цепочки, а не только у корня списка — см. brick.js, там та же причина.
+    style: Object.assign(
+      {
+        position: "relative",
+        borderColor: "var(--ui-stroke-secondary)",
+        backgroundColor: dimmed ? DIMMED_BG : "var(--ui-bg-elevated)"
+      },
+      CAPPED,
+      attachedBelow ? { borderBottomLeftRadius: 0, borderBottomRightRadius: 0 } : null,
+      disabled ? { opacity: 0.45, filter: "grayscale(70%)", pointerEvents: "none" } : null
+    ),
+    children: [
+      jsx3("div", {
+        className: "flex items-center gap-1.5",
+        onClick: onHeaderClick,
+        style: {
+          height: ROW_HEIGHT,
+          boxSizing: "border-box",
+          paddingLeft: "4px",
+          paddingRight: `${Math.round(reserve * 0.95)}px`,
+          cursor: onHeaderClick ? "pointer" : "default"
+        },
+        children: jsxs3("div", { className: "flex items-center gap-1.5", style: CAPPED, children: [
+          jsx3(StatusColumn, { statuses }),
+          // toolColumnWidth задаёт список (он один знает про соседей); без него карточка
+          // самодостаточна — считает ширину по своему собственному имени тула.
+          jsx3(ToolColumn, { icon, tool, added, removed, width: toolColumnWidth }),
+          // Удаление помечается ПРИГЛУШЕНИЕМ, а не зачёркиванием (владелец, 2026-09-09:
+          // «зачёркивание лишнее, лучше цвет текста прозрачнее»). Зачёркивание осталось за
+          // `disabled` — это другое состояние и другой смысл.
+          fileName ? jsx3(FileTarget, { fileName, filePath, strike: disabled, faded: dimmed }) : null,
+          // flexShrink выше, чем у имени файла — команда менее важна и отдаёт место первой при
+          // сужении панели, файл держит размер дольше.
+          command ? jsx3("code", {
+            className: "truncate",
+            style: Object.assign({ fontSize: "0.65rem", color: "var(--ui-text-secondary)", minWidth: 0, flexShrink: 4 }, SELECTABLE),
+            children: command
+          }) : null,
+          jsx3("div", { className: "flex-1 min-w-0" })
+        ] })
+      }),
+      jsx3(Drawer, { drawerRef, open, onToggle: () => setOpen((o) => !o), durationText, opNumber, tag, pick, staleItems, onSelectOp }),
+      // Крестика в режиме выбора нет: закрыть шторку он бы всё равно не смог (режим её
+      // перекрывает), а кнопка, которая на вид закрывает и не закрывает, хуже её отсутствия.
+      // Выход из режима — кнопкой режима, там же, где вход.
+      open && !(pick && pick.enabled) ? jsx3(CloseButton, { onClick: () => setOpen(false) }) : null
+    ]
+  });
+}
+
+// desktop/src/operation-card-body.js
+import { jsx as jsx4, jsxs as jsxs4 } from "react/jsx-runtime";
+import { useState as useState3 } from "react";
+var COMMENT_RE = /^\s*(\/\/|#|--|;|<!--|\*(?!\/))/;
+var LEADING_NUMBER_RE = /^(→\s*)?(\s*\d+)([:.|]?\s*)/;
+function headerEndIndex(lines) {
+  const re = separatorRe();
+  return lines.findIndex((l) => re.test(l));
+}
+function BodyLine({ text, header }) {
+  if (header) {
+    return jsx4("div", { style: { color: "var(--body-marker)" }, children: text || " " });
+  }
+  if (ownMarkerRe().test(text)) {
+    return jsx4("div", { style: { color: "var(--body-marker)" }, children: text });
+  }
+  if (COMMENT_RE.test(text)) {
+    return jsx4("div", { style: { color: "var(--body-comment)" }, children: text });
+  }
+  const m = text.match(LEADING_NUMBER_RE);
+  if (m) {
+    return jsxs4("div", { children: [
+      jsx4("span", { style: { color: "var(--body-mark)" }, children: m[0] }),
+      jsx4("span", { style: { color: "var(--body-text)" }, children: text.slice(m[0].length) })
+    ] });
+  }
+  return jsx4("div", { style: { color: "var(--body-text)" }, children: text || " " });
+}
+function BodyPreview({ text }) {
+  const lines = text.split("\n");
+  const headerEnd = headerEndIndex(lines);
+  return jsx4("div", {
+    className: "rounded-md border",
+    style: Object.assign({ maxHeight: "27rem", overflowX: "auto", overflowY: "auto", borderColor: "var(--ui-stroke-secondary)", backgroundColor: "var(--ui-bg-elevated)" }, CAPPED),
+    children: jsx4("div", {
+      className: "whitespace-pre font-mono p-2",
+      style: Object.assign({
+        fontSize: "0.65rem",
+        lineHeight: 1.4,
+        "--body-text": "var(--ui-text-primary)",
+        "--body-comment": "var(--ui-text-tertiary)",
+        "--body-marker": "var(--dt-secondary)",
+        "--body-mark": "var(--ui-orange)"
+      }, PRE, SELECTABLE),
+      children: lines.map((line, i) => jsx4(BodyLine, { key: i, text: line, header: headerEnd >= 0 && i <= headerEnd }))
+    })
+  });
+}
+function CommandBlock({ command }) {
+  const [open, setOpen] = useState3(false);
+  const preview = command.split("\n").slice(0, 2).join("\n");
+  const truncated = preview.length < command.length;
+  return jsxs4("div", {
+    className: "rounded-md border cursor-pointer",
+    style: { borderColor: "var(--ui-stroke-secondary)", backgroundColor: "var(--ui-bg-elevated)" },
+    onClick: () => setOpen((o) => !o),
+    children: [
+      jsxs4("div", {
+        className: "flex items-center gap-1 px-2 pt-1",
+        style: { fontSize: "0.55rem", color: "var(--ui-text-quaternary)" },
+        children: [
+          jsx4("span", { children: open ? "\u25BE" : "\u25B8" }),
+          jsx4("span", { children: "command" })
+        ]
+      }),
+      open ? jsx4("div", {
+        className: "whitespace-pre font-mono px-2 pb-1.5",
+        style: Object.assign({ fontSize: "0.6rem", color: "var(--ui-text-secondary)", maxHeight: "12rem", overflowX: "auto", overflowY: "auto" }, SELECTABLE),
+        children: command
+      }) : jsxs4("div", {
+        className: "whitespace-pre font-mono px-2 pb-1.5 overflow-hidden",
+        style: Object.assign({ fontSize: "0.6rem", color: "var(--ui-text-secondary)", maxHeight: "2.2em" }, SELECTABLE),
+        children: [preview, truncated ? " \u2026" : ""]
+      })
+    ]
+  });
+}
+function CardTray({ children }) {
+  return jsx4("div", {
+    className: "flex flex-col gap-1",
+    style: Object.assign({}, CAPPED, {
+      backgroundColor: "color-mix(in srgb, var(--ui-bg-elevated) 60%, var(--dt-background))",
+      border: "1px solid var(--ui-stroke-secondary)",
+      borderTop: "none",
+      borderBottomLeftRadius: "6px",
+      borderBottomRightRadius: "6px",
+      padding: "4px 8px",
+      boxSizing: "border-box"
+    }),
+    children
+  });
+}
+
+// desktop/src/operation-card.js
+function OperationCard({ headerProps, commandText, result }) {
+  const [bodyOpen, setBodyOpen] = useState4(false);
+  const canToggle = !headerProps.disabled && (commandText || result);
+  return jsxs5("div", {
+    style: CAPPED,
+    children: [
+      jsx5(OperationCardHeader, Object.assign({}, headerProps, {
+        attachedBelow: bodyOpen,
+        onHeaderClick: canToggle ? () => setBodyOpen((o) => !o) : void 0
+      })),
+      bodyOpen ? jsx5(CardTray, {
+        children: [
+          commandText ? jsx5(CommandBlock, { command: commandText }) : null,
+          result ? jsx5(BodyPreview, { text: result }) : null
+        ]
+      }) : null
+    ]
+  });
+}
+function mockStatuses(tool) {
+  const kindGuess = tool === "terminal" || tool === "execute_code" ? "warn" : "good";
+  return [
+    { tone: kindGuess, hint: `kind: MOCK (${kindGuess})` },
+    { tone: "muted", hint: "read: MOCK (unknown)" }
+  ];
+}
+
+// desktop/src/color-mixer.js
+var THEME_ACCENT = "var(--dt-primary)";
+function themeHue({ l, c, h }, share) {
+  return `oklch(from color-mix(in oklch, oklch(${l} ${c} ${h}), ${THEME_ACCENT} ${share}%) ${l} ${c} h / 1)`;
+}
+var COMPACT_TONE = `color-mix(in oklch, var(--ui-purple), ${THEME_ACCENT} 45%)`;
+var EXPORT_BASE = { l: 0.8, c: 0.17, h: 125 };
+var EXPORT_HUE_SHARE = 25;
+var EXPORT_TONE = themeHue(EXPORT_BASE, EXPORT_HUE_SHARE);
+var IMPORT_BASE = { l: 0.75, c: 0.13, h: 215 };
+var IMPORT_TONE = themeHue(IMPORT_BASE, EXPORT_HUE_SHARE);
+var ACTION_COLOR = {
+  content: "var(--ui-orange)",
+  tool: "var(--ui-purple)",
+  turn: "var(--ui-red)",
+  compact: COMPACT_TONE,
+  export: EXPORT_TONE,
+  erase: "var(--ui-red)",
+  import: IMPORT_TONE
+};
+function railFill(tone) {
+  return `color-mix(in oklch, ${tone}, transparent 45%)`;
+}
+var TOKEN_COLOR = {
+  fixed: `color-mix(in oklch, var(--ui-yellow), ${THEME_ACCENT} 30%)`,
+  msgs: THEME_ACCENT,
+  growth: `color-mix(in oklch, ${THEME_ACCENT}, transparent 55%)`,
+  ticked: COMPACT_TONE,
+  threshold: `oklch(from ${THEME_ACCENT} l c calc(h - 160) / 1)`,
+  over: "var(--ui-red)",
+  track: "color-mix(in oklch, var(--ui-text-quaternary), transparent 75%)"
+};
+
+// desktop/src/card-adapter.js
+var TOOL_ICON = {
+  read_file: "\u25E7",
+  write_file: "\u25E7",
+  patch: "\u25E7",
+  search_files: "\u2315",
+  terminal: "\u276F"
+};
+var KIND_LABEL = { ok: "done", error: "error", "no-change": "no change" };
+var FILE_TAG_RE = /FileTag:\s*(x[0-9a-fA-F]{2,4})/;
+function extractFileTag(body) {
+  if (typeof body !== "string" || body === "") return null;
+  const open = blockOpen();
+  for (const line of body.split("\n")) {
+    if (line.includes(open)) {
+      const b = line.match(blockTagRe());
+      return b ? b[1] : null;
+    }
+    const m = line.match(FILE_TAG_RE);
+    if (m) return m[1];
+  }
+  return null;
+}
+function splitPath(title) {
+  const t = typeof title === "string" ? title : "";
+  if (!t) return { fileName: "(no path)", filePath: null };
+  const i = Math.max(t.lastIndexOf("/"), t.lastIndexOf("\\"));
+  if (i < 0) return { fileName: t, filePath: null };
+  return { fileName: t.slice(i + 1), filePath: t.slice(0, i) };
+}
+function staleItemsFor(pct) {
+  const n2 = typeof pct === "number" && isFinite(pct) ? Math.round(pct) : 0;
+  if (n2 <= 0) return [];
+  return [{ label: `stale ${n2}%`, pct: n2 }];
+}
+function statusesFor(brick) {
+  if (isErasedBrick(brick)) {
+    const meta = brick.meta || {};
+    const when = formatWhen(meta.erased_at);
+    const by = typeof meta.erased_by === "string" ? meta.erased_by : "";
+    return [{
+      tone: "muted",
+      hint: ["erased", when, by ? `by ${by}` : ""].filter(Boolean).join(" \xB7 ")
+    }];
+  }
+  const out = [{
+    tone: KIND_TONE[brick.kind] || "muted",
+    hint: `result: ${KIND_LABEL[brick.kind] || brick.kind}`
+  }];
+  if (brick.read) {
+    const label = READ_STATE_LABEL[brick.read.state] || brick.read.state;
+    out.push({
+      tone: READ_STATE_TONE[brick.read.state] || "muted",
+      // БЕЗ ПРЕФИКСА. `в контексте: removed from context` — двуязычная бессмыслица, и
+      // владелец требовала это убрать несколько раз (2026-09-09). Подпись состояния
+      // самодостаточна: `дословно`, `сжато`, `removed from context` читаются без вводного
+      // слова, а с ним последняя превращается в «в контексте: убрано из контекста».
+      // Причину даёт маршрут (/reads), своих формулировок не сочиняем.
+      hint: `${label}${brick.read.reason ? ` \u2014 ${brick.read.reason}` : ""}`
+    });
+  }
+  return out;
+}
+function pickFor(brick, drop, onPick) {
+  const meta = brick.meta || {};
+  const op = typeof meta.op === "string" && meta.op ? meta.op : null;
+  const enabled = !!(drop && drop.mode);
+  if (!enabled) return null;
+  if (isErasedBrick(brick)) return null;
+  const action = actionOf(drop.action);
+  const dropped = meta.state === "removed_from_context" || !!(brick.read && brick.read.state === "removed_from_context");
+  if (dropped && action.mode === "content") return null;
+  const weight = opTokens(brick);
+  if (!op) {
+    return {
+      enabled: true,
+      selectable: false,
+      why: "no operation id \u2014 neither the button nor the command can address it"
+    };
+  }
+  return {
+    enabled: true,
+    selectable: true,
+    checked: !!(drop.picked && op in drop.picked),
+    onPick: onPick ? () => onPick(op, brick.tool_id || "") : void 0,
+    // Галочка подписана ГЛАГОЛОМ действия, а не «выбрать»: отмечая её, человек не выбирает
+    // абстрактно, а называет операцию, над которой действие произойдёт. Объект в этот момент
+    // известен и так — он написан на взведённой кнопке (см. boxOf в core.js).
+    label: boxOf(actionOf(drop.action)),
+    // `tk` у числа (владелец, 2026-09-09): «300 tk», иначе непонятно, что это токены, а не
+    // строки, байты или что-нибудь ещё, чего в этой панели показано достаточно.
+    tokensText: `${tokensLabel(weight.tokens)} tk`,
+    exact: weight.exact
+  };
+}
+function brickToCardProps(brick, toolColumnWidth, stalePct, drop, onPick) {
+  const meta = brick.meta || {};
+  const isCommand = isCommandTool(brick.tool);
+  const { fileName, filePath } = isCommand ? { fileName: null, filePath: null } : splitPath(brick.title);
+  return {
+    headerProps: {
+      statuses: statusesFor(brick),
+      staleItems: staleItemsFor(stalePct),
+      // Приглушить фон карточки, если операция удалена из контекста. Просьба владельца
+      // 2026-09-09: «когда их много, они сливаются» — одна точка состояния на карточке
+      // теряется в списке из тридцати, а удаление необратимо и должно быть заметно.
+      dimmed: !!(brick.read && brick.read.state === "removed_from_context"),
+      // `#L7` — формат надгробия, заведённый в палитре задолго до механизма: всё содержимое на
+      // месте, но карточка приглушена целиком, имя зачёркнуто и клики выключены. Владелец
+      // указала на него сама: «графика есть, и там имя зачёркнуто».
+      //
+      // Отличие от `dimmed` существенное и оба состояния нужны рядом: `dimmed` — операция есть,
+      // содержимого нет (после `drop content`), с ней можно работать. `disabled` — операции нет
+      // вовсе, работать не с чем.
+      disabled: isErasedBrick(brick),
+      icon: TOOL_ICON[brick.tool] || "\u25C6",
+      tool: brick.tool,
+      added: meta.added,
+      removed: meta.removed,
+      fileName,
+      filePath,
+      // Файловые тулы: subtitle — «что именно сделано» из аргументов вызова (`line 42`,
+      // `@ line 7`, `pattern "..."`, `overwrite`). Командные: сама команда из title, а subtitle
+      // (там лежит явно заданный workdir) приписываем к ней — иначе он не показался бы нигде.
+      command: isCommand ? [brick.title, brick.subtitle].filter(Boolean).join("  \xB7 ") || null : brick.subtitle || null,
+      durationText: formatDuration(meta.duration_s),
+      tag: extractFileTag(brick.body),
+      // Адрес операции (Plan09). Слот в карточке существовал с самого начала —
+      // «формат придуман, генератор не существует»; генератор теперь есть, это
+      // сервис леджера (file_ops/_ledger.py::next_op), и адрес приходит в
+      // meta.op из шапки нашего же ответа.
+      // В карточке метка СОКРАЩЁННАЯ (`op:`), в тексте для модели — полная
+      // (`Operation ID:`, _tool_text.OP_LABEL). Расхождение намеренное: полное
+      // слово нужно модели, которой сокращение приходится угадывать, а слот в
+      // шапке карточки узкий и читает его человек, у которого адрес перед
+      // глазами каждый день. Значение при этом одно и то же.
+      opNumber: typeof meta.op === "string" && meta.op ? `op: ${meta.op}` : null,
+      pick: pickFor(brick, drop, onPick),
+      toolColumnWidth
+    },
+    commandText: null,
+    result: brick.body
+  };
+}
+var CHIP_STATUS = {
+  error: { glyph: "\u25CF", tone: "var(--ui-red)", title: "result: error" },
+  noChange: { glyph: "=", tone: "var(--ui-text-quaternary)", title: "result: no change" },
+  dropped: { glyph: "\u2298", tone: ACTION_COLOR.content, title: "removed from context (drop content)" },
+  compacted: { glyph: "\u25D0", tone: ACTION_COLOR.compact, title: "compacted" },
+  evicted: { glyph: "\u2205", tone: "var(--ui-red)", title: "evicted: no longer in the active window" },
+  unknown: { glyph: "?", tone: "var(--ui-text-quaternary)", title: "read state: could not be matched" },
+  // НЕ ромб (владелец, 2026-09-29: «похож на точку»). Пунктирная рамка — «не наш». На чипе
+  // встаёт НА МЕСТО иконки тула, как и точка ошибки: иконка чужому тулу не нужна.
+  foreign: { glyph: "\u2B1A", tone: "var(--ui-orange)", title: "foreign tool: no operation of ours carries this tool_call_id" },
+  unrecorded: { glyph: "\u25CB", tone: "var(--ui-text-quaternary)", title: "ours, no ledger record" }
+};
+function chipState(brick, fact) {
+  const meta = brick && brick.meta || {};
+  return fact && fact.state || meta.state || brick && brick.read && brick.read.state || "";
+}
+function chipStatuses({ brick, fact, foreign, unrecorded }) {
+  const out = [];
+  const kind = brick && brick.kind || fact && fact.kind || "ok";
+  if (kind === "error") out.push(CHIP_STATUS.error);
+  else if (kind === "no-change") out.push(CHIP_STATUS.noChange);
+  const state = chipState(brick, fact);
+  if (state === "removed_from_context") out.push(CHIP_STATUS.dropped);
+  else if (state === "compacted" || brick && brick.meta && brick.meta.compacted) out.push(CHIP_STATUS.compacted);
+  else if (state === "evicted") out.push(CHIP_STATUS.evicted);
+  else if (state === "unknown") out.push(CHIP_STATUS.unknown);
+  if (foreign) out.push(CHIP_STATUS.foreign);
+  if (unrecorded) out.push(CHIP_STATUS.unrecorded);
+  return out;
+}
+function brickSubject(brick) {
+  if (!brick) return "";
+  const tool = String(brick.tool || "");
+  let t = String(brick.title || "");
+  if (tool && t.startsWith(tool + " ")) t = t.slice(tool.length + 1);
+  return t === tool ? "" : t.trim();
+}
+function chipTarget({ brick, fact, target }) {
+  if (fact && fact.file) return fact.file;
+  const subject = brickSubject(brick);
+  if (subject) return isCommandTool(brick.tool) ? subject : splitPath(subject).fileName;
+  const t = String(target || "").replace(/\\/g, "/");
+  return t ? t.split("/").filter(Boolean).pop() || t : "";
+}
+function chipDiff(brick) {
+  const meta = brick && brick.meta || {};
+  const added = Number.isFinite(Number(meta.added)) ? Number(meta.added) : 0;
+  const removed = Number.isFinite(Number(meta.removed)) ? Number(meta.removed) : 0;
+  return added || removed ? { added, removed } : null;
+}
+function chipTipLines({ name, op, brick, fact, target, statuses, tokens, freshness }) {
+  const meta = brick && brick.meta || {};
+  const lines = [];
+  lines.push([name, op ? `op ${op}` : ""].filter(Boolean).join(" \xB7 "));
+  const subject = brickSubject(brick);
+  const command = brick && isCommandTool(brick.tool) ? subject : "";
+  const path = fact && fact.path || (command ? "" : subject) || String(target || "");
+  if (command) lines.push(`command: ${command}`);
+  else if (path) lines.push(path);
+  if (brick && brick.subtitle) lines.push(brick.subtitle);
+  const diff = chipDiff(brick);
+  if (diff) lines.push(`lines: +${diff.added} \u2212${diff.removed}`);
+  (statuses || []).forEach((s) => lines.push(`${s.glyph}  \u2014  ${s.title}`));
+  const dur = formatDuration(meta.duration_s);
+  lines.push([tokens ? `${tokens} tk` : "", `freshness: ${freshness}`, dur ? `took ${dur}` : ""].filter(Boolean).join(" \xB7 "));
+  return lines.filter(Boolean);
+}
+
+// desktop/src/core-window.js
+var ROW_PX = 34;
+var NOTE_ESTIMATE_PX = 30;
+var OVERSCAN_PX = 400;
+var TAIL_GUARANTEE = 20;
+function estimateBrickHeight(b) {
+  return ROW_PX + (b && b.note ? NOTE_ESTIMATE_PX : 0);
+}
+function renderWindow(bricks, scrollTop, viewportHeight) {
+  const list = Array.isArray(bricks) ? bricks : [];
+  const heights = list.map(estimateBrickHeight);
+  const total = heights.reduce((sum, h) => sum + h, 0);
+  if (!list.length) return { start: 0, end: 0, topSpacer: 0, bottomSpacer: 0, total: 0 };
+  const lo = Math.max(0, (scrollTop || 0) - OVERSCAN_PX);
+  const hi = (scrollTop || 0) + (viewportHeight || 0) + OVERSCAN_PX;
+  let offset = 0;
+  let start = 0;
+  let end = list.length;
+  for (let i = 0; i < list.length; i++) {
+    if (offset >= hi) {
+      end = i;
+      break;
+    }
+    if (offset + heights[i] <= lo) start = i + 1;
+    offset += heights[i];
+  }
+  end = Math.max(end, list.length - TAIL_GUARANTEE);
+  if (start > end) start = end;
+  let topSpacer = 0;
+  for (let i = 0; i < start; i++) topSpacer += heights[i];
+  let bottomSpacer = 0;
+  for (let i = end; i < list.length; i++) bottomSpacer += heights[i];
+  return { start, end, topSpacer, bottomSpacer, total };
+}
+
+// desktop/src/palette/index.js
+import { jsx as jsx18, jsxs as jsxs18 } from "react/jsx-runtime";
+import * as sdk6 from "@hermes/plugin-sdk";
+
+// desktop/src/palette/buttons.js
+import { jsx as jsx6, jsxs as jsxs6 } from "react/jsx-runtime";
+function jsxSemanticSoft(label, colorHex) {
+  return jsx6("button", {
+    className: "px-3 py-1 rounded-md text-xs font-medium cursor-pointer active:scale-95 transition-colors duration-150 ease-out select-none",
+    style: Object.assign(
+      { backgroundColor: `color-mix(in oklch, ${colorHex} 8%, transparent)`, color: colorHex },
+      SELECTABLE
+    ),
+    onMouseEnter: (e) => {
+      e.currentTarget.style.backgroundColor = `color-mix(in oklch, ${colorHex} 15%, transparent)`;
+    },
+    onMouseLeave: (e) => {
+      e.currentTarget.style.backgroundColor = `color-mix(in oklch, ${colorHex} 8%, transparent)`;
+    },
+    children: label
+  });
+}
+function ButtonsSection() {
+  return paletteTile("Buttons", jsxs6("div", {
+    className: "flex flex-col gap-1.5",
+    style: {
+      fontSize: "0.7rem",
+      // Токены от var(--dt-primary), определены ОДИН РАЗ здесь и переиспользуются ниже
+      // (#A2, #A7) — правило C2, не дублировать формулу/значение.
+      // bg: ~85% непрозрачности — чуть снижает контраст заливки в обеих темах.
+      "--btn-primary-bg": "color-mix(in oklch, var(--dt-primary) 85%, transparent)",
+      // hover-bg: lightness тянется К СЕРЕДИНЕ (0.5) — тот же приём, что в #G8.
+      "--btn-primary-hover-bg": "oklch(from var(--dt-primary) calc(l + (0.5 - l) * 0.55) c h)",
+      // contrast: НЕ математика от собственной светлоты --dt-primary (проверено 2026-09-02 —
+      // не инвертируется со сменой темы, если у бренд-цвета светлота похожа в обеих темах).
+      // Вместо этого — цвет фона приложения (--dt-background): он ПО ОПРЕДЕЛЕНИЮ инвертируется
+      // с темой, и весь текст приложения и так рассчитан быть читаемым на нём.
+      "--btn-primary-contrast": "var(--dt-background)"
+    },
+    children: [
+      // Primary variants — visible buttons, not hidden links
+      jsx6("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#A1 Primary" }),
+      jsxs6("div", { className: "flex flex-wrap gap-1", children: [
+        // #A2 — БЫЛ на bg-primary/90: этот opacity-slash класс не докомпилен (найдено 2026-09-02,
+        // визуально — почти невидимая кнопка, только текст). Голый bg-primary РАБОТАЕТ (см. #A6/#A7),
+        // поэтому фон и текст переведены на инлайн var(--dt-primary). Текст и hover-фон — через
+        // --btn-primary-contrast/--btn-primary-hover-bg (определены один раз на обёртке выше).
+        jsx6("button", {
+          className: "px-3 py-1 rounded-md text-xs font-medium cursor-pointer active:scale-95 transition-colors duration-150 ease-out select-none",
+          style: Object.assign({ backgroundColor: "var(--btn-primary-bg)", color: "var(--btn-primary-contrast)" }, SELECTABLE),
+          onMouseEnter: (e) => {
+            e.currentTarget.style.backgroundColor = "var(--btn-primary-hover-bg)";
+          },
+          onMouseLeave: (e) => {
+            e.currentTarget.style.backgroundColor = "var(--btn-primary-bg)";
+          },
+          children: "#A2 Primary"
+        }),
+        // #A4 — soft primary (tinted background, primary text)
+        jsx6("button", { className: "px-3 py-1 rounded-md bg-primary/20 text-primary text-xs font-medium cursor-pointer hover:bg-primary/30 active:scale-95 transition-colors duration-150 ease-out select-none", children: "#A4 Soft" }),
+        // #A5 — ghost ✓
+        jsx6("button", { className: "px-3 py-1 rounded-full border border-(--ui-stroke-secondary) bg-transparent text-muted-foreground text-xs font-medium cursor-pointer hover:bg-(--ui-bg-tertiary) hover:text-foreground active:scale-95 transition-colors duration-150 ease-out select-none", children: "#A5 Ghost" }),
+        // #A6 — outline ✓
+        jsx6("button", { className: "px-3 py-1 rounded-full border border-primary/40 bg-transparent text-primary text-xs font-medium cursor-pointer hover:bg-primary/10 active:scale-95 transition-colors duration-150 ease-out select-none", children: "#A6 Outline" }),
+        // Accent text on primary background — обычное состояние var(--dt-accent), hover
+        // переключает на --btn-primary-contrast (ту же вычисленную переменную, что и текст
+        // #A2 — не отдельная константа, JS-обработчик вместо hover: в className, потому что
+        // Tailwind вырезает произвольные значения).
+        jsx6("button", { className: "px-3 py-1 rounded-full text-xs font-medium cursor-pointer active:scale-95 transition-all duration-150 ease-out select-none", style: Object.assign({ backgroundColor: "var(--btn-primary-bg)", color: "var(--dt-accent)" }, SELECTABLE), onMouseEnter: (e) => {
+          e.currentTarget.style.color = "var(--btn-primary-contrast)";
+        }, onMouseLeave: (e) => {
+          e.currentTarget.style.color = "var(--dt-accent)";
+        }, children: "#A7 accent on primary" })
+      ] }),
+      // Secondary / neutral — bodies must be visible, not just text on background
+      jsx6("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#A8 Neutral" }),
+      jsxs6("div", { className: "flex flex-wrap gap-1", children: [
+        // #A9 Secondary — БЫЛ на bg-background/90 (не opacity-класс темы, а почти непрозрачный
+        // background) — визуально читался ТЯЖЕЛЕЕ primary, хотя должен быть легче. Заменено на
+        // var(--ui-bg-secondary) (M18, живая, буквально "вторичная поверхность" по смыслу темы).
+        jsx6("button", { className: "px-3 py-1 rounded-md border border-(--ui-stroke-quaternary) text-xs font-medium cursor-pointer hover:bg-(--ui-bg-tertiary) active:scale-95 transition-colors duration-150 ease-out select-none", style: Object.assign({ backgroundColor: "var(--ui-bg-secondary)" }, SELECTABLE), children: "#A9 Secondary" }),
+        // #A10 Muted — БЫЛ на bg-muted/20 (слишком бледный/не докомпилен, фона почти не видно).
+        // Заменено на var(--ui-bg-tertiary) (M19) — видимый, но заведомо более тихий, чем Secondary.
+        jsx6("button", { className: "px-3 py-1 rounded-md text-muted-foreground text-xs font-medium cursor-pointer hover:bg-primary/5 active:scale-95 transition-colors duration-150 ease-out select-none", style: Object.assign({ backgroundColor: "var(--ui-bg-tertiary)" }, SELECTABLE), children: "#A10 Muted" }),
+        // #A11 Chip — pill shape with faint accent border (primary tint instead of stroke)
+        jsx6("button", { className: "px-2.5 py-1 rounded-full bg-primary/5 text-xs font-medium cursor-pointer hover:bg-primary/10 active:scale-95 transition-colors duration-100 ease-out select-none", children: "#A11 Chip" }),
+        // #A12 Tag → — pill shape, scale UP on hover (not down), accent border distinct from chip
+        jsx6("button", { className: "px-2.5 py-1 rounded-full border border-(--ui-stroke-secondary)/40 text-xs font-medium cursor-pointer hover:bg-(--ui-row-hover-background) hover:scale-105 active:scale-95 transition-all duration-100 ease-out select-none", children: "#A12 Tag \u2192" })
+      ] }),
+      // Destructive / semantic — INLINE STYLES ONLY (Tailwind CSS vars AND hex arbitrary values are tree-shaken!)
+      jsx6("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#A13 Semantic" }),
+      jsxs6("div", { className: "flex flex-wrap gap-1", children: [
+        // БЫЛ на hsl(var(--destructive))/hsl(var(--destructive-foreground)) — голых переменных
+        // без dt- нет в теме вовсе (в F12-дампе есть только --dt-destructive), фон был невидим,
+        // оставался только текст. Заменено на var(--ui-red) (M10, живая) + var(--dt-background)
+        // для текста — тот же приём, что и у #A2/#A7 (инвертируется с темой).
+        jsx6("button", {
+          className: "px-3 py-1 rounded-md text-xs font-medium cursor-pointer active:scale-95 transition-colors duration-150 ease-out select-none",
+          style: Object.assign({ backgroundColor: "color-mix(in oklch, var(--ui-red) 85%, transparent)", color: "var(--dt-background)" }, SELECTABLE),
+          children: "#A14 Destructive"
+        }),
+        // Живые переменные из M10-16, а не захардкоженный hex — тот же цвет, но не константа.
+        jsxSemanticSoft("#A15 Error soft", "var(--ui-red)"),
+        jsxSemanticSoft("#A16 Success", "var(--ui-green)"),
+        jsxSemanticSoft("#A17 Warning", "var(--ui-yellow)"),
+        jsxSemanticSoft("#A18 Purple", "var(--ui-purple)")
+      ] }),
+      jsx6("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#A19 Disabled (\u0441\u043E\u0441\u0442\u043E\u044F\u043D\u0438\u0435, \u043D\u0435 \u043E\u0442\u0434\u0435\u043B\u044C\u043D\u044B\u0439 \u0432\u0438\u0434 \u2014 \u043D\u0430 \u043B\u044E\u0431\u043E\u043C \u0432\u0438\u0434\u0435 \u0432\u044B\u0448\u0435)" }),
+      jsxs6("div", { className: "flex flex-wrap gap-1", children: [
+        // #A20 — та же проблема с bg-primary/90, что и была у #A2; тот же фикс.
+        jsx6("button", {
+          disabled: true,
+          className: "px-3 py-1 rounded-md text-xs font-medium opacity-40 pointer-events-none cursor-not-allowed select-none",
+          style: Object.assign({ backgroundColor: "var(--dt-primary)", color: "var(--dt-primary-foreground, #fcfcfc)" }, SELECTABLE),
+          children: "#A20 Disabled primary"
+        }),
+        jsx6("button", { disabled: true, className: "px-3 py-1 rounded-md border border-(--ui-stroke-secondary) bg-transparent text-xs font-medium opacity-50 pointer-events-none cursor-not-allowed select-none", children: "#A21 Disabled ghost" })
+      ] }),
+      // Sizes
+      jsx6("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#A22 Sizes" }),
+      jsxs6("div", { className: "flex flex-wrap items-center gap-1", children: [
+        jsx6("button", { className: "px-2 py-0.5 rounded text-[0.6rem] font-medium bg-primary/20 text-primary cursor-pointer hover:bg-primary/30 select-none", children: "#A23 XS" }),
+        jsx6("button", { className: "px-2.5 py-1 rounded-md text-xs font-medium bg-primary/20 text-primary cursor-pointer hover:bg-primary/30 select-none", children: "#A24 SM" }),
+        jsx6("button", { className: "px-3 py-1.5 rounded-md text-sm font-medium bg-primary/20 text-primary cursor-pointer hover:bg-primary/30 select-none", children: "#A25 MD" })
+      ] }),
+      // Reveal on hover — buttons that appear when hovering their container (Hermes pattern)
+      jsx6("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#A26 Reveal on hover (group-hover)" }),
+      jsxs6("div", { className: "flex flex-col gap-1 select-none", style: SELECTABLE, children: [
+        // Row with hidden action buttons — matches Hermes session list / file row pattern
+        jsxs6("div", {
+          className: "group relative flex items-center justify-between px-2 py-1 rounded-md border border-(--ui-stroke-quaternary) cursor-default hover:bg-(--ui-row-hover-background) transition-colors duration-100 ease-out",
+          children: [
+            jsx6("span", { className: "text-[0.6rem] truncate flex-1", children: "#A27 Hover this row to reveal actions \u2192" }),
+            jsxs6("div", { className: "flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-100 ease-out", children: [
+              jsx6("button", { className: "px-2 py-0.5 rounded text-[0.55rem] bg-transparent cursor-pointer hover:bg-(--ui-bg-tertiary) select-none", children: "#A28 edit" }),
+              jsx6("button", { className: "px-2 py-0.5 rounded text-[0.55rem] bg-destructive/10 text-destructive cursor-pointer hover:bg-destructive/20 select-none", children: "#A29 delete" })
+            ] })
+          ]
+        }),
+        // Icon-style reveal buttons (common in Hermes toolbars)
+        jsxs6("div", {
+          className: "group relative flex items-center justify-between px-2 py-1 rounded-md border border-(--ui-stroke-quaternary) cursor-default hover:bg-(--ui-row-hover-background) transition-colors duration-100 ease-out",
+          children: [
+            jsx6("span", { className: "text-[0.6rem] truncate flex-1", children: "#A30 Hover for icons \u2192" }),
+            jsxs6("div", { className: "flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-100 ease-out", children: [
+              jsx6("button", { className: "w-5 h-5 rounded flex items-center justify-center text-[0.6rem] bg-transparent cursor-pointer hover:bg-(--ui-bg-tertiary) select-none", title: "#A31 copy", children: "\u29C9" }),
+              jsx6("button", { className: "w-5 h-5 rounded flex items-center justify-center text-[0.6rem] bg-transparent cursor-pointer hover:bg-(--ui-bg-tertiary) select-none", title: "#A32 more", children: "\u22EF" })
+            ] })
+          ]
+        })
+      ] })
+    ]
+  }));
+}
+
+// desktop/src/palette/cards.js
+import { jsx as jsx7, jsxs as jsxs7 } from "react/jsx-runtime";
+function CardsSection() {
+  return paletteTile("Cards & Panels", jsxs7("div", {
+    className: "flex flex-col gap-1.5",
+    style: {
+      fontSize: "0.7rem",
+      // ЕДИНСТВЕННОЕ место с значениями: 7 токенов shiki (светлый / тёмный) через light-dark().
+      // На уровне ВСЕЙ секции (не только #B15-контейнера), чтобы #B16 мог быть отдельным
+      // сиблингом и всё равно унаследовать эти же переменные — без дублирования (правило C2).
+      "--cc-bg": "light-dark(rgb(255 255 255 / 0.7), rgb(34 39 46 / 0.7))",
+      // фон карточки (прозрачность ~30%)
+      "--cc-text": "light-dark(rgb(31, 35, 40), rgb(173, 186, 199))",
+      // обычный текст
+      "--cc-comment": "light-dark(rgb(87, 96, 106), rgb(118, 131, 144))",
+      // комментарий
+      "--cc-string": "light-dark(rgb(10, 48, 105), rgb(150, 208, 255))",
+      // строки
+      "--cc-fn": "light-dark(rgb(130, 80, 223), rgb(220, 189, 251))",
+      // функции/ключевые слова
+      "--cc-op": "light-dark(rgb(207, 34, 46), rgb(244, 112, 103))",
+      // операторы
+      "--cc-num": "light-dark(rgb(5, 80, 174), rgb(108, 182, 255))",
+      // числа/голубое слово
+      "--cc-mark": "light-dark(rgb(149, 56, 0), rgb(246, 157, 80))"
+      // маркеры строк (оранжевый, из #B16)
+    },
+    children: [
+      jsx7("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#B1 Surfaces" }),
+      jsxs7("div", { className: "grid grid-cols-2 gap-1", children: [
+        jsx7("div", { className: "px-2 py-1.5 rounded-md border border-(--ui-stroke-secondary) bg-card text-[0.6rem] truncate", title: "#B2 bg-card + border", children: "#B2 bg-card" }),
+        jsx7("div", { className: "px-2 py-1.5 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) text-[0.6rem] truncate", title: "#B3 elevated + border", children: "#B3 elevated" }),
+        // #B4 — БЫЛ на bg-background/80 (opacity-slash, ненадёжен — та же болезнь, что у кнопок).
+        // Инлайн color-mix + backdrop-blur-sm класс оставлен (сам blur — не opacity-класс).
+        jsx7("div", { className: "px-2 py-1.5 rounded-lg border border-(--ui-stroke-tertiary) backdrop-blur-sm text-[0.6rem] truncate", style: { backgroundColor: "color-mix(in oklch, var(--dt-background), transparent 20%)" }, title: "#B4 glass + blur", children: "#B4 glass" }),
+        // #B5 — БЫЛ на bg-(--ui-bg-secondary) (paren-var класс, не докомпилен для bg- с этим
+        // именем — border-(--ui-stroke-*) с тем же именем работает, bg- нет; непредсказуемо
+        // без проверки каждого класса, поэтому инлайн — надёжнее). var(--ui-bg-secondary)
+        // оказался слишком ярким — заменено на var(--ui-bg-card), тише (2026-09-02).
+        jsx7("div", { className: "px-2 py-1.5 rounded-md border border-transparent text-[0.6rem] truncate", style: { backgroundColor: "var(--ui-bg-card)" }, title: "#B5 secondary no border", children: "#B5 secondary" })
+      ] }),
+      // Radius variants
+      jsx7("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#B6 Radius" }),
+      jsxs7("div", { className: "flex flex-wrap gap-1", children: [
+        jsx7("div", { className: "px-2 py-1 rounded-sm border border-(--ui-stroke-secondary) bg-muted/40 text-[0.6rem]", children: "#B7 sm" }),
+        jsx7("div", { className: "px-2 py-1 rounded-md border border-(--ui-stroke-secondary) bg-muted/40 text-[0.6rem]", children: "#B8 md" }),
+        jsx7("div", { className: "px-2 py-1 rounded-lg border border-(--ui-stroke-secondary) bg-muted/40 text-[0.6rem]", children: "#B9 lg" }),
+        jsx7("div", { className: "px-2 py-1 rounded-xl border border-(--ui-stroke-secondary) bg-muted/40 text-[0.6rem]", children: "#B10 xl" }),
+        jsx7("div", { className: "px-3 py-1 rounded-full border border-(--ui-stroke-secondary) bg-muted/40 text-[0.6rem]", children: "#B11 full" })
+      ] }),
+      // Shadow variants
+      jsx7("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#B12 Shadows" }),
+      jsxs7("div", { className: "flex flex-wrap gap-1", children: [
+        jsx7("div", { className: "px-2 py-1 rounded-md border border-(--ui-stroke-secondary) bg-card shadow-sm text-[0.6rem]", children: "#B13 sm" }),
+        jsx7("div", { className: "px-2 py-1 rounded-md border border-(--ui-stroke-secondary) bg-card shadow-md text-[0.6rem]", children: "#B14 md" })
+      ] }),
+      // ── CODE CARD (shiki github-dark-dimmed/light-default) ────────────────
+      // Токены определены ОДИН РАЗ ниже как CSS-переменные (--cc-*), все спаны — только var().
+      jsx7("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#B15 Code card (shiki themes, tokens = vars)" }),
+      jsxs7("div", {
+        className: "rounded-md border border-(--ui-stroke-secondary) overflow-hidden select-none",
+        style: Object.assign({ backgroundColor: "var(--cc-bg)" }, CAPPED),
+        children: [
+          jsx7("pre", {
+            className: "m-0 overflow-x-auto font-mono leading-relaxed whitespace-pre",
+            style: Object.assign({ padding: "0.5rem 0.75rem", fontSize: "0.6rem" }, SELECTABLE_SMALL, SCROLLER),
+            children: [
+              // Comment (gray) — var only, zero literals
+              jsx7("span", { style: { color: "var(--cc-comment)" }, children: "// #B17 comment token\n" }),
+              // String (blue)
+              jsx7("span", { style: { color: "var(--cc-string)" }, children: "'#B18 mix 25%'" }),
+              // Plain text (dark gray)
+              jsx7("span", { style: { color: "var(--cc-text)" }, children: " \u2192 color-" }),
+              // Function (purple)
+              jsx7("span", { style: { color: "var(--cc-fn)" }, children: "mix" }),
+              // Operator (red)
+              jsx7("span", { style: { color: "var(--cc-op)" }, children: "(" }),
+              // Keyword (blue)
+              jsx7("span", { style: { color: "var(--cc-num)" }, children: "in" }),
+              // Plain text
+              jsx7("span", { style: { color: "var(--cc-text)" }, children: " oklch, #e75e78, var(--dt-primary) " }),
+              // Number (blue)
+              jsx7("span", { style: { color: "var(--cc-num)" }, children: "25" }),
+              // Operator (red)
+              jsx7("span", { style: { color: "var(--cc-op)" }, children: "%)\n\n" }),
+              // Second line for visual density
+              jsx7("span", { style: { color: "var(--cc-comment)" }, children: "// #B19 second comment\n" }),
+              jsx7("span", { style: { color: "var(--cc-text)" }, children: "#B20 label + " }),
+              jsx7("span", { style: { color: "var(--cc-string)" }, children: "'#B21 mix 50%'" }),
+              jsx7("span", { style: { color: "var(--cc-text)" }, children: ' \u2192 "color-mix(in oklch)";\n\n' }),
+              // Third line: pure operators / keywords
+              jsx7("span", { style: { color: "var(--cc-text)" }, children: "#B22 tokens: " }),
+              jsx7("span", { style: { color: "var(--cc-op)" }, children: "(operator)" }),
+              jsx7("span", { style: { color: "var(--cc-text)" }, children: " + " }),
+              jsx7("span", { style: { color: "var(--cc-fn)" }, children: "(keyword)" })
+            ]
+          })
+        ]
+      }),
+      // ── #B16 FILE-DIFF TOOL-BLOCK (сиблинг #B15, не вложен — наследует --cc-* с уровня
+      // ВСЕЙ секции, см. её style выше; было вложено в #B15, вынесено по просьбе 2026-09-01) ──
+      // Счётчики и строка: дословные precompiled-классы из исходников приложения.
+      // Live-переменные (--ui-diff-*, --conversation-scaffold-text) — ссылки, значения НЕ копируем.
+      jsx7("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#B16 File-diff tool-block (live vars + shared cc tokens)" }),
+      jsxs7("div", {
+        className: "rounded-md border border-(--ui-stroke-tertiary) overflow-hidden select-none",
+        // Тот же --cc-bg, что у #B15 (та же секция, наследуется с общего style выше) — по
+        // просьбе 2026-09-02, раньше у #B16 фона не было задано вообще.
+        style: Object.assign({ backgroundColor: "var(--cc-bg)" }, CAPPED),
+        children: [
+          // Шапка: live var для имени файла; счётчики — precompiled Tailwind emerald/rose (как в приложении)
+          jsxs7("div", { className: "flex items-center gap-1 px-2 py-1 border-b border-(--ui-stroke-tertiary)", title: "F12: --conversation-scaffold-text?", children: [
+            jsx7("span", { style: Object.assign({ color: "var(--cc-comment)", fontSize: "0.65rem" }, SELECTABLE), children: "\u2263" }),
+            jsx7("span", { className: "min-w-0 truncate font-mono text-[0.6rem]", style: { color: "var(--conversation-scaffold-text)" }, title: "F12: --conversation-scaffold-text?", children: "implementation_plan.md" }),
+            jsx7("span", { className: "ml-auto shrink-0 font-mono text-[0.55rem] tabular-nums text-emerald-600 dark:text-emerald-400", title: "precompiled class \u0438\u0437 \u0438\u0441\u0445\u043E\u0434\u043D\u0438\u043A\u043E\u0432 \u043F\u0440\u0438\u043B\u043E\u0436\u0435\u043D\u0438\u044F (\u043A\u0430\u043A \u0432 \u0447\u0430\u0442\u0435)", children: "+1" }),
+            jsx7("span", { className: "shrink-0 font-mono text-[0.55rem] tabular-nums text-rose-600 dark:text-rose-400", title: "precompiled class \u0438\u0437 \u0438\u0441\u0445\u043E\u0434\u043D\u0438\u043A\u043E\u0432 \u043F\u0440\u0438\u043B\u043E\u0436\u0435\u043D\u0438\u044F (\u043A\u0430\u043A \u0432 \u0447\u0430\u0442\u0435)", children: "\u22121" })
+          ] }),
+          // Тело diff: токены текста — var(--cc-*), live vars только для подсветки строк
+          jsx7("pre", {
+            className: "m-0 overflow-x-auto font-mono leading-relaxed whitespace-pre",
+            style: Object.assign({ padding: "0.5rem 0" }, SELECTABLE_SMALL, SCROLLER),
+            title: "F12: --ui-diff-add/remove-background/border?",
+            children: [
+              jsxs7("div", { className: "whitespace-pre pl-3 pr-2 py-px border-l-2 border-transparent", style: Object.assign({ fontSize: "0.6rem" }, SELECTABLE), title: "#B23 normal line: --cc-mark + --cc-text/--cc-num", children: [
+                jsx7("span", { style: { color: "var(--cc-mark)" }, children: "4." }),
+                jsx7("span", { style: { color: "var(--cc-text)" }, children: " [ ] V1\u2013V3 (\xA70) \u2014 \u0437\u0430\u0444\u0438\u043A\u0441\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0432 impl-log" })
+              ] }),
+              jsxs7("div", { className: "whitespace-pre pl-3 pr-2 py-px border-l-2", style: Object.assign({ fontSize: "0.6rem", borderColor: "var(--ui-diff-remove-border)", backgroundColor: "var(--ui-diff-remove-background)" }, SELECTABLE), title: "#B24 removed line: live vars --ui-diff-remove-*", children: [
+                jsx7("span", { style: { color: "var(--cc-mark)" }, children: "5." }),
+                jsx7("span", { style: { color: "var(--cc-text)" }, children: " [ ] Handler \u0432 tools.py (\u0432\u044B\u0434\u0430\u0447\u0430 \u0438\u0437 " }),
+                jsx7("span", { style: { color: "var(--cc-num)" }, children: "`_PENDING`" }),
+                jsx7("span", { style: { color: "var(--cc-text)" }, children: ")" })
+              ] }),
+              jsxs7("div", { className: "whitespace-pre pl-3 pr-2 py-px border-l-2", style: Object.assign({ fontSize: "0.6rem", borderColor: "var(--ui-diff-add-border)", backgroundColor: "var(--ui-diff-add-background)" }, SELECTABLE), title: "#B25 added line: live vars --ui-diff-add-*", children: [
+                jsx7("span", { style: { color: "var(--cc-mark)" }, children: "6." }),
+                jsx7("span", { style: { color: "var(--cc-text)" }, children: " [ ] Handler \u0432 " }),
+                jsx7("span", { style: { color: "var(--cc-num)" }, children: "`__init__.py`" }),
+                jsx7("span", { style: { color: "var(--cc-text)" }, children: " (\u0432\u044B\u0434\u0430\u0447\u0430 \u0438\u0437 " }),
+                jsx7("span", { style: { color: "var(--cc-num)" }, children: "`_PENDING`" }),
+                jsx7("span", { style: { color: "var(--cc-text)" }, children: ")" })
+              ] })
+            ]
+          })
+        ]
+      })
+    ]
+  }));
+}
+
+// desktop/src/palette/badges.js
+import { jsx as jsx8, jsxs as jsxs8 } from "react/jsx-runtime";
+import * as sdk3 from "@hermes/plugin-sdk";
+function BadgesSection() {
+  return paletteTile("Badges & Chips", jsxs8("div", {
+    className: "flex flex-col gap-1.5",
+    style: { fontSize: "0.7rem" },
+    children: [
+      jsx8("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#C1 Badges" }),
+      jsxs8("div", { className: "flex flex-wrap gap-1", children: [
+        jsx8("span", { className: "inline-flex items-center px-2 py-0.5 rounded-full text-[0.6rem] font-medium bg-primary/10 text-primary select-none", style: SELECTABLE, children: "#C2 primary" }),
+        jsx8("span", { className: "inline-flex items-center px-2 py-0.5 rounded-full text-[0.6rem] font-medium bg-(--ui-green)/10 text-(--ui-green) select-none", style: SELECTABLE, children: "#C3 success" }),
+        // БЫЛ на bg-(--ui-red)/10 text-(--ui-red) — фон почти не виден (красный на 10% темнее/
+        // тусклее воспринимается, чем зелёный/жёлтый на той же непрозрачности). Инлайн, 18%.
+        jsx8("span", { className: "inline-flex items-center px-2 py-0.5 rounded-full text-[0.6rem] font-medium select-none", style: Object.assign({ backgroundColor: "color-mix(in oklch, var(--ui-red), transparent 82%)", color: "var(--ui-red)" }, SELECTABLE), children: "#C4 error" }),
+        jsx8("span", { className: "inline-flex items-center px-2 py-0.5 rounded-full text-[0.6rem] font-medium bg-(--ui-yellow)/10 text-(--ui-yellow) select-none", style: SELECTABLE, children: "#C5 warning" }),
+        jsx8("span", { className: "inline-flex items-center px-2 py-0.5 rounded-full text-[0.6rem] font-medium bg-muted/40 text-muted-foreground select-none", style: SELECTABLE, children: "#C6 neutral" })
+      ] }),
+      // Dot + label combos. БЫЛО tone:'error'/'warning' — невалидные значения для SDK
+      // StatusDot (по коду проекта валидны 'good'/'muted'/'bad'/'warn' — см. KIND_TONE в
+      // core.js, READ_STATE_TONE в brick.js), точка молча не рисовалась. Исправлено на
+      // 'bad'/'warn'. Заодно текст рядом с точкой тоже покрашен в тон — не только точка
+      // несёт смысл (по просьбе 2026-09-02, "точки мало").
+      jsx8("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#C7 Status badges (dot + \u0446\u0432\u0435\u0442\u043D\u043E\u0439 \u0442\u0435\u043A\u0441\u0442)" }),
+      jsxs8("div", { className: "flex flex-wrap gap-2", children: [
+        jsxs8("span", { className: "inline-flex items-center gap-1 text-[0.6rem] font-medium select-none", style: Object.assign({ color: "var(--ui-green)" }, SELECTABLE), children: [sdkC(sdk3.StatusDot, "span", { tone: "good" }), jsx8("span", { children: "#C8 live" })] }),
+        jsxs8("span", { className: "inline-flex items-center gap-1 text-[0.6rem] font-medium text-(--ui-text-tertiary) select-none", style: SELECTABLE, children: [sdkC(sdk3.StatusDot, "span", { tone: "muted" }), jsx8("span", { children: "#C9 idle" })] }),
+        jsxs8("span", { className: "inline-flex items-center gap-1 text-[0.6rem] font-medium select-none", style: Object.assign({ color: "var(--ui-red)" }, SELECTABLE), children: [sdkC(sdk3.StatusDot, "span", { tone: "bad" }), jsx8("span", { children: "#C10 failed" })] }),
+        jsxs8("span", { className: "inline-flex items-center gap-1 text-[0.6rem] font-medium select-none", style: Object.assign({ color: "var(--ui-yellow)" }, SELECTABLE), children: [sdkC(sdk3.StatusDot, "span", { tone: "warn" }), jsx8("span", { children: "#C11 pending" })] })
+      ] }),
+      // #C12 убран 2026-09-02 — дублировал #C3/#C4 (та же заливка-пилюля, ничего нового).
+      // Пульсация осталась единственным реально ДРУГИМ способом показать статус (не точка,
+      // не заливка) — для "активно сейчас". opacity-анимация, GPU-composited (приём #G8).
+      jsx8("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: '#C12 Status \u0441 \u043F\u0443\u043B\u044C\u0441\u0430\u0446\u0438\u0435\u0439 (\u0442\u043E\u043B\u044C\u043A\u043E \u0434\u043B\u044F "\u0430\u043A\u0442\u0438\u0432\u043D\u043E \u0441\u0435\u0439\u0447\u0430\u0441")' }),
+      jsxs8("span", { className: "inline-flex items-center gap-1 text-[0.6rem] font-medium select-none", style: Object.assign({ color: "var(--ui-green)" }, SELECTABLE), children: [
+        jsx8("span", { className: "w-1.5 h-1.5 rounded-full animate-pulse", style: { backgroundColor: "var(--ui-green)" } }),
+        jsx8("span", { children: "#C12 processing\u2026" })
+      ] }),
+      // Строка символов — это просто ТЕКСТ (обычные юникод-глифы, не иконочный шрифт), а не
+      // формы из CSS: выделяется/копируется как обычная строка. Поэтому не по одному элементу
+      // с номером, а один выделяемый набор — бери нужный символ прямо отсюда. Крупнее обычной
+      // буквы (1rem), для маркеров "перед тулом/именем/статусом".
+      jsx8("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#C13 \u2014 \u0441\u0442\u0440\u043E\u043A\u0430 \u0441\u0438\u043C\u0432\u043E\u043B\u043E\u0432 (\u043A\u043E\u043F\u0438\u0440\u0443\u0435\u043C\u0430\u044F)" }),
+      jsx8("div", {
+        className: "text-[1rem] leading-relaxed tracking-widest",
+        style: Object.assign({ color: "var(--ui-text-secondary)" }, SELECTABLE),
+        // Убраны 2026-09-02: ⏺▶⏸⏹ рендерятся цветными (emoji-стиль шрифта, не моно-глиф);
+        // •‣ слишком мелкие на глаз, бесполезны.
+        children: "\u2713 \u2717 \u25CF \u25CB \u25A0 \u25A1 \u25C6 \u25C7 \u25B2 \u25BC \u2605 \u2606 \u26A0 \u24D8 \u26A1 \u21BB"
+      })
+    ]
+  }));
+}
+
+// desktop/src/palette/typography.js
+import { jsx as jsx9, jsxs as jsxs9 } from "react/jsx-runtime";
+function TypographySection() {
+  return paletteTile("Typography", jsxs9("div", {
+    className: "flex flex-col gap-1",
+    children: [
+      jsx9("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#D1 Color hierarchy" }),
+      jsx9("p", { className: "text-xs font-medium text-foreground leading-tight select-none", style: SELECTABLE, children: "#D2 Primary \u2014 main text (font-medium)" }),
+      jsx9("p", { className: "text-[0.7rem] text-muted-foreground leading-tight select-none", style: SELECTABLE, children: "#D3 Secondary / muted \u2014 labels & subtitles" }),
+      jsx9("p", { className: "text-[0.65rem] text-(--ui-text-secondary) leading-tight select-none", style: SELECTABLE, children: "#D4 Tertiary UI text \u2014 metadata hints" }),
+      jsx9("p", { className: "text-[0.6rem] text-(--ui-text-tertiary) leading-tight select-none", style: SELECTABLE, children: "#D5 Quaternary \u2014 very faint captions & timestamps" }),
+      jsx9("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1.5", children: "#D6 Sizes & styles" }),
+      jsxs9("p", { className: "flex items-baseline gap-2 leading-tight select-none", style: SELECTABLE, children: [
+        jsx9("span", { className: "text-[length:var(--conversation-text-font-size)] font-normal text-foreground", children: "#D7 Chat" }),
+        jsx9("span", { className: "text-xs font-medium text-muted-foreground", children: "#D8 xs/med" }),
+        jsx9("span", { className: "text-[0.6875rem] font-mono text-(--ui-text-secondary)", children: "#D9 tool mono" })
+      ] }),
+      jsx9("span", { className: "text-sm font-semibold text-primary select-none", style: SELECTABLE, children: "#D10 Primary strong" }),
+      // #D12 — код-чип из markdown-рендера. НЕГАТИВНАЯ НАХОДКА (2026-09-01): составные
+      // Tailwind Typography-модификаторы (`prose-code:rounded-[...]` и т.п.) до плагина
+      // НЕ доезжают — в отличие от простых precompiled-классов, эта комбинированная запись
+      // в собранном CSS плагину недоступна (текст рендерился чёрным, без темы). Взято
+      // напрямую через F12 (Computed): цвет/фон — живые переменные `--ui-inline-code-*`
+      // (фон — тот же цвет текста на ~7% непрозрачности, задан отдельной переменной, не
+      // color-mix нашими руками); border-radius 0.25rem — константа (не цвет, не по C1).
+      jsx9("code", {
+        dir: "ltr",
+        style: Object.assign({
+          color: "var(--ui-inline-code-foreground)",
+          backgroundColor: "var(--ui-inline-code-background)",
+          borderRadius: "0.25rem",
+          padding: "1px 0.1875rem",
+          fontFamily: "monospace",
+          fontSize: "0.9em",
+          // Прямой flex-child в flex-col родителе растягивается на всю ширину строки
+          // (align-items:stretch по умолчанию) — без этого фон полз бы под весь ряд,
+          // а не только под текст.
+          alignSelf: "flex-start"
+        }, SELECTABLE),
+        children: "#D12 desktop/Recon__UI-Decisions.md"
+      }),
+      // #D13 — заголовок сворачиваемого tool-блока («Saved to memory», F12, 2026-09-01).
+      // Шеврон-кнопка (codicon codicon-chevron-right) из оригинала сюда сознательно НЕ взята —
+      // она подразумевает hover/expand-поведение, которого у нас тут нет.
+      // ПОДТВЕРЖДЕНО ЖИВЬЁМ (2026-09-02): классы `tool-memory-legendary-*` — не Tailwind, а
+      // собственные классы приложения — реально доезжают до плагина. `tool-memory-legendary-
+      // title` красит текст ГРАДИЕНТОМ (background + background-clip:text, --tool-memory-
+      // legendary-from/-mid/-to), поэтому в оригинале title был text-transparent — цвет шёл не
+      // через color. --ui-text-tertiary — тоже подтверждена.
+      jsxs9("div", { className: "group/disclosure-row relative flex w-full max-w-full min-w-0 text-(--ui-text-tertiary) mt-1.5", style: SELECTABLE, children: [
+        jsxs9("span", { className: "flex min-w-0 max-w-fit items-start gap-1.5", children: [
+          jsx9("span", {
+            className: "grid size-3.5 shrink-0 place-items-center self-center tool-memory-legendary-glyph",
+            title: "F12: \u043A\u043B\u0430\u0441\u0441 tool-memory-legendary-glyph \u2014 \u043D\u0435 Tailwind, \u0441\u0432\u043E\u0439 \u043B\u0438 CSS \u0434\u043E\u0439\u0434\u0451\u0442 \u0434\u043E \u043F\u043B\u0430\u0433\u0438\u043D\u0430?",
+            children: "\u25C6"
+          }),
+          jsx9("span", {
+            className: "block min-w-0 max-w-full overflow-hidden whitespace-nowrap text-[length:var(--conversation-tool-font-size)] leading-(--conversation-line-height) tool-memory-legendary-title",
+            title: "\u043F\u043E\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043D\u043E: \u043A\u043B\u0430\u0441\u0441 \u0441\u0430\u043C \u043A\u0440\u0430\u0441\u0438\u0442 \u0442\u0435\u043A\u0441\u0442 \u0433\u0440\u0430\u0434\u0438\u0435\u043D\u0442\u043E\u043C (background-clip:text), \u0438\u043D\u043B\u0430\u0439\u043D-\u0446\u0432\u0435\u0442 \u043D\u0435 \u0437\u0430\u0434\u0430\u0432\u0430\u043B\u0441\u044F",
+            children: "#D13 Saved to memory"
+          })
+        ] })
+      ] })
+    ]
+  }));
+}
+
+// desktop/src/palette/interactive.js
+import { jsx as jsx10, jsxs as jsxs10 } from "react/jsx-runtime";
+function InteractiveSection() {
+  return paletteTile("Interactive States", jsxs10("div", {
+    className: "flex flex-col gap-1.5",
+    style: { fontSize: "0.7rem" },
+    children: [
+      jsx10("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#F1 Hover states (mouse over)" }),
+      jsxs10("div", { className: "flex flex-col gap-1", children: [
+        jsx10("button", { className: "w-full px-2 py-1 rounded-md text-xs text-left cursor-pointer select-none transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) active:bg-(--ui-bg-tertiary)", children: "#F2 Row hover \u2192" }),
+        // БЫЛ на hover:bg-accent/40 — голое --accent (не --dt-accent) мертвое в этой теме
+        // (та же болезнь, что была у #A14/--destructive), hover визуально не отличался от #F2.
+        // Заменено на var(--dt-accent) через JS-обработчик (Tailwind hover: с произвольными
+        // значениями/переменными вырезается — тот же паттерн, что и в кнопках Buttons).
+        jsx10("button", {
+          className: "w-full px-2 py-1 rounded-md text-xs text-left cursor-pointer select-none transition-colors duration-100 ease-out",
+          onMouseEnter: (e) => {
+            e.currentTarget.style.backgroundColor = "color-mix(in oklch, var(--dt-accent), transparent 60%)";
+          },
+          onMouseLeave: (e) => {
+            e.currentTarget.style.backgroundColor = "transparent";
+          },
+          children: "#F3 Accent hover \u2192"
+        }),
+        jsx10("button", { className: "w-full px-2 py-1 rounded-md border border-(--ui-stroke-secondary) text-xs text-left cursor-pointer select-none transition-colors duration-100 ease-out hover:border-(--ui-stroke-primary)", children: "#F4 Border highlight \u2192" })
+      ] }),
+      jsx10("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#F5 Disabled states" }),
+      jsxs10("div", { className: "flex flex-col gap-1", children: [
+        jsx10("button", { disabled: true, className: "w-full px-2 py-1 rounded-md text-xs text-left opacity-40 pointer-events-none cursor-not-allowed select-none bg-muted/40", children: "#F6 Disabled row" })
+        // #F7 убрана 2026-09-02 — дублировала #A20 Disabled primary (Buttons), ничего нового
+        // не показывала. Opacity Test Stand убран туда же — вопрос закрыт (М36), тут был
+        // хардкод-константа (#f97316) для проверки самого механизма, ценности не несёт.
+      ] })
+    ]
+  }));
+}
+
+// desktop/src/palette/loaders.js
+import { jsx as jsx11, jsxs as jsxs11 } from "react/jsx-runtime";
+import { useState as useState5 } from "react";
+import * as sdk4 from "@hermes/plugin-sdk";
+function LoadersSection() {
+  return paletteTile("Loaders & Animations", jsxs11("div", {
+    className: "flex flex-col gap-1.5",
+    style: { fontSize: "0.7rem" },
+    children: [
+      // #G1 — единственный тестовый элемент анимации: composited sweep через
+      // transform (не background-position, не JS-таймер). Полоса-подсветка
+      // едет через translateX внутри overflow:hidden — GPU-слой, без repaint.
+      jsx11("style", {
+        dangerouslySetInnerHTML: { __html: `
+          @keyframes sweep-composited {
+            from { transform: translateX(-120%); }
+            to   { transform: translateX(220%); }
+          }
+          .animate-sweep-composited {
+            animation: sweep-composited 1.8s linear infinite;
+            will-change: transform;
+          }
+          @keyframes bounce-custom {
+            0%, 100% { transform: translateY(0); animation-timing-function: cubic-bezier(0.8, 0, 1, 1); }
+            50% { transform: translateY(-4px); animation-timing-function: cubic-bezier(0, 0, 0.2, 1); }
+          }
+          .animate-bounce-custom {
+            animation: bounce-custom 1s infinite;
+          }
+          @keyframes crossfade-derived {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+          }
+          .animate-crossfade-derived {
+            animation: crossfade-derived 3s ease-in-out infinite;
+            will-change: opacity;
+          }
+          @keyframes appear-once {
+            from { opacity: 0; transform: translateY(4px) scale(0.98); }
+            to   { opacity: 1; transform: translateY(0) scale(1); }
+          }
+          .animate-appear-once {
+            /* both \u2014 \u0434\u0435\u0440\u0436\u0438\u0442 \u043A\u043E\u043D\u0435\u0447\u043D\u043E\u0435 \u0441\u043E\u0441\u0442\u043E\u044F\u043D\u0438\u0435 \u043F\u043E\u0441\u043B\u0435 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043D\u0438\u044F; \u0418\u0413\u0420\u0410\u0415\u0422 \u041E\u0414\u0418\u041D \u0420\u0410\u0417 (\u043D\u0435 infinite) \u2014
+               \u0441\u0440\u0430\u0431\u0430\u0442\u044B\u0432\u0430\u0435\u0442 \u043F\u0440\u0438 \u043C\u043E\u043D\u0442\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0438 \u0443\u0437\u043B\u0430, \u0442.\u0435. \u043F\u0440\u0438 \u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0438 FileOps \u2192 Palette. */
+            animation: appear-once 220ms ease-out both;
+            will-change: opacity, transform;
+          }
+          @keyframes spin-custom {
+            to { transform: rotate(360deg); }
+          }
+          .animate-spin-custom {
+            /* \u0428\u0442\u0430\u0442\u043D\u044B\u0439 Tailwind animate-spin \u043E\u043A\u0430\u0437\u0430\u043B\u0441\u044F \u043D\u0435 \u0434\u043E\u043A\u043E\u043C\u043F\u0438\u043B\u0435\u043D \u0432 \u044D\u0442\u043E\u0439 \u0441\u0431\u043E\u0440\u043A\u0435 (2026-09-02,
+               #G2 \u043D\u0435 \u043A\u0440\u0443\u0442\u0438\u043B\u0441\u044F \u0432\u043E\u043E\u0431\u0449\u0435) \u2014 \u0441\u0432\u043E\u0439 keyframe, \u043A\u0430\u043A \u0438 \u043E\u0441\u0442\u0430\u043B\u044C\u043D\u044B\u0435 \u0432 \u044D\u0442\u043E\u043C \u0431\u043B\u043E\u043A\u0435, \u043D\u0430\u0434\u0451\u0436\u043D\u0435\u0435. */
+            animation: spin-custom 1s linear infinite;
+            will-change: transform;
+          }
+          @keyframes blink-custom {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.15; }
+          }
+          .animate-blink-slow   { animation: blink-custom 1.6s ease-in-out infinite; will-change: opacity; }
+          .animate-blink-medium { animation: blink-custom 0.9s ease-in-out infinite; will-change: opacity; }
+          .animate-blink-fast   { animation: blink-custom 0.45s ease-in-out infinite; will-change: opacity; }
+        ` }
+      }),
+      jsx11("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#G1 Animation test (composited transform, not background-position)" }),
+      jsx11("div", {
+        className: "h-3 w-full rounded-full overflow-hidden relative select-none",
+        style: { backgroundColor: "var(--dt-primary)" },
+        children: jsx11("div", {
+          className: "animate-sweep-composited absolute inset-y-0 w-1/3",
+          style: { background: "linear-gradient(90deg, transparent, rgba(255,255,255,0.5), transparent)" }
+        })
+      }),
+      jsx11("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#G2-4 Spinners / pulse / bounce (\u0442\u043E\u0436\u0435 composited: transform, opacity)" }),
+      jsxs11("div", { className: "flex items-center gap-3", children: [
+        jsxs11("span", { className: "inline-flex items-center gap-1.5 text-[0.6rem] select-none", style: SELECTABLE, children: [
+          // border-t-primary тоже не докомпилен — кольцо было одноцветным, вращение
+          // физически шло, но не было видно. Инлайн top-цвет делает "засечку" заметной.
+          jsx11("div", { className: "w-3 h-3 rounded-full animate-spin-custom", style: { border: "2px solid var(--ui-stroke-secondary)", borderTopColor: "var(--dt-primary)" } }),
+          jsx11("span", { children: "#G2 spin" })
+        ] }),
+        jsxs11("span", { className: "inline-flex items-center gap-1.5 text-[0.6rem] select-none", style: SELECTABLE, children: [
+          sdkC(sdk4.StatusDot, "span", { tone: "muted" }),
+          jsx11("div", { className: "w-2 h-2 rounded-full bg-(--ui-text-tertiary) animate-pulse" }),
+          jsx11("span", { children: "#G3 pulse" })
+        ] }),
+        jsxs11("span", { className: "inline-flex items-center gap-1.5 text-[0.6rem] select-none", style: SELECTABLE, children: [
+          jsxs11("div", { className: "flex gap-0.5 items-center", children: [
+            jsx11("div", { className: "w-1 h-1 rounded-full bg-foreground animate-bounce-custom", style: { animationDelay: "0ms" } }),
+            jsx11("div", { className: "w-1 h-1 rounded-full bg-foreground animate-bounce-custom", style: { animationDelay: "200ms" } }),
+            jsx11("div", { className: "w-1 h-1 rounded-full bg-foreground animate-bounce-custom", style: { animationDelay: "400ms" } })
+          ] }),
+          jsx11("span", { children: "#G4 bounce (css)" })
+        ] })
+      ] }),
+      // Progress bars (CSS-only)
+      jsx11("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#G5 Progress bars" }),
+      jsxs11("div", { className: "flex flex-col gap-1", children: [
+        jsx11("span", { className: "text-[0.5rem] text-(--ui-text-quaternary)", children: "#G6 primary bar (bg-primary/80)" }),
+        jsx11("div", { className: "w-full h-3 rounded-full bg-muted/40 overflow-hidden select-none", children: jsx11("div", { className: "h-full w-3/4 rounded-full bg-primary/80" }) }),
+        jsx11("span", { className: "text-[0.5rem] text-(--ui-text-quaternary)", children: "#G7 green bar (bg-green/70)" }),
+        jsx11("div", { className: "w-full h-2 rounded-full bg-(--ui-stroke-quaternary) overflow-hidden select-none", children: jsx11("div", { className: "h-full w-1/2 rounded-full bg-(--ui-green)/70" }) })
+      ] }),
+      // #G8 — анимация МЕЖДУ базовым цветом и его производным (OKLCH RCS), не двумя
+      // константами. Производный тон: lightness сдвигается К СЕРЕДИНЕ (0.5) — светлый темнеет,
+      // тёмный светлеет, без if/else, чистой формулой `l + (0.5 - l) * k`. Анимируется НЕ
+      // background-color (это перекраска/repaint каждый кадр — то, из-за чего убрали shimmer
+      // в #G-секции раньше), а opacity верхнего слоя — GPU-композит, дёшево.
+      jsx11("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-1 mt-3", children: "#G8 Crossfade base \u2194 derived (OKLCH RCS, opacity-composited)" }),
+      jsx11("div", {
+        className: "h-4 w-full rounded-md relative overflow-hidden",
+        style: {
+          // Нижний слой — производный тон (сдвиг к середине lightness).
+          backgroundColor: "oklch(from var(--dt-primary) calc(l + (0.5 - l) * 0.55) c h)",
+          border: "1px solid rgba(255,255,255,0.1)"
+        },
+        children: jsx11("div", {
+          className: "absolute inset-0 animate-crossfade-derived",
+          // Верхний слой — сам var(--dt-primary); анимируется его opacity, не цвет.
+          style: { backgroundColor: "oklch(from var(--dt-primary) l c h)" }
+        })
+      }),
+      // #G9 — появление при монтировании, группой + кнопка replay. Выход из палитры и обратно
+      // для повтора неудобен (панель неизвестно где), поэтому реиграем через смену `key` —
+      // React снимает и заново монтирует поддерево, анимация монтирования срабатывает опять,
+      // без выхода из палитры вообще.
+      jsx11(AppearGroupDemo, {}),
+      // #G10 — срочность/важность через СКОРОСТЬ мигания, та же opacity-анимация
+      // (composited), разница только в длительности. Оранжевый — "важная штука мигает".
+      jsx11("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-3", children: "#G10 Blink \u2014 \u0441\u0440\u043E\u0447\u043D\u043E\u0441\u0442\u044C \u0447\u0435\u0440\u0435\u0437 \u0441\u043A\u043E\u0440\u043E\u0441\u0442\u044C (composited opacity)" }),
+      jsxs11("div", { className: "flex items-center gap-3", children: [
+        jsxs11("span", { className: "inline-flex items-center gap-1.5 text-[0.6rem] select-none", style: SELECTABLE, children: [
+          jsx11("div", { className: "w-2.5 h-2.5 rounded-full animate-blink-slow", style: { backgroundColor: "var(--ui-orange)" } }),
+          jsx11("span", { children: "#G10 slow" })
+        ] }),
+        jsxs11("span", { className: "inline-flex items-center gap-1.5 text-[0.6rem] select-none", style: SELECTABLE, children: [
+          jsx11("div", { className: "w-2.5 h-2.5 rounded-full animate-blink-medium", style: { backgroundColor: "var(--ui-orange)" } }),
+          jsx11("span", { children: "medium" })
+        ] }),
+        jsxs11("span", { className: "inline-flex items-center gap-1.5 text-[0.6rem] select-none", style: SELECTABLE, children: [
+          jsx11("div", { className: "w-2.5 h-2.5 rounded-full animate-blink-fast", style: { backgroundColor: "var(--ui-orange)" } }),
+          jsx11("span", { children: "fast" })
+        ] })
+      ] })
+    ]
+  }));
+}
+function AppearGroupDemo() {
+  const [gen, setGen] = useState5(0);
+  return jsxs11("div", {
+    children: [
+      jsxs11("div", { className: "flex items-center justify-between mb-1 mt-3", children: [
+        jsx11("span", { className: "text-[0.6rem] text-(--ui-text-quaternary)", children: "#G9 \u041F\u043E\u044F\u0432\u043B\u0435\u043D\u0438\u0435 (\u0433\u0440\u0443\u043F\u043F\u0430, replay \u043D\u0438\u0436\u0435)" }),
+        jsx11("button", {
+          className: "px-2 py-0.5 rounded-full text-[0.55rem] font-medium cursor-pointer select-none hover:bg-(--ui-bg-tertiary)",
+          style: { border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-secondary)" },
+          onClick: () => setGen((g) => g + 1),
+          children: "\u21BB replay"
+        })
+      ] }),
+      jsx11("div", {
+        key: gen,
+        className: "flex flex-col gap-1",
+        children: [0, 1, 2].map((i) => jsx11("div", {
+          key: i,
+          className: "animate-appear-once px-2 py-1.5 rounded-md text-[0.6rem] font-medium",
+          style: Object.assign(
+            { backgroundColor: "var(--ui-bg-tertiary)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)", animationDelay: `${i * 70}ms` },
+            SELECTABLE
+          ),
+          children: `#G9.${i + 1} card`
+        }))
+      })
+    ]
+  });
+}
+
+// desktop/src/palette/lists.js
+import { jsx as jsx12, jsxs as jsxs12 } from "react/jsx-runtime";
+import * as sdk5 from "@hermes/plugin-sdk";
+function ListsSection() {
+  return paletteTile("Lists & Rows", jsxs12("div", {
+    className: "flex flex-col gap-1.5",
+    style: { fontSize: "0.7rem" },
+    children: [
+      jsx12("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#H1 Interactive list (scrollable)" }),
+      // Test A: overflow-y-auto with inline maxHeight — max-h-* Tailwind classes are tree-shaken!
+      jsxs12("div", {
+        className: "rounded-md border border-(--ui-stroke-secondary) overflow-y-auto select-none scrollbar-dt scrollbar-fade",
+        style: Object.assign({}, CAPPED, { maxHeight: "7rem" }),
+        // 28 * 0.25 = 7rem (inline, bypasses tree-shaking)
+        children: [
+          // Номер адресации убран у чистого филлера (2026-09-02) — ссылаться на "возьми стиль
+          // с #H10" бессмысленно, это просто строка-наполнитель для скролла. #H4/#H5 номер
+          // оставлен — там есть содержательная разница (точка-статус, конкретный вид строки).
+          jsxListRow("Item one \u2014 hover me"),
+          jsxListRow("Second item with detail \u2192"),
+          jsxListRow("#H4 Third item"),
+          jsxs12(ListRowWithDot, { label: "#H5 Active item", tone: "good" }),
+          jsxListRow("Fifth item"),
+          jsxListRow("Sixth item \u2014 long text that truncates"),
+          jsxListRow("Seventh row for scroll testing"),
+          jsxListRow("Eighth item \u2014 more content here"),
+          jsxListRow("Ninth row to push height further"),
+          jsxListRow("Tenth item \u2014 should be visible only with scrolling"),
+          jsxListRow("Eleventh row \u2014 definitely needs scrollbar now")
+        ]
+      }),
+      // Test B: pure inline styles for scroll container (no Tailwind classes at all)
+      jsx12("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1.5", children: "#H8 Inline style scroll test" }),
+      jsxs12("div", {
+        className: "",
+        // no Tailwind classes — pure inline styles to isolate what works
+        style: Object.assign(
+          { maxHeight: "6rem", overflowY: "auto", borderRadius: "0.375rem", border: "1px solid var(--ui-stroke-secondary)" },
+          CAPPED
+        ),
+        children: [
+          jsx12("div", { className: "", style: Object.assign({ padding: "4px 8px", fontSize: "0.6rem" }, SELECTABLE), children: "First inline scroll row" }),
+          jsx12("div", { className: "", style: Object.assign({ padding: "4px 8px", fontSize: "0.6rem" }, SELECTABLE), children: "Second row with some text" }),
+          jsx12("div", { className: "", style: Object.assign({ padding: "4px 8px", fontSize: "0.6rem" }, SELECTABLE), children: "Third item here" }),
+          jsx12("div", { className: "", style: Object.assign({ padding: "4px 8px", fontSize: "0.6rem" }, SELECTABLE), children: "Fourth row \u2014 more content" }),
+          jsx12("div", { className: "", style: Object.assign({ padding: "4px 8px", fontSize: "0.6rem" }, SELECTABLE), children: "Fifth row for testing" }),
+          jsx12("div", { className: "", style: Object.assign({ padding: "4px 8px", fontSize: "0.6rem" }, SELECTABLE), children: "Sixth row should force scroll" }),
+          jsx12("div", { className: "", style: Object.assign({ padding: "4px 8px", fontSize: "0.6rem" }, SELECTABLE), children: "Seventh row definitely needs scrollbar" }),
+          jsx12("div", { className: "", style: Object.assign({ padding: "4px 8px", fontSize: "0.6rem" }, SELECTABLE), children: "Eighth and final test row" })
+        ]
+      }),
+      // Test C: horizontal scroll — long content that overflows width
+      jsx12("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1.5", children: "#H17 Horizontal scroll test" }),
+      jsxs12("div", {
+        className: "",
+        // no Tailwind classes — pure inline styles
+        style: Object.assign(
+          { maxHeight: "4rem", overflowX: "auto", overflowY: "hidden", borderRadius: "0.375rem", border: "1px solid var(--ui-stroke-secondary)" },
+          CAPPED
+        ),
+        children: jsx12("div", {
+          className: "",
+          // inner wrapper wider than container to force horizontal scroll
+          style: Object.assign({ minWidth: "600px", padding: "4px 8px", fontSize: "0.6rem", whiteSpace: "nowrap" }, SELECTABLE),
+          children: "This is a very long row that should force horizontal scrolling because the content width exceeds the container width significantly so we can test if overflow-x-auto works properly in this plugin context \u2713 scroll right \u2192"
+        })
+      })
+    ]
+  }));
+}
+function jsxListRow(text) {
+  return jsx12("button", {
+    className: "w-full flex items-center gap-1.5 px-2 py-1 row-hover rounded-md cursor-pointer text-[0.6rem] text-left select-none transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) active:bg-(--ui-bg-tertiary)",
+    children: text
+  });
+}
+function ListRowWithDot({ label, tone }) {
+  return jsxs12("div", {
+    className: "flex items-center gap-1.5 px-2 py-1 rounded-md bg-(--ui-row-active-background) cursor-pointer text-[0.6rem] select-none",
+    children: [
+      sdkC(sdk5.StatusDot, "span", { tone }),
+      jsx12("span", { className: "truncate font-medium", children: label })
+    ]
+  });
+}
+
+// desktop/src/palette/dividers.js
+import { jsx as jsx13, jsxs as jsxs13 } from "react/jsx-runtime";
+function DividersSection() {
+  return paletteTile("Borders & Dividers", jsxs13("div", {
+    className: "flex flex-col gap-2",
+    style: { fontSize: "0.7rem" },
+    children: [
+      jsx13("div", { className: "text-[0.6rem] text-(--ui-text-quaternary)", children: "#J1 Stroke levels (top to bottom)" }),
+      jsxs13("div", { className: "flex flex-col gap-1 select-none", style: SELECTABLE, children: [
+        // БЫЛ на border-(--ui-stroke-primary) — этот класс не докомпилен (--ui-stroke-primary
+        // самая сильная по теме, 24%, но рендерилась слабее всех остальных). border-(--ui-
+        // stroke-secondary/tertiary/quaternary) ниже используются в проекте намного чаще и
+        // докомпилены нормально — инлайн для primary надёжнее.
+        jsx13("div", { children: "#J2 Primary" }),
+        jsx13("hr", { className: "m-0", style: { borderTop: "1px solid var(--ui-stroke-primary)" } }),
+        jsx13("div", { children: "#J3 Secondary (most common)" }),
+        jsx13("hr", { className: "border-t border-(--ui-stroke-secondary) m-0" }),
+        jsx13("div", { children: "#J4 Tertiary" }),
+        jsx13("hr", { className: "border-t border-(--ui-stroke-tertiary) m-0" }),
+        jsx13("div", { children: "#J5 Quaternary (faintest)" }),
+        jsx13("hr", { className: "border-t border-(--ui-stroke-quaternary) m-0" })
+      ] })
+    ]
+  }));
+}
+
+// desktop/src/palette/sdk.js
+import { jsx as jsx14, jsxs as jsxs14 } from "react/jsx-runtime";
+function SdkSection() {
+  return paletteTile("SDK Components", jsxs14("div", {
+    className: "flex flex-col gap-1.5",
+    style: { fontSize: "0.7rem" },
+    children: [
+      // StatusDot-точки убраны 2026-09-02 — дублировали #C7-C11 (тот же sdk.StatusDot, та же
+      // демонстрация тонов). Оставлен только справочник API — единственное, чего нет больше
+      // нигде в палитре (что вообще доступно из @hermes/plugin-sdk).
+      jsx14("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#K1 Available SDK APIs:" }),
+      jsxs14("code", { className: "block px-2 py-1 rounded-md bg-muted/40 text-[0.55rem] font-mono overflow-x-auto select-none whitespace-pre", style: SELECTABLE, children: [
+        "#K2 atom, useValue, host.onEvent,",
+        "\n",
+        "StatusDot, ScrollArea, CopyButton,",
+        "\n",
+        "EmptyState"
+      ] })
+    ]
+  }));
+}
+
+// desktop/src/palette/layout.js
+import { jsx as jsx15, jsxs as jsxs15 } from "react/jsx-runtime";
+var SAMPLE_BODY_TEXT = [
+  "\u25CB\u25CB\u25CB",
+  "plugin.js: 6",
+  "1026|    style: { fontSize: '0.7rem' },",
+  "1027|    children: [",
+  "1028|      jsx('div', { className: 'text-[0.6rem] text-(--ui-text-quaternary) mb-0.5', children: '#60 Semantic tokens (from theme)' }),",
+  "1029|      jsxs('div', { className: 'grid grid-cols-3 gap-1', children: [",
+  "\u21921030|        jsxColorSwatch('#61 primary', 'bg-primary'),",
+  "",
+  "//\u2693x52 Line: 997",
+  "#\u2693x9 Line: 42",
+  "",
+  "<!-- File: /workspace/SRC/hermes-filetools/desktop/Recon__Ui-hermes-plugin.md -->",
+  "<!-- Size: 220 lines, 11963 bytes, 11845 chars, LF, max/avg line 274/52.8 -->",
+  "<!-- Modified: 2026-08-30 18:44 -->",
+  "<!-- Encoding: utf-8 -->",
+  "<!-- FileTag: x0a -->",
+  "<!-- \u25CB\u25CB\u25CB -->",
+  "<!-- \u25A0BLOCK x0a : 1-220 -->",
+  "# Hermes Desktop Plugin \u2014 UI & Tailwind Investigation Notes",
+  "",
+  "Date: 2026-08-28  ",
+  "Plugin: hermes-filetools/desktop/plugin.js ",
+  "",
+  "<!-- \u2693x0a Line: 111 -->",
+  "<!-- \u25A0END x0a : 220 -->"
+].join("\n");
+function LayoutSection() {
+  return paletteTile("Layout Compositions", jsxs15("div", {
+    className: "flex flex-col gap-1.5",
+    style: { fontSize: "0.7rem" },
+    children: [
+      jsx15("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#L1 \u041F\u0440\u043E\u0442\u043E\u0442\u0438\u043F \u0441\u0442\u0440\u043E\u043A\u0438 \u043E\u043F\u0435\u0440\u0430\u0446\u0438\u0438 \u2014 \u043F\u043E\u0442\u044F\u043D\u0438 \u0437\u0430 \u043F\u0440\u0430\u0432\u044B\u0439 \u043D\u0438\u0436\u043D\u0438\u0439 \u0443\u0433\u043E\u043B \u0431\u043B\u043E\u043A\u0430 \u043D\u0438\u0436\u0435" }),
+      jsx15("div", {
+        style: {
+          resize: "horizontal",
+          overflow: "hidden",
+          width: "380px",
+          minWidth: "150px",
+          maxWidth: "100%",
+          border: "1px dashed var(--ui-stroke-tertiary)",
+          padding: "6px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "4px"
+        },
+        children: [
+          jsx15("div", { className: "text-[0.55rem] mb-0.5", style: { color: "var(--ui-text-quaternary)" }, children: "#L2 StaleStack: 3 \u044D\u043B\u0435\u043C\u0435\u043D\u0442\u0430, \u0437\u043D\u0430\u0447\u043A\u0438 \u0432\u043C\u0435\u0441\u0442\u043E \u0442\u043E\u0447\u0435\u043A (\u2713/\u26A0/\u21BB)" }),
+          jsx15(OperationCardHeader, {
+            statuses: mockStatuses("patch"),
+            icon: "\u25E7",
+            tool: "patch",
+            added: 8,
+            removed: 120,
+            fileName: "core_reader_and_writer_utils.js",
+            filePath: "desktop/src/palette/components/deeply/nested/example/core.js",
+            command: "npm run build -- --watch --config production.settings.json",
+            drawerOpen: true,
+            opNumber: "op:56AB",
+            durationText: "2.0s",
+            tag: "xAB",
+            showCheckboxes: false,
+            staleItems: [{ label: "\u0443\u0441\u0442\u0430\u0440\u0435\u043B\u043E", glyph: "\u2713" }, { label: "\u0443\u0441\u0442\u0430\u0440\u0435\u043B\u043E 2", glyph: "\u26A0" }, { label: "\u0443\u0441\u0442\u0430\u0440\u0435\u043B\u043E 3", glyph: "\u21BB" }]
+          }),
+          jsx15("div", { className: "text-[0.55rem] mb-0.5 mt-1.5", style: { color: "var(--ui-text-quaternary)" }, children: "#L3 StaleStack: 1 \u044D\u043B\u0435\u043C\u0435\u043D\u0442 (\u0442\u043E\u0447\u043A\u0430, \u043A\u0430\u043A \u0440\u0430\u043D\u044C\u0448\u0435)" }),
+          jsx15(OperationCardHeader, {
+            statuses: mockStatuses("execute_code"),
+            icon: "\u25A4",
+            tool: "execute_code",
+            added: 0,
+            removed: 0,
+            fileName: null,
+            filePath: null,
+            command: "npm run build -- --watch --config prod.settings.local.json",
+            drawerOpen: true,
+            opNumber: "op:12F0",
+            durationText: "0.9s",
+            staleItems: [{ label: "\u0443\u0441\u0442\u0430\u0440\u0435\u043B\u043E" }]
+          }),
+          jsx15("div", { className: "text-[0.55rem] mb-0.5 mt-1.5", style: { color: "var(--ui-text-quaternary)" }, children: "#L4 StaleStack: 2 \u044D\u043B\u0435\u043C\u0435\u043D\u0442\u0430 (\u0442\u043E\u0447\u043A\u0438)" }),
+          jsx15(OperationCardHeader, {
+            statuses: mockStatuses("write_file"),
+            icon: "\u25E7",
+            tool: "write_file",
+            added: 150,
+            removed: 0,
+            fileName: "core.js",
+            filePath: "desktop/src/palette/components/deeply/nested/example/core.js",
+            command: "buildBrick",
+            drawerOpen: true,
+            opNumber: "op:9D3E",
+            durationText: "0.2s",
+            staleItems: [{ label: "\u0443\u0441\u0442\u0430\u0440\u0435\u043B\u043E" }, { label: "\u0443\u0441\u0442\u0430\u0440\u0435\u043B\u043E 2" }]
+          }),
+          jsx15("div", { className: "text-[0.55rem] mb-0.5 mt-1.5", style: { color: "var(--ui-text-quaternary)" }, children: "#L7 \u0412\u044B\u043A\u0438\u043D\u0443\u0442\u043E \u0438\u0437 \u043A\u043E\u043D\u0442\u0435\u043A\u0441\u0442\u0430 \u2014 \u0432\u0441\u0451 \u043A\u0430\u043A \u0431\u044B\u043B\u043E, \u043F\u0440\u0438\u0442\u0443\u0448\u0435\u043D\u043E, \u043D\u0435 \u043A\u043B\u0438\u043A\u0430\u0435\u0442\u0441\u044F" }),
+          jsx15(OperationCardHeader, {
+            statuses: mockStatuses("patch"),
+            icon: "\u25E7",
+            tool: "patch",
+            added: 8,
+            removed: 120,
+            fileName: "core.js",
+            filePath: "desktop/src/palette/components/deeply/nested/example/core.js",
+            command: null,
+            drawerOpen: false,
+            opNumber: "op:56AB",
+            durationText: "2.0s",
+            disabled: true
+          })
+        ]
+      }),
+      jsx15("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-2 pt-2", style: { borderTop: "1px solid var(--ui-stroke-secondary)" }, children: "#L5 \u0421\u0432\u043E\u0451 \u0442\u0435\u043B\u043E: \u043D\u0430\u0448\u0438 \u043C\u0430\u0440\u043A\u0435\u0440\u044B / \u043A\u043E\u043C\u043C\u0435\u043D\u0442\u0430\u0440\u0438\u0439 / \u043D\u043E\u043C\u0435\u0440 \u0441\u0442\u0440\u043E\u043A\u0438 \u2014 \u0431\u0435\u0437 \u0431\u0438\u0431\u043B\u0438\u043E\u0442\u0435\u043A" }),
+      jsx15(BodyPreview, { text: SAMPLE_BODY_TEXT }),
+      jsx15("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-2 pt-2", style: { borderTop: "1px solid var(--ui-stroke-secondary)" }, children: "#L6 \u0421\u043E\u0431\u0440\u0430\u043D\u043D\u0430\u044F \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0430 (OperationCard) \u2014 \u043A\u043B\u0438\u043A \u043F\u043E \u0448\u0430\u043F\u043A\u0435 \u0440\u0430\u0441\u043A\u0440\u044B\u0432\u0430\u0435\u0442 \u043A\u043E\u043C\u0430\u043D\u0434\u0443+\u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442" }),
+      jsx15(OperationCard, {
+        headerProps: {
+          statuses: mockStatuses("patch"),
+          icon: "\u25E7",
+          tool: "patch",
+          added: 8,
+          removed: 120,
+          fileName: "core_reader_and_writer_utils.js",
+          filePath: "desktop/src/palette/components/deeply/nested/example/core.js",
+          command: null,
+          drawerOpen: false,
+          opNumber: "op:56AB",
+          durationText: "2.0s",
+          tag: "a1"
+        },
+        commandText: "npm run build -- --watch --config production.settings.json",
+        result: SAMPLE_BODY_TEXT
+      })
+    ]
+  }));
+}
+
+// desktop/src/palette/theme-vars.js
+import { jsx as jsx16, jsxs as jsxs16 } from "react/jsx-runtime";
+function swatchBg(num, varName, expect) {
+  return jsx16("div", {
+    className: "h-5 rounded flex items-center justify-center px-1 text-[0.5rem] font-bold truncate",
+    style: Object.assign({ backgroundColor: `var(${varName})`, color: "#fcfcfc80" }, SELECTABLE),
+    title: `${varName} \u2014 \u043E\u0436\u0438\u0434\u0430\u043D\u0438\u0435: ${expect}`,
+    children: `#M${num} ${varName}`
+  });
+}
+function swatchText(num, varName, expect) {
+  return jsx16("div", {
+    className: "text-[0.6rem] font-bold truncate select-none",
+    style: Object.assign({ color: `var(${varName})` }, SELECTABLE),
+    title: `${varName} \u2014 \u043E\u0436\u0438\u0434\u0430\u043D\u0438\u0435: ${expect}`,
+    children: `#M${num} ${varName}`
+  });
+}
+function groupLabel(text) {
+  return jsx16("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: text });
+}
+function ThemeVarsSection() {
+  return paletteTile("Theme Vars (audit)", jsxs16("div", {
+    className: "flex flex-col gap-1",
+    style: { fontSize: "0.7rem" },
+    children: [
+      groupLabel("#M1-5 \u0417\u0430\u043B\u0438\u0432\u043A\u0438 \u2014 \u0441\u0435\u043C\u0430\u043D\u0442\u0438\u043A\u0430"),
+      jsxs16("div", { className: "grid grid-cols-5 gap-1", children: [
+        swatchBg(1, "--dt-primary", "#a7c080"),
+        swatchBg(2, "--dt-secondary", "#4f5c4e"),
+        swatchBg(3, "--dt-accent", "#434e47"),
+        swatchBg(4, "--dt-destructive", "#da6362"),
+        swatchBg(5, "--ui-success", "#41b770")
+      ] }),
+      groupLabel("#M17-21 \u0417\u0430\u043B\u0438\u0432\u043A\u0438 \u2014 \u0444\u043E\u043D\u044B \u043F\u0430\u043D\u0435\u043B\u0435\u0439"),
+      jsxs16("div", { className: "grid grid-cols-5 gap-1", children: [
+        swatchBg(17, "--ui-bg-primary", "accent 16%"),
+        swatchBg(18, "--ui-bg-secondary", "accent 11%"),
+        swatchBg(19, "--ui-bg-tertiary", "accent 8%"),
+        swatchBg(20, "--ui-bg-card", "accent 4%"),
+        swatchBg(21, "--ui-bg-elevated", "elevated-seed")
+      ] }),
+      groupLabel("#M10-16 UI-\u043F\u0430\u043B\u0438\u0442\u0440\u0430 (\u0444\u0438\u043A\u0441\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u044B\u0435 hex-\u043F\u0435\u0440\u0435\u043C\u0435\u043D\u043D\u044B\u0435)"),
+      jsxs16("div", { className: "grid grid-cols-7 gap-1", children: [
+        swatchBg(10, "--ui-red", "#e75e78"),
+        swatchBg(11, "--ui-green", "#55a583"),
+        swatchBg(12, "--ui-cyan", "#6f9ba6"),
+        swatchBg(13, "--ui-orange", "#db704b"),
+        swatchBg(14, "--ui-yellow", "#c08532"),
+        swatchBg(15, "--ui-blue", "#0053fd"),
+        swatchBg(16, "--ui-purple", "#9e94d5")
+      ] }),
+      groupLabel("#M6-9 Foreground-\u043F\u0430\u0440\u044B (\u0446\u0432\u0435\u0442 \u0422\u0415\u041A\u0421\u0422\u0410 \u0434\u043B\u044F \u0437\u0430\u043B\u0438\u0432\u043E\u043A \u0432\u044B\u0448\u0435)"),
+      jsxs16("div", { className: "grid grid-cols-2 gap-x-2", children: [
+        swatchText(6, "--dt-primary-foreground", "#ffffff"),
+        swatchText(7, "--dt-secondary-foreground", "#d3c6aa"),
+        swatchText(8, "--dt-accent-foreground", "#d3c6aa"),
+        swatchText(9, "--dt-destructive-foreground", "#ffffff")
+      ] }),
+      // Градиент по смыслу (94% → 36% непрозрачности base) — в один ряд, чтобы затухание было видно сразу.
+      groupLabel("#M22-25 \u0422\u0435\u043A\u0441\u0442 \u2014 \u0438\u0435\u0440\u0430\u0440\u0445\u0438\u044F (\u0433\u0440\u0430\u0434\u0438\u0435\u043D\u0442 \u043F\u0440\u043E\u0437\u0440\u0430\u0447\u043D\u043E\u0441\u0442\u0438 base)"),
+      jsxs16("div", { className: "flex items-baseline gap-2", children: [
+        swatchText(22, "--ui-text-primary", "94% base"),
+        swatchText(23, "--ui-text-secondary", "74% base"),
+        swatchText(24, "--ui-text-tertiary", "54% base"),
+        swatchText(25, "--ui-text-quaternary", "36% base")
+      ] }),
+      // Diff — border+background СМЫСЛОВАЯ пара, одна плашка на пару (как в #B16), не 4 отдельных.
+      groupLabel("#M26-27 Diff (\u0440\u0430\u043C\u043A\u0430+\u0444\u043E\u043D \u043E\u0434\u043D\u043E\u0439 \u043F\u043B\u0430\u0448\u043A\u043E\u0439)"),
+      jsxs16("div", { className: "grid grid-cols-2 gap-1", children: [
+        jsx16("div", {
+          className: "h-5 rounded border text-[0.5rem] flex items-center justify-center font-bold",
+          style: { borderColor: "var(--ui-diff-add-border)", backgroundColor: "var(--ui-diff-add-background)", color: "var(--ui-diff-add-border)" },
+          title: "--ui-diff-add-border/-background \u2014 \u043E\u0436\u0438\u0434\u0430\u043D\u0438\u0435: green / green 12%",
+          children: "M26 add"
+        }),
+        jsx16("div", {
+          className: "h-5 rounded border text-[0.5rem] flex items-center justify-center font-bold",
+          style: { borderColor: "var(--ui-diff-remove-border)", backgroundColor: "var(--ui-diff-remove-background)", color: "var(--ui-diff-remove-border)" },
+          title: "--ui-diff-remove-border/-background \u2014 \u043E\u0436\u0438\u0434\u0430\u043D\u0438\u0435: red / red 12%",
+          children: "M27 remove"
+        })
+      ] }),
+      // Inline code — та же пара bg+fg, тоже одной плашкой (см. #D12).
+      groupLabel("#M28 Inline code (\u0444\u043E\u043D+\u0442\u0435\u043A\u0441\u0442 \u043E\u0434\u043D\u043E\u0439 \u043F\u043B\u0430\u0448\u043A\u043E\u0439)"),
+      jsx16("div", {
+        className: "inline-flex px-1 rounded text-[0.6rem] font-bold",
+        style: { backgroundColor: "var(--ui-inline-code-background)", color: "var(--ui-inline-code-foreground)" },
+        title: "--ui-inline-code-background/-foreground \u2014 \u043E\u0436\u0438\u0434\u0430\u043D\u0438\u0435: #ffffff12 / #ffffffe0",
+        children: "M28 --ui-inline-code-*"
+      }),
+      groupLabel("#M29 \u041B\u0435\u0433\u0435\u043D\u0434\u0430\u0440\u043D\u0430\u044F \u043F\u0430\u043C\u044F\u0442\u044C tool"),
+      swatchBg(29, "--tool-memory-legendary-icon", "yellow\xD7purple mix"),
+      // Перенесено сюда 2026-09-02 из #G8-10 (RCS-сдвиги) и #E13-15 (color-mix) — оба метода
+      // получения ПРОИЗВОДНОГО цвета от var(--dt-primary), тематически одно и то же умение.
+      groupLabel("#M30-32 OKLCH Relative Color Syntax \u2014 \u043F\u0440\u043E\u0438\u0437\u0432\u043E\u0434\u043D\u044B\u0435 \u043E\u0442 var(--dt-primary)"),
+      jsxs16("div", { className: "grid grid-cols-3 gap-1", children: [
+        jsx16("div", {
+          className: "h-5 rounded flex items-center justify-center text-[0.45rem] font-bold truncate",
+          style: { backgroundColor: "oklch(from var(--dt-primary) l c h)", color: "#fcfcfc80" },
+          title: "oklch(from var(--dt-primary) l c h) \u2014 \u0442\u043E\u0447\u043D\u043E\u0435 \u0437\u0435\u0440\u043D\u043E \u043F\u0435\u0440\u0435\u043C\u0435\u043D\u043D\u043E\u0439",
+          children: "#M30 base"
+        }),
+        jsx16("div", {
+          className: "h-5 rounded flex items-center justify-center text-[0.45rem] font-bold truncate",
+          style: { backgroundColor: "oklch(from var(--dt-primary) l c calc(h + 20))", color: "#fcfcfc80" },
+          title: "oklch(from var(--dt-primary) l c calc(h + 20)) \u2014 hue +20",
+          children: "#M31 hue+20"
+        }),
+        jsx16("div", {
+          className: "h-5 rounded flex items-center justify-center text-[0.45rem] font-bold truncate",
+          style: { backgroundColor: "oklch(from var(--dt-primary) calc(l - 0.3) c h)", color: "#fcfcfc80" },
+          title: "oklch(from var(--dt-primary) calc(l - 0.3) c h) \u2014 lightness -0.3",
+          children: "#M32 light-0.3"
+        })
+      ] }),
+      groupLabel("#M33-35 color-mix(in oklch, #e75e78, var(--dt-primary) N%)"),
+      jsxs16("div", { className: "grid grid-cols-3 gap-1", children: [
+        jsx16("div", {
+          className: "h-5 rounded flex items-center justify-center text-[0.45rem] font-bold truncate",
+          style: { backgroundColor: "color-mix(in oklch, #e75e78, var(--dt-primary) 25%)", color: "#fcfcfc80" },
+          title: "color-mix(in oklch, #e75e78, var(--dt-primary) 25%)",
+          children: "#M33 25%"
+        }),
+        jsx16("div", {
+          className: "h-5 rounded flex items-center justify-center text-[0.45rem] font-bold truncate",
+          style: { backgroundColor: "color-mix(in oklch, #e75e78, var(--dt-primary) 50%)", color: "#fcfcfc80" },
+          title: "color-mix(in oklch, #e75e78, var(--dt-primary) 50%)",
+          children: "#M34 50%"
+        }),
+        jsx16("div", {
+          className: "h-5 rounded flex items-center justify-center text-[0.45rem] font-bold truncate",
+          style: { backgroundColor: "color-mix(in oklch, #e75e78, var(--dt-primary) 75%)", color: "#fcfcfc80" },
+          title: "color-mix(in oklch, #e75e78, var(--dt-primary) 75%)",
+          children: "#M35 75%"
+        })
+      ] }),
+      // Перенесено сюда 2026-09-02 из #F (Interactive Opacity Test Stand) — сам вопрос
+      // "работает ли прозрачность фона" закрыт, оставлен один пример на ЖИВОЙ переменной
+      // (var(--ui-orange), не хардкод-hex, каким был тест).
+      groupLabel("#M36 Opacity via color-mix (\u043D\u0430 \u0436\u0438\u0432\u043E\u0439 var(--ui-orange), \u043D\u0435 \u043A\u043E\u043D\u0441\u0442\u0430\u043D\u0442\u0435)"),
+      jsxs16("div", { className: "grid grid-cols-4 gap-1", children: [
+        jsx16("div", { className: "h-5 rounded border text-[0.45rem] flex items-center justify-center", style: { backgroundColor: "color-mix(in oklch, var(--ui-orange), transparent 90%)" }, children: "10%" }),
+        jsx16("div", { className: "h-5 rounded border text-[0.45rem] flex items-center justify-center", style: { backgroundColor: "color-mix(in oklch, var(--ui-orange), transparent 70%)" }, children: "30%" }),
+        jsx16("div", { className: "h-5 rounded border text-[0.45rem] flex items-center justify-center", style: { backgroundColor: "color-mix(in oklch, var(--ui-orange), transparent 50%)" }, children: "50%" }),
+        jsx16("div", { className: "h-5 rounded border text-[0.45rem] flex items-center justify-center", style: { backgroundColor: "color-mix(in oklch, var(--ui-orange), transparent 20%)" }, children: "80%" })
+      ] })
+    ]
+  }));
+}
+
+// desktop/src/palette/forms.js
+import { jsx as jsx17, jsxs as jsxs17 } from "react/jsx-runtime";
+import { useState as useState6 } from "react";
+function TextInputDemo() {
+  return jsx17("input", {
+    type: "text",
+    defaultValue: "",
+    placeholder: "#N1 text input",
+    className: "w-full px-2 py-1 rounded-md text-[0.65rem] outline-none transition-colors duration-100 ease-out",
+    // БЫЛ на var(--ui-bg-input) — константа #fcfcfc в самой теме, без тёмной пары, не
+    // инвертируется со сменой темы. var(--ui-bg-elevated) — то же, что уже работает в #B3.
+    style: { backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)" },
+    onFocus: (e) => {
+      e.currentTarget.style.borderColor = "var(--dt-ring)";
+    },
+    onBlur: (e) => {
+      e.currentTarget.style.borderColor = "var(--ui-stroke-secondary)";
+    }
+  });
+}
+function TextAreaDemo() {
+  return jsx17("textarea", {
+    rows: 3,
+    placeholder: "#N5 multiline input",
+    className: "w-full px-2 py-1 rounded-md text-[0.65rem] outline-none resize-none transition-colors duration-100 ease-out",
+    style: { backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)" },
+    onFocus: (e) => {
+      e.currentTarget.style.borderColor = "var(--dt-ring)";
+    },
+    onBlur: (e) => {
+      e.currentTarget.style.borderColor = "var(--ui-stroke-secondary)";
+    }
+  });
+}
+function CheckboxDemo() {
+  return jsxs17("label", { className: "inline-flex items-center gap-1.5 text-[0.65rem] cursor-pointer select-none", style: SELECTABLE, children: [
+    jsx17("input", { type: "checkbox", defaultChecked: true, style: { accentColor: "var(--dt-primary)" } }),
+    jsx17("span", { children: "#N2 checkbox" })
+  ] });
+}
+function RadioDemo() {
+  return jsxs17("div", { className: "inline-flex items-center gap-3 text-[0.65rem] select-none", style: SELECTABLE, children: [
+    jsxs17("label", { className: "inline-flex items-center gap-1 cursor-pointer", children: [
+      jsx17("input", { type: "radio", name: "palette-n3-demo", defaultChecked: true, style: { accentColor: "var(--dt-primary)" } }),
+      jsx17("span", { children: "a" })
+    ] }),
+    jsxs17("label", { className: "inline-flex items-center gap-1 cursor-pointer", children: [
+      jsx17("input", { type: "radio", name: "palette-n3-demo", style: { accentColor: "var(--dt-primary)" } }),
+      jsx17("span", { children: "b" })
+    ] }),
+    jsx17("span", { className: "text-(--ui-text-quaternary)", children: "#N3 radio" })
+  ] });
+}
+function TooltipDemo() {
+  const [open, setOpen] = useState6(false);
+  return jsx17("span", {
+    className: "relative inline-block",
+    onMouseEnter: () => setOpen(true),
+    onMouseLeave: () => setOpen(false),
+    children: jsxs17("span", { style: { position: "relative" }, children: [
+      jsx17("span", {
+        key: "trigger",
+        className: "text-[0.65rem] cursor-help select-none",
+        style: { borderBottom: "1px dotted var(--ui-text-tertiary)", color: "var(--ui-text-secondary)" },
+        children: "#N4 hover me (tooltip)"
+      }),
+      open ? jsx17("div", {
+        key: "tooltip",
+        className: "absolute z-10 px-2 py-1 rounded-md text-[0.6rem] whitespace-nowrap",
+        style: {
+          bottom: "100%",
+          left: "0",
+          marginBottom: "4px",
+          backgroundColor: "var(--ui-bg-elevated)",
+          border: "1px solid var(--ui-stroke-secondary)",
+          color: "var(--ui-text-primary)"
+        },
+        children: "controlled tooltip \u2014 \u044D\u0442\u043E\u0442 \u0442\u0435\u043A\u0441\u0442 \u0442\u043E\u0447\u043D\u043E \u0438\u0437 \u0441\u043E\u0441\u0442\u043E\u044F\u043D\u0438\u044F, \u043D\u0435 \u0438\u0437 title="
+      }) : null
+    ] })
+  });
+}
+function FormsSection() {
+  return paletteTile("Forms & Tooltip", jsxs17("div", {
+    className: "flex flex-col gap-2",
+    style: { fontSize: "0.7rem" },
+    children: [
+      jsx17("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5", children: "#N1 Text input" }),
+      jsx17(TextInputDemo, {}),
+      jsx17("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#N2-3 Checkbox / radio" }),
+      jsxs17("div", { className: "flex items-center gap-3", children: [jsx17(CheckboxDemo, {}), jsx17(RadioDemo, {})] }),
+      jsx17("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#N4 Tooltip (controlled)" }),
+      jsx17(TooltipDemo, {}),
+      jsx17("div", { className: "text-[0.6rem] text-(--ui-text-quaternary) mb-0.5 mt-1", children: "#N5 Multiline input" }),
+      jsx17(TextAreaDemo, {})
+    ]
+  }));
+}
+
+// desktop/src/palette/index.js
+function paletteTile(title, children) {
+  return jsxs18("div", {
+    className: "rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-card)",
+    style: CAPPED,
+    children: [
+      jsx18("div", {
+        className: "px-2 py-1 border-b border-(--ui-stroke-quaternary) text-[0.6rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)",
+        style: SELECTABLE,
+        children: title
+      }),
+      jsx18("div", { className: "p-2", children })
+    ]
+  });
+}
+function PalettePane() {
+  return sdkC(sdk6.ScrollArea, "div", {
+    className: "h-full w-full overflow-hidden p-2 gap-1.5",
+    style: CAPPED,
+    children: jsxs18("div", {
+      className: "grid grid-cols-2 gap-1.5",
+      style: CAPPED,
+      children: [
+        jsx18(ButtonsSection, {}),
+        jsx18(CardsSection, {}),
+        jsx18(BadgesSection, {}),
+        jsx18(TypographySection, {}),
+        jsx18(ListsSection, {}),
+        jsx18(LoadersSection, {}),
+        jsx18(InteractiveSection, {}),
+        jsx18(DividersSection, {}),
+        jsx18(SdkSection, {}),
+        jsx18(FormsSection, {}),
+        // Layout и Theme Vars на всю ширину
+        jsxs18("div", { className: "col-span-2", children: [jsx18(LayoutSection, {})] }),
+        jsxs18("div", { className: "col-span-2", children: [jsx18(ThemeVarsSection, {})] })
+      ]
+    })
+  });
+}
+
+// desktop/src/prompt-mirror.js
+import * as sdk7 from "@hermes/plugin-sdk";
+import { jsx as jsx31, jsxs as jsxs30 } from "react/jsx-runtime";
+import { useEffect as useEffect5, useLayoutEffect as useLayoutEffect4, useState as useState11, useMemo as useMemo2, useRef as useRef6 } from "react";
+
+// desktop/src/mirror-rail.js
+import { jsx as jsx19 } from "react/jsx-runtime";
+var ROW_HEIGHT2 = {
+  header: "1rem",
+  // `opener` = верхний паддинг обёртки (`pt-1`, 0.25rem) + содержимое `brick` (ниже) —
+  // ТОЧНО, не с запасом (владелец, 2026-09-15: карточка реплики юзера «обрезалась снизу» —
+  // запас в 1.5rem маскировал СИМПТОМ несовпадения, не был его причиной, точный расчёт
+  // безопаснее произвольного запаса).
+  opener: "1.3rem",
+  // `brick` = `lineHeight:1 * fontSize 0.6rem` (0.6rem) + `Chip`'s `py-0.5` (0.25rem) +
+  // 1px-бордер сверху/снизу (0.125rem) = 0.975rem, плюс небольшой запас на округление.
+  // Раньше это было то же число, но БЕЗ `lineHeight:1` на `Chip` — реальная высота чипа
+  // зависела от УНАСЛЕДОВАННОГО межстрочного интервала хоста (не наш контроль), оказывалась
+  // БОЛЬШЕ этого числа, и `BrickRow`'s `overflow:hidden` молча резал чип снизу. `lineHeight:
+  // 1` на `Chip` (`prompt-mirror.js`) убирает саму неопределённость, а не прячет её запасом.
+  brick: "1.05rem",
+  step: "0.4rem",
+  // Строка, которая слева рендерит НИЧЕГО (владелец, 2026-09-15: «есть состояния когда эта
+  // сетка съезжает» — реплика ассистента, которая только зовёт тулы без своего текста,
+  // `ReplyBrick` возвращает `null` для неё; рельса раньше всё равно резервировала под неё
+  // `ROW_HEIGHT.brick`, реальный след слева был 0 — отсюда и разъезд). `0rem`, а не
+  // пропуск строки в списке: список остаётся 1-в-1 с проходом по строкам вагона, а не
+  // превращается во ВТОРОЙ условный проход, который рискует разойтись с первым.
+  empty: "0rem"
+};
+var ROW_GAP = "0.125rem";
+var RAIL_COL_WIDTH = "1.4rem";
+var RAIL_WIDTH = RAIL_COL_WIDTH;
+var RAIL_BODY_WIDTH = "2rem";
+function buildRailRows(entries) {
+  return entries.map((e, i) => {
+    const height = ROW_HEIGHT2[e.kind] || ROW_HEIGHT2.brick;
+    const gap = e.gapBefore ? ROW_GAP : "0rem";
+    const base = {
+      rowIndex: i,
+      height,
+      gap,
+      pickable: !!e.pickable,
+      tone: e.tone || null,
+      msgAddr: e.msgAddr || "",
+      result: !!e.result
+    };
+    return e.pickable ? Object.assign(base, { op: e.op, toolId: e.toolId || "", stepKey: e.stepKey }) : base;
+  });
+}
+var SEGMENT_GUIDE = "color-mix(in oklch, var(--ui-stroke-secondary), transparent 92%)";
+function selectionRailChrome({ key, column, rowSpan, fill, headHeight, onClose, capChildren, markedCount }) {
+  const body = jsx19("div", {
+    // Метка для замера: крестик в шапке ставится над ИЗМЕРЕННЫМ телом (`prompt-mirror.js`).
+    "data-rail-body": key,
+    className: "rounded-md border border-(--ui-stroke-secondary)",
+    style: {
+      gridColumn: column,
+      gridRow: `1 / ${rowSpan + 1}`,
+      alignSelf: "stretch",
+      justifySelf: "stretch",
+      width: "100%",
+      boxSizing: "border-box",
+      position: "relative",
+      zIndex: 0,
+      pointerEvents: "none",
+      backgroundColor: fill
+    }
+  }, `${key}-body`);
+  const cap = jsx19("div", {
+    style: {
+      gridColumn: column,
+      gridRow: `1 / ${rowSpan + 1}`,
+      alignSelf: "stretch",
+      justifySelf: "stretch",
+      position: "relative",
+      zIndex: 3,
+      minHeight: 0,
+      pointerEvents: "none"
+    },
+    children: jsx19("div", {
+      style: {
+        position: "sticky",
+        top: 0,
+        pointerEvents: "auto",
+        display: "flex",
+        gap: "2px",
+        width: "100%",
+        height: ROW_HEIGHT2.header,
+        marginBottom: `-${ROW_HEIGHT2.header}`
+      },
+      children: capChildren
+    })
+  }, `${key}-cap`);
+  const close = jsx19("button", {
+    type: "button",
+    className: "mirror-action-btn rounded-md border border-(--ui-stroke-secondary)",
+    title: "remove operation",
+    onClick: (e) => {
+      e.stopPropagation();
+      onClose();
+    },
+    style: {
+      gridColumn: column,
+      gridRow: 1,
+      zIndex: 4,
+      alignSelf: "stretch",
+      justifySelf: "stretch",
+      width: "100%",
+      height: headHeight,
+      boxSizing: "border-box",
+      padding: 0,
+      cursor: "pointer",
+      display: "flex",
+      flexDirection: "column",
+      justifyContent: "space-between",
+      paddingInline: "3px",
+      lineHeight: 1,
+      color: "var(--ui-text-secondary)",
+      backgroundColor: fill
+    },
+    // КРЕСТИК — ГЛАВНОЕ, число — справка (владелец, 2026-09-29: «информация — это крестик: эту
+    // штуку можно закрыть; число — так, для справки»). Высота прежняя, две строки, но ПО
+    // ДИАГОНАЛИ, как дробь: крестик слева вверху, число справа внизу — столбиком по центру они
+    // читались одним значком. Кнопка — вся зона, ховер на всей зоне: целиться в крестик не надо.
+    children: [
+      // `lineHeight: 0.7`: у глифа × свои пустоты сверху и снизу, строку можно ужать без обрезки.
+      // Иначе 0.8rem + 0.55rem = ровно высота кнопки, и зазору под числом взяться неоткуда.
+      jsx19("span", { style: {
+        alignSelf: "flex-start",
+        fontSize: "0.8rem",
+        lineHeight: 0.7,
+        marginTop: "2px",
+        color: "var(--ui-text-primary)"
+      }, children: "\xD7" }, `${key}-x`),
+      jsx19("span", {
+        // 2px над нижней рамкой (владелец, 2026-09-29): вплотную число ложилось на границу.
+        style: {
+          alignSelf: "flex-end",
+          fontSize: "0.55rem",
+          lineHeight: 1,
+          marginBottom: "2px",
+          color: "var(--ui-text-quaternary)"
+        },
+        children: String(markedCount || 0)
+      }, `${key}-n`)
+    ]
+  }, `${key}-close`);
+  return { body, cap, close };
+}
+function Rail({ railRows, cells, guide, gridRow, gridColumn }) {
+  const rowsTemplate = railRows.map((r) => `calc(${r.height} + ${r.gap})`).join(" ");
+  return jsx19("div", {
+    style: {
+      display: "grid",
+      gridTemplateRows: rowsTemplate,
+      width: RAIL_WIDTH,
+      flexShrink: 0,
+      boxSizing: "border-box",
+      gridRow,
+      gridColumn,
+      position: guide ? "relative" : void 0,
+      zIndex: guide ? 1 : void 0,
+      justifySelf: guide ? "center" : void 0,
+      outline: guide ? `1px solid ${SEGMENT_GUIDE}` : void 0,
+      outlineOffset: guide ? "4px" : void 0
+    },
+    children: cells
+  });
+}
+var OPENER_CELL = "1.18rem";
+function cellSide(r) {
+  return r.height === ROW_HEIGHT2.opener ? OPENER_CELL : r.height;
+}
+function activeAddresses(railRows, isActive) {
+  const on = isActive || ((r) => !!r.msgAddr);
+  const ids = [];
+  railRows.forEach((r) => {
+    if (r.height === ROW_HEIGHT2.empty) return;
+    if (r.height === ROW_HEIGHT2.header && !r.msgAddr) return;
+    if (!r.msgAddr || !on(r)) return;
+    if (ids.indexOf(r.msgAddr) < 0) ids.push(r.msgAddr);
+  });
+  return ids;
+}
+function markedAddresses(picked) {
+  return Object.keys(picked || {});
+}
+function baseCells(railRows, picked, drag, paint) {
+  const marks = picked || {};
+  const onDown = drag && drag.onDown;
+  const onEnter = drag && drag.onEnter;
+  const border = paint && paint.border || "var(--ui-stroke-secondary)";
+  const fill = paint && paint.fill || border;
+  const isActive = paint && paint.active || ((r) => !!r.msgAddr);
+  return railRows.filter((r) => r.height !== ROW_HEIGHT2.empty && !(r.height === ROW_HEIGHT2.header && !r.msgAddr)).map((r) => {
+    const active = !!(r.msgAddr && isActive(r));
+    const selected = active && Object.prototype.hasOwnProperty.call(marks, r.msgAddr);
+    const wash = r.tone ? `color-mix(in oklch, ${r.tone}, transparent 85%)` : "transparent";
+    return jsx19("span", {
+      onMouseDown: active ? (e) => {
+        e.stopPropagation();
+        onDown(r.msgAddr);
+      } : void 0,
+      // КЛИК тоже гасится, не только нажатие: на документе висят слушатели «клик мимо —
+      // выйти из режима» (`file-ops-pane.js` для `drop`), и без этого первая же отметка на
+      // рельсе `drop content` снимала режим (владелец, 2026-09-29).
+      onClick: (e) => e.stopPropagation(),
+      onMouseEnter: active ? () => onEnter(r.msgAddr) : void 0,
+      title: active ? `${selected ? "selected" : "empty"} ${r.msgAddr}` : "not selectable",
+      style: {
+        gridRow: r.rowIndex + 1,
+        alignSelf: "end",
+        justifySelf: "center",
+        width: cellSide(r),
+        height: cellSide(r),
+        boxSizing: "border-box",
+        borderRadius: "0.1rem",
+        cursor: active ? "pointer" : "default",
+        border: active ? `1px solid ${border}` : "1px solid transparent",
+        backgroundColor: selected ? fill : wash
+      }
+    }, `${r.rowIndex}`);
+  });
+}
+function pickCells(railRows, drop) {
+  if (!drop || !drop.mode) return [];
+  const color = ACTION_COLOR[drop.action] || "var(--ui-text-quaternary)";
+  const picked = drop.picked || {};
+  return railRows.filter((r) => r.pickable).map((r) => {
+    const isPicked = Object.prototype.hasOwnProperty.call(picked, r.op);
+    return jsx19("span", {
+      onClick: (e) => {
+        e.stopPropagation();
+        toggleDropPick(r.op, r.toolId);
+      },
+      title: `${isPicked ? "unpick" : "pick"} op ${r.op} for "${drop.action}"`,
+      style: {
+        gridRow: r.rowIndex + 1,
+        alignSelf: "end",
+        justifySelf: "center",
+        cursor: "pointer",
+        width: cellSide(r),
+        height: cellSide(r),
+        boxSizing: "border-box",
+        borderRadius: "0.1rem",
+        border: `1px solid ${color}`,
+        backgroundColor: isPicked ? color : "transparent"
+      }
+    }, `${r.rowIndex}`);
+  });
+}
+
+// desktop/src/mirror-primitives.js
+import { jsx as jsx21, jsxs as jsxs20 } from "react/jsx-runtime";
+import { useEffect as useEffect2, useState as useState7, useRef as useRef3, useLayoutEffect as useLayoutEffect2 } from "react";
+
+// desktop/src/mirror-op-chip.js
+import { jsx as jsx20, jsxs as jsxs19 } from "react/jsx-runtime";
+var CHIP_PAD_LEFT = "0.5rem";
+var ICON_COL_WIDTH = "1.2rem";
+var NAME_COL_WIDTH = "13ch";
+var LEAD_GAP = "0.3rem";
+var MARK_SLOT_WIDTH = `calc(${CHIP_PAD_LEFT} + ${ICON_COL_WIDTH})`;
+var LEAD_WIDTH = `calc(${MARK_SLOT_WIDTH} + ${NAME_COL_WIDTH} + ${LEAD_GAP})`;
+var OP_COL_WIDTH = "4ch";
+var UNASSIGNED_OP = "0000";
+var UNASSIGNED_OP_OPACITY = 0.4;
+var OVERLAP_COL_WIDTH = "4.2ch";
+var CLIP = { overflow: "hidden", whiteSpace: "nowrap" };
+var OP_CHIP_GAP = "0.25rem";
+function toolIcon(name) {
+  return TOOL_ICON[name] || "\u25C6";
+}
+function OpChipBody({ marks, name, data, diff, op, overlapText, overlapTone, overlapTitle }) {
+  const list = Array.isArray(marks) ? marks : [];
+  const leadGroup = jsxs19("span", {
+    style: Object.assign({ display: "flex", alignItems: "center", flexShrink: 0, width: LEAD_WIDTH, columnGap: "0.15rem" }, CLIP),
+    children: [
+      list.length ? jsx20("span", {
+        title: list.map((m) => `${m.glyph}  \u2014  ${m.title}`).join("\n"),
+        style: Object.assign({ flexShrink: 0, width: MARK_SLOT_WIDTH, display: "flex", justifyContent: "flex-end" }, CLIP),
+        children: list.map((m, i) => jsx20("span", { style: { color: m.tone || "inherit" }, children: m.glyph }, i))
+      }, "marks") : jsx20("span", {
+        title: name,
+        style: { flexShrink: 0, width: MARK_SLOT_WIDTH, paddingLeft: CHIP_PAD_LEFT, boxSizing: "border-box", textAlign: "center" },
+        children: toolIcon(name)
+      }, "icon"),
+      // Имя — остаток группы (`flex:1`). Колонка значков постоянная, поэтому имя от статусов
+      // больше не сжимается и не едет; `data` снаружи группы тоже стоит на месте.
+      jsx20("span", {
+        style: Object.assign({ flex: "1 1 auto", minWidth: 0 }, CLIP),
+        children: name
+      })
+    ]
+  });
+  return jsxs19("span", {
+    style: Object.assign({ display: "flex", alignItems: "center", width: "100%", columnGap: OP_CHIP_GAP }, CLIP),
+    children: [
+      leadGroup,
+      // Диф `+N −M` — ПЕРЕД именем (владелец, 2026-09-29: «ничего, если имя сдвинется»).
+      // Только у операций, которые его знают; у прочих узла нет вовсе.
+      diff ? jsxs19("span", {
+        style: { flexShrink: 0, display: "flex", columnGap: "0.2rem", fontVariantNumeric: "tabular-nums" },
+        children: [
+          diff.added ? jsx20("span", { style: { color: "var(--ui-green)" }, children: `+${diff.added}` }) : null,
+          diff.removed ? jsx20("span", { style: { color: "var(--ui-red)" }, children: `\u2212${diff.removed}` }) : null
+        ]
+      }) : null,
+      jsx20("span", {
+        style: Object.assign({ flex: "1 1 auto", minWidth: 0, opacity: 0.75 }, CLIP),
+        children: data || ""
+      }),
+      jsx20("span", {
+        style: Object.assign({
+          flexShrink: 0,
+          width: OP_COL_WIDTH,
+          textAlign: "right",
+          fontVariantNumeric: "tabular-nums",
+          opacity: op === UNASSIGNED_OP ? UNASSIGNED_OP_OPACITY : 1
+        }, CLIP),
+        children: op || ""
+      }),
+      jsx20("span", {
+        title: overlapTitle,
+        style: Object.assign({
+          flexShrink: 0,
+          width: OVERLAP_COL_WIDTH,
+          textAlign: "right",
+          fontVariantNumeric: "tabular-nums",
+          color: overlapTone || "inherit"
+        }, CLIP),
+        children: overlapText || ""
+      })
+    ]
+  });
+}
+
+// desktop/src/mirror-primitives.js
+function mixTone(baseVar, pct) {
+  return `color-mix(in oklch, var(${baseVar}), var(--dt-primary) ${pct}%)`;
+}
+function opaque(varName) {
+  return `oklch(from var(${varName}) l c h / 1)`;
+}
+var SURFACE_BASE = "--ui-editor-surface-background";
+var WORKAREA_BG = `color-mix(in oklch, ${opaque(SURFACE_BASE)}, ${opaque("--ui-bg-elevated")} 50%)`;
+var VAGON_BG = `color-mix(in oklch, ${opaque(SURFACE_BASE)}, ${opaque("--tool-memory-legendary-icon")} 3%)`;
+var ROLE_TONE = {
+  user: mixTone("--ui-blue", 30),
+  assistant: mixTone("--ui-green", 30),
+  tool: mixTone("--ui-cyan", 30),
+  system: mixTone("--ui-yellow", 30)
+};
+function toneOf(role) {
+  return ROLE_TONE[String(role || "")] || "var(--ui-text-quaternary)";
+}
+var DISTILL_RE = /FT-DISTILL(-END)?(?:\/1|_v1)/;
+var DISTILL_HEAD_CHARS = 120;
+var BRIDGE_MARK = "\u25C6FT-DISTILL-BRIDGE_v1\u25C6";
+var OLD_BRIDGE_HEADS = ["[system \u2014 context compaction:"];
+function firstBracket(head) {
+  const close = head.indexOf("]");
+  return /^<?\[/.test(head) && close > 0 ? head.slice(0, close + 1) : head.slice(0, DISTILL_HEAD_CHARS);
+}
+function distillKind(text) {
+  const head = String(text || "").trimStart();
+  if (OLD_BRIDGE_HEADS.some((h) => head.startsWith(h))) return "bridge";
+  const first = firstBracket(head);
+  if (first.includes(BRIDGE_MARK)) return "bridge";
+  const m = first.match(DISTILL_RE);
+  if (!m) return "";
+  return m[1] ? "close" : "open";
+}
+function rowTone(fact) {
+  const f = fact || {};
+  return f.distill || distillKind(f.text) ? ACTION_COLOR.compact : toneOf(f.role);
+}
+function roughTokens(chars) {
+  return Math.ceil(Number(chars || 0) / 4);
+}
+function factTokens(fact) {
+  const f = fact || {};
+  return typeof f.tokens === "number" && isFinite(f.tokens) ? f.tokens : roughTokens(f.chars);
+}
+function briefPreview(text, maxChars) {
+  const s = String(text || "");
+  return s.length > maxChars ? s.slice(0, maxChars) + "\u2026" : s;
+}
+var TOKEN_COL_WIDTH = "1.1rem";
+var CHIP_WIDTH = "17rem";
+var CHIP_HOVER_BRIGHTNESS = 1.3;
+var CHIP_OPEN_FILL_BRIGHTNESS = CHIP_HOVER_BRIGHTNESS;
+var CHIP_OPEN_TEXT_BRIGHTNESS = CHIP_HOVER_BRIGHTNESS;
+var CHIP_OPEN_RING_TRANSPARENT_PCT = 30;
+function brighten(color, factor) {
+  return `oklch(from ${color} calc(l * ${factor}) c h)`;
+}
+function Chip({ tone, border, open, flushLeft, onClick, onMouseEnter, onMouseLeave, children }) {
+  return jsx21("span", {
+    className: "mirror-chip relative inline-flex items-center px-2 py-0.5 rounded-xl font-medium cursor-pointer" + (open ? " mirror-chip-open" : ""),
+    style: Object.assign({
+      width: CHIP_WIDTH,
+      fontSize: "0.6rem",
+      // `lineHeight: 1` (Таск 10a, живая правка) — без него высота чипа зависит от
+      // УНАСЛЕДОВАННОГО межстрочного интервала хоста, который мы не знаем заранее и не
+      // контролируем; `ROW_HEIGHT.brick` (mirror-rail.js) посчитан ИМЕННО под `lineHeight:
+      // 1`, и `BrickRow` теперь режет строку по этой высоте (`overflow:hidden`) — если
+      // реальная высота чипа окажется больше расчётной (как было до этой правки, с
+      // унаследованным интервалом), чип обрезается снизу молча. Владелец поймала это на
+      // карточке-реплике юзера («обрезалась снизу») сразу после первого внедрения трека.
+      lineHeight: 1,
+      backgroundColor: `color-mix(in oklch, ${open ? brighten(tone, CHIP_OPEN_FILL_BRIGHTNESS) : tone}, transparent 85%)`,
+      color: open ? brighten(tone, CHIP_OPEN_TEXT_BRIGHTNESS) : tone,
+      boxShadow: open ? `inset 0 0 0 1px color-mix(in oklch, ${tone}, transparent ${CHIP_OPEN_RING_TRANSPARENT_PCT}%)` : "none",
+      border: border ? "1px solid var(--ui-stroke-secondary)" : "1px solid transparent",
+      whiteSpace: "nowrap",
+      overflow: "hidden",
+      textOverflow: "ellipsis"
+    }, flushLeft ? { paddingLeft: 0 } : null, SELECTABLE),
+    onClick,
+    onMouseEnter,
+    onMouseLeave,
+    children: jsx21("span", { style: { overflow: "hidden", textOverflow: "ellipsis", width: "100%" }, children }, "label")
+  });
+}
+var CHIP_FONT = "0.6rem";
+function BrickHead({ left, opLabel, addrLabel, addrTitle, height }) {
+  return jsxs20("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: `${TOKEN_COL_WIDTH} ${CHIP_WIDTH} minmax(0, auto)`,
+      alignItems: "center",
+      columnGap: "0.375rem",
+      minWidth: 0,
+      overflow: "hidden",
+      height,
+      boxSizing: "border-box",
+      fontSize: "0.5rem",
+      lineHeight: 1
+    },
+    children: [
+      jsx21("span", {
+        className: "text-(--ui-text-quaternary)",
+        style: Object.assign({ gridColumn: "1 / 3", gridRow: 1, whiteSpace: "nowrap", overflow: "hidden" }, SELECTABLE),
+        children: left
+      }, "left"),
+      jsx21("span", {
+        style: {
+          gridColumn: 2,
+          gridRow: 1,
+          display: "flex",
+          justifyContent: "flex-end",
+          fontSize: CHIP_FONT,
+          // `+ 0.4rem` — живая подгонка владельца (2026-09-29: «левее на 1.5 буквы»).
+          padding: `0 calc(0.5rem + 1px + ${OVERLAP_COL_WIDTH} + ${OP_CHIP_GAP} + 0.4rem) 0 0`,
+          pointerEvents: "none"
+        },
+        children: jsx21("span", {
+          className: "text-(--ui-text-quaternary)",
+          style: { width: OP_COL_WIDTH, textAlign: "right", whiteSpace: "nowrap", fontSize: "0.5rem", opacity: 0.7 },
+          title: "the number of our operation \u2014 what the model sees as Operation ID",
+          children: opLabel
+        })
+      }, "op"),
+      jsxs20("span", {
+        style: { gridColumn: 3, gridRow: 1, display: "flex", flexWrap: "wrap", height: "1em", overflow: "hidden", minWidth: 0 },
+        children: [
+          jsx21("span", { style: { width: 0 } }, "pad"),
+          jsx21("span", {
+            className: "text-(--ui-text-quaternary)",
+            style: Object.assign({ whiteSpace: "nowrap", opacity: 0.7 }, SELECTABLE),
+            title: addrTitle,
+            children: addrLabel
+          }, "addr")
+        ]
+      }, "addr")
+    ]
+  });
+}
+function BrickRow({ tokens, chip, rest }) {
+  return jsxs20("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: `${TOKEN_COL_WIDTH} ${CHIP_WIDTH} auto`,
+      alignItems: "center",
+      columnGap: "0.375rem",
+      minWidth: 0,
+      overflow: "hidden",
+      height: ROW_HEIGHT2.brick,
+      boxSizing: "border-box"
+    },
+    children: [
+      jsx21("span", {
+        className: "text-(--ui-text-quaternary)",
+        // `lineHeight: 1` — та же причина, что у `Chip`: строка вырезана по авторитетной
+        // высоте (`overflow:hidden` выше), унаследованный межстрочный интервал не должен
+        // решать, влезет ли содержимое.
+        style: Object.assign({ fontVariantNumeric: "tabular-nums", fontSize: "0.55rem", lineHeight: 1, textAlign: "right", overflow: "hidden" }, SELECTABLE),
+        children: tokens
+      }),
+      chip,
+      jsxs20("span", { className: "flex items-center gap-1 min-w-0", style: { lineHeight: 1 }, children: rest || [] })
+    ]
+  });
+}
+var PANE_MIN_LINES = 5;
+var PANE_WHOLE_MAX_SHARE = 60;
+var PANE_LINE_REM = 0.94;
+var PANE_CHARS_PER_LINE = 70;
+function paneMinRem(chars) {
+  const size = Math.max(0, Number(chars) || 0);
+  const lines = Math.max(1, Math.ceil(size / PANE_CHARS_PER_LINE));
+  return Math.min(PANE_MIN_LINES, lines) * PANE_LINE_REM;
+}
+function paneSplit(topChars, bottomChars) {
+  const top = Math.max(0, Number(topChars) || 0);
+  return {
+    top: top === 0 ? null : { minRem: paneMinRem(top) },
+    // Пустой результат секцию НЕ отменяет: «ответ пуст» — это факт, а не нечего показать.
+    bottom: { minRem: paneMinRem(bottomChars) }
+  };
+}
+function Pane({ minRem, whole, children }) {
+  return jsx21("div", {
+    className: "mirror-pane-scroll overflow-auto px-2 py-1",
+    style: whole ? { flexGrow: 0, flexShrink: 0, flexBasis: "auto", maxHeight: `${PANE_WHOLE_MAX_SHARE}%` } : { flexGrow: 0, flexShrink: 1, flexBasis: "auto", minHeight: `${minRem}rem` },
+    children
+  });
+}
+function TwoPanes({ top, bottom, topChars, bottomChars, topWhole }) {
+  const split = paneSplit(top ? topChars === void 0 ? 1 : topChars : 0, bottomChars);
+  const parts = [];
+  if (split.top) {
+    parts.push(jsx21(Pane, { minRem: split.top.minRem, whole: topWhole, children: top }, "call"));
+    parts.push(jsx21("div", {
+      className: "shrink-0",
+      style: { height: "4px", backgroundColor: "var(--ui-stroke-secondary)", opacity: 0.9 }
+    }, "split"));
+  }
+  parts.push(topWhole ? jsx21("div", {
+    className: "mirror-pane-scroll overflow-auto px-2 py-1 grow min-h-0",
+    children: bottom
+  }, "result") : jsx21(Pane, { minRem: split.bottom.minRem, children: bottom }, "result"));
+  return jsxs20("div", { className: "flex flex-col min-h-0", children: parts }, "panes");
+}
+var HOVER_DELAY_MS = 200;
+var FLYOUT_GAP_PX = 6;
+var FLYOUT_BOTTOM_REM = 5;
+var FLYOUT_LOWER_QUARTER = 0.3;
+var EDGE_PAD_PX = 4;
+var TOP_PAD_FACTOR = 5;
+var TALL_WAIT_MS = 500;
+var TALL_TRIES = 3;
+function tallBox(cur, short, viewH, pad2) {
+  const box = cur && typeof cur === "object" ? cur : {};
+  const top0 = Math.max(0, Number(box.top) || 0);
+  const bottom0 = Math.max(top0, Number(box.bottom) || 0);
+  const height0 = bottom0 - top0;
+  const missing = Math.max(0, Number(short) || 0);
+  if (missing <= 0 || height0 <= 0) return null;
+  const topPad = pad2 * TOP_PAD_FACTOR;
+  const want = height0 + missing;
+  const top = Math.min(top0, Math.max(topPad, bottom0 - want));
+  const bottom = Math.min(viewH - pad2, Math.max(bottom0, top + want));
+  return bottom - top > height0 ? { top: Math.round(top), height: Math.round(bottom - top) } : null;
+}
+function flyoutBox(rect, widthRem, fill, tall, viewH, viewW, capPx) {
+  if (!rect) return { display: "none" };
+  const right = Math.max(EDGE_PAD_PX, viewW - rect.left + FLYOUT_GAP_PX);
+  if (tall && tall.height > 0) {
+    return { position: "fixed", top: tall.top, right, width: widthRem, maxHeight: `${tall.height}px` };
+  }
+  const top = Math.max(EDGE_PAD_PX, rect.top);
+  const chipBottom = rect.bottom == null ? top : rect.bottom;
+  const mid = rect.bottom == null ? top : (Number(rect.top) + Number(rect.bottom)) / 2;
+  const inLowerQuarter = mid >= viewH * (1 - FLYOUT_LOWER_QUARTER);
+  if (fill && inLowerQuarter) {
+    const anchor = Math.min(Math.max(chipBottom, EDGE_PAD_PX), viewH - EDGE_PAD_PX);
+    const room = Math.round(anchor - EDGE_PAD_PX);
+    const maxH = capPx > 0 ? Math.min(room, Math.round(capPx)) : room;
+    return {
+      position: "fixed",
+      bottom: viewH - anchor,
+      right,
+      width: widthRem,
+      maxHeight: `${maxH}px`
+    };
+  }
+  return {
+    position: "fixed",
+    top,
+    right,
+    width: widthRem,
+    // Считается ОТ `top`, а не задаётся процентом вроде `90vh`: фиксированный процент у чипа
+    // внизу ленты увёл бы нижний край за пределы экрана — молча и необратимо.
+    maxHeight: fill ? `calc(100vh - ${top}px - ${FLYOUT_BOTTOM_REM}rem)` : void 0
+  };
+}
+function leftFlyoutStyle(rect, widthRem, fill, tall, capPx) {
+  return flyoutBox(rect, widthRem, fill, tall, window.innerHeight, window.innerWidth, capPx);
+}
+function safePadPx() {
+  const root = typeof document !== "undefined" && document.documentElement;
+  const size = root ? parseFloat(getComputedStyle(root).fontSize) : 16;
+  return FLYOUT_BOTTOM_REM * (size > 0 ? size : 16);
+}
+function hiddenBelow(el) {
+  if (!el || typeof el.querySelectorAll !== "function") return 0;
+  let short = 0;
+  for (const node of el.querySelectorAll("*")) {
+    const over = (node.scrollHeight || 0) - (node.clientHeight || 0);
+    if (over > 1) short += over;
+  }
+  return short;
+}
+function ChipTrigger({ id, popup, setPopup, tone, label, tip, border, flushLeft, renderPopup }) {
+  const open = !!popup && popup.id === id;
+  const tier = open ? popup.tier : "summary";
+  const [hover, setHover] = useState7(false);
+  const hoverTimer = useRef3(null);
+  const triggerRef = useRef3(null);
+  const [hoverRect, setHoverRect] = useState7(null);
+  const [popupRect, setPopupRect] = useState7(null);
+  useLayoutEffect2(() => {
+    if (hover && triggerRef.current) setHoverRect(triggerRef.current.getBoundingClientRect());
+  }, [hover]);
+  const [raw, setRaw] = useState7(false);
+  const [tall, setTall] = useState7(null);
+  const [gripped, setGripped] = useState7(false);
+  const [restHeight, setRestHeight] = useState7(null);
+  const popupRef = useRef3(null);
+  const tallTimer = useRef3(null);
+  useLayoutEffect2(() => {
+    if (open && triggerRef.current) setPopupRect(triggerRef.current.getBoundingClientRect());
+    if (open) {
+      setRaw(false);
+      setTall(null);
+      setGripped(false);
+      setRestHeight(null);
+    }
+    if (!open && tallTimer.current) {
+      clearTimeout(tallTimer.current);
+      tallTimer.current = null;
+    }
+  }, [open]);
+  const expandLater = (tries) => {
+    if (tallTimer.current) clearTimeout(tallTimer.current);
+    tallTimer.current = setTimeout(() => {
+      tallTimer.current = null;
+      const el = popupRef.current;
+      if (!el) return;
+      const next = tallBox(
+        el.getBoundingClientRect(),
+        hiddenBelow(el),
+        window.innerHeight,
+        safePadPx()
+      );
+      if (next) setTall(next);
+      else if (tries > 1) expandLater(tries - 1);
+    }, TALL_WAIT_MS);
+  };
+  useLayoutEffect2(() => {
+    const root = popupRef.current;
+    if (!root || typeof root.querySelectorAll !== "function") return;
+    const kick = () => {
+      for (const node of root.querySelectorAll(".mirror-pane-scroll")) {
+        const y = node.scrollTop || 0;
+        node.scrollTop = y + 1;
+        node.scrollTop = y;
+      }
+    };
+    kick();
+    const id2 = requestAnimationFrame(kick);
+    return () => cancelAnimationFrame(id2);
+  }, [tall, gripped, tier]);
+  useEffect2(() => () => {
+    if (tallTimer.current) clearTimeout(tallTimer.current);
+  }, []);
+  useEffect2(() => () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+  }, []);
+  return jsxs20("span", {
+    ref: triggerRef,
+    className: "inline-flex",
+    style: { minWidth: 0 },
+    children: [
+      jsx21(Chip, {
+        tone,
+        border,
+        open,
+        flushLeft,
+        onMouseEnter: () => {
+          hoverTimer.current = setTimeout(() => setHover(true), HOVER_DELAY_MS);
+        },
+        onMouseLeave: () => {
+          if (hoverTimer.current) clearTimeout(hoverTimer.current);
+          setHover(false);
+        },
+        onClick: (e) => {
+          e.stopPropagation();
+          setPopup(open ? null : { id, tier: "summary" });
+        },
+        children: label
+      }),
+      hover && !open ? jsx21("div", {
+        className: "rounded-md p-1.5 whitespace-pre-wrap pointer-events-none",
+        style: Object.assign({
+          maxWidth: "70vw",
+          maxHeight: "50vh",
+          overflow: "auto",
+          fontSize: "0.6rem",
+          whiteSpace: "pre-wrap",
+          backgroundColor: "var(--ui-bg-elevated)",
+          border: "1px solid var(--ui-stroke-secondary)",
+          boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
+          zIndex: 50
+        }, leftFlyoutStyle(hoverRect, "20rem"), SELECTABLE),
+        children: tip
+      }) : null,
+      open ? jsx21("div", {
+        // ОДИНАРНЫЙ клик разворачивает до полного текста (владелец, 2026-09-23).
+        // Был двойной — жест, который в списке никто не находит: он не подсказывается
+        // ничем, кроме строчки внизу, и её ещё надо прочитать.
+        //
+        // Выделение текста при этом не отнимаем: если в окне что-то выделено, клик
+        // считается концом выделения, а не запросом развернуть. Промоушен всё равно
+        // одноразовый (`summary` → `full`), так что цена ошибки — один лишний разворот.
+        onClick: (e) => {
+          e.stopPropagation();
+          if (tier !== "summary") return;
+          const sel = typeof window !== "undefined" && window.getSelection ? String(window.getSelection() || "") : "";
+          if (sel) return;
+          setPopup({ id, tier: "full" });
+        },
+        // ДВА БЛОКА, А НЕ ОДИН СКРОЛЛЕР (владелец, 2026-09-23): шапка — заголовок,
+        // кнопки и строка состояния — прижата к верху и не едет, текст проскроливается
+        // ПОД ней. Поэтому `overflow` снят с самого окна и отдан телу, а `renderPopup`
+        // отдаёт теперь `{head, body}` вместо одного дерева: разделить их снаружи
+        // невозможно, а `position: sticky` внутри общего скроллера пришлось бы
+        // подпирать отрицательным `top` из-за паддинга окна — тот же результат, но
+        // фокусом вместо устройства.
+        ref: popupRef,
+        className: "rounded-md cursor-pointer flex flex-col",
+        style: Object.assign({
+          maxWidth: "80vw",
+          maxHeight: "50vh",
+          overflow: "hidden",
+          fontSize: "0.65rem",
+          backgroundColor: "var(--ui-bg-elevated)",
+          border: "1px solid var(--ui-stroke-secondary)",
+          boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
+          zIndex: 51
+        }, leftFlyoutStyle(popupRect, "30rem", true, tall, gripped ? 0 : restHeight), SELECTABLE),
+        children: (() => {
+          const parts = renderPopup(tier, {
+            raw,
+            toggleRaw: () => setRaw((on) => !on),
+            tall: !!tall
+          }) || {};
+          const grown = !!(tall || gripped);
+          const onGrip = (e) => {
+            e.stopPropagation();
+            if (grown) {
+              setTall(null);
+              setGripped(false);
+              return;
+            }
+            const h = popupRef.current ? popupRef.current.getBoundingClientRect().height : 0;
+            if (h > 0) setRestHeight(Math.round(h));
+            setGripped(true);
+            if (tier === "summary") setPopup({ id, tier: "full" });
+            expandLater(TALL_TRIES);
+          };
+          const grip = (edge) => jsx21("div", {
+            className: "shrink-0",
+            title: grown ? "collapse back to the chip" : "expand upward",
+            // Курсор — ИНЛАЙНОМ. Классом `cursor-n-resize` он не работает: наш бандл в
+            // сканирование Tailwind не попадает, и класс, которого нет в их исходниках,
+            // молча выбрасывается (правило в шапке `core.js`). Без курсора кромка
+            // кликабельна, но об этом никто не узнает.
+            style: {
+              height: "6px",
+              cursor: edge === "bottom" ? "s-resize" : "n-resize",
+              backgroundColor: grown ? "var(--ui-stroke-secondary)" : "transparent"
+            },
+            onClick: onGrip
+          }, edge);
+          return [
+            // ВЕРХНЯЯ КРОМКА — ручка разворота (владелец, 2026-09-23: «можно на верхней
+            // границе окна невидимую, просто утолщив границу чуток»). Кнопкой в шапке это
+            // отняло бы место у заголовка ради жеста, которым пользуются раз в сессию.
+            // `stopPropagation` обязателен: клик по окну иначе промотирует его в `full`.
+            grip("top"),
+            jsx21("div", {
+              className: "shrink-0 px-2 pt-2 pb-1",
+              style: { borderBottom: "1px solid var(--ui-stroke-quaternary)" },
+              children: parts.head
+            }, "head"),
+            // Прокрутка НЕ здесь: её держат сами секции (`TwoPanes`), иначе, читая
+            // длинный результат, ты увозил бы вызов за верхний край окна.
+            jsx21("div", {
+              className: "min-h-0 grow flex flex-col whitespace-pre-wrap pt-1",
+              children: parts.body
+            }, "body"),
+            // ПОДВАЛ — вне скролла, как и шапка (владелец, 2026-09-23: подсказка «прибита
+            // к тексту и уезжает под срез вместе со скроллом»). Она про ОКНО, а не про
+            // текст в нём, и место ей у края окна.
+            parts.foot ? jsx21("div", {
+              className: "shrink-0 px-2 pt-1 pb-1 text-center text-(--ui-text-quaternary)",
+              style: {
+                fontSize: "0.55rem",
+                borderTop: "1px solid var(--ui-stroke-quaternary)"
+              },
+              children: parts.foot
+            }, "foot") : null,
+            grip("bottom")
+          ];
+        })()
+      }) : null
+    ]
+  });
+}
+
+// desktop/src/mirror-bricks.js
+import { jsx as jsx24, jsxs as jsxs23 } from "react/jsx-runtime";
+import { useEffect as useEffect3, useRef as useRef4, useState as useState8 } from "react";
+
+// desktop/src/call-render.js
+import { jsx as jsx22, jsxs as jsxs21 } from "react/jsx-runtime";
+var GRID_MAX = 21;
+var BODY_KEYS = ["content", "code", "text", "body", "patch", "old_string", "new_string", "pattern"];
+var KEY_CH = 11;
+var CELL_CH = 32;
+var CELL_LINE = "color-mix(in oklch, var(--ui-stroke-secondary), transparent 65%)";
+function callValue(value) {
+  if (typeof value === "string") return value;
+  if (value === null || value === void 0) return "";
+  try {
+    if (typeof value === "object") return realNewlines(JSON.stringify(value, null, 2));
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+function realNewlines(text) {
+  return String(text).replace(/(\\+)n/g, (m, slashes) => slashes.length % 2 === 1 ? slashes.slice(1) + "\n" : m);
+}
+function unfoldValue(value) {
+  if (typeof value !== "string") return value;
+  const t = value.trim();
+  if (t.startsWith("{") && t.endsWith("}") || t.startsWith("[") && t.endsWith("]")) {
+    try {
+      const parsed = JSON.parse(t);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {
+    }
+  }
+  if (!value.includes("\n") && (value.match(/\\n/g) || []).length >= 2) {
+    return value.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "	");
+  }
+  return value;
+}
+var NEST_MAX = 3;
+function isPlainObject(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+function nestedOf(value, depth, limit) {
+  if (depth >= NEST_MAX) return null;
+  if (isPlainObject(value) && Object.keys(value).length > 0) {
+    return [{ label: "", rows: callRows(value, limit, depth + 1) }];
+  }
+  if (Array.isArray(value) && value.length > 0 && value.every(isPlainObject)) {
+    return value.map((item, i) => ({
+      label: value.length > 1 ? `[${i}]` : "",
+      rows: callRows(item, limit, depth + 1)
+    }));
+  }
+  return null;
+}
+function callRows(args, limit, depth = 0) {
+  const cut = (text) => limit > 0 && text.length > limit ? text.slice(0, limit) + " \u2026" : text;
+  if (typeof args === "string") {
+    return args ? [{ key: "", value: cut(args), block: true }] : [];
+  }
+  if (!args || typeof args !== "object") return [];
+  return Object.keys(args).map((key) => {
+    const raw = unfoldValue(args[key]);
+    const nested = nestedOf(raw, depth, limit);
+    if (nested) return { key, value: "", block: true, nested };
+    const value = cut(callValue(raw));
+    const many = value.includes("\n");
+    const long = value.length > GRID_MAX || BODY_KEYS.includes(key.toLowerCase());
+    return { key, value, block: many, wide: !many && long };
+  });
+}
+function splitFields(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  return {
+    grid: list.filter((row) => !row.block && !row.wide && row.key),
+    // Средний ярус: длинное, но однострочное. Идёт той же сеткой, но во всю её ширину — пара
+    // остаётся парой, просто занимает строку целиком.
+    wide: list.filter((row) => row.wide && row.key),
+    // Низ — ВСЁ многострочное, а не одно самое большое: у чужого тула таких полей запросто два,
+    // и второе утонуло бы выше. Сюда же безымянное (битый JSON): ключа нет, в сетку такое
+    // ставить не на что.
+    body: list.filter((row) => row.block || !row.key)
+  };
+}
+function Key({ text, width }) {
+  return jsx22("span", {
+    className: "shrink-0 text-(--ui-text-quaternary)",
+    style: Object.assign(
+      { fontSize: "0.6rem" },
+      // Ширина задаётся только в сетке: там ключи обязаны стоять столбцом. У блока ключ один на
+      // всю ширину, и резервировать под него полосу незачем.
+      width ? { width: `${KEY_CH}ch`, overflow: "hidden", textOverflow: "ellipsis" } : null,
+      SELECTABLE
+    ),
+    children: text
+  });
+}
+function Value({ text, tone }) {
+  return jsx22("div", {
+    style: Object.assign(
+      // `lineHeight` здесь свой, а не наследуемый: у многострочного значения общий межстрочный
+      // интервал панели даёт разрежённую простыню, которую неудобно читать (владелец, 2026-09-23).
+      { whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.3, minWidth: 0 },
+      tone ? { color: tone } : null,
+      SELECTABLE
+    ),
+    children: text
+  });
+}
+function FieldGrid({ rows, wide }) {
+  const list = Array.isArray(rows) ? rows : [];
+  const wideList = Array.isArray(wide) ? wide : [];
+  if (list.length === 0 && wideList.length === 0) return null;
+  return jsx22("div", {
+    style: { overflow: "hidden" },
+    children: jsx22("div", {
+      style: {
+        display: "grid",
+        marginLeft: "-1px",
+        marginBottom: "-1px",
+        // `auto-fill` + фиксированная ячейка + `justifyContent: start`: колонок столько, сколько
+        // влезло, и они прижаты влево. `1fr` растягивал бы их по всей ширине — при двух полях
+        // второе уезжало к правому краю.
+        gridTemplateColumns: `repeat(auto-fill, ${CELL_CH}ch)`,
+        justifyContent: "start",
+        // ЗАЗОРОВ НЕТ — «лист в клеточку» (владелец, 2026-09-23). Линия между двумя соседями
+        // должна быть ОДНА, поэтому ячейка рисует только два ребра из четырёх: рисуй она все,
+        // на каждом стыке было бы по две линии, и сетка выглядела бы вдвое жирнее внутри.
+        columnGap: 0,
+        rowGap: 0
+      },
+      children: list.map((row, i) => jsxs21("div", {
+        className: "flex items-baseline gap-1.5 min-w-0",
+        // Еле заметная линия сетки (владелец, 2026-09-23). Смысл не в украшении: без неё глаз не
+        // видит, где кончается одно значение и начинается соседний ключ — колонки держатся только
+        // на выравнивании, а оно ломается, едва значение перенеслось на вторую строку.
+        style: {
+          borderLeft: `1px solid ${CELL_LINE}`,
+          borderBottom: `1px solid ${CELL_LINE}`,
+          padding: "0.05rem 0.25rem"
+        },
+        children: [jsx22(Key, { text: row.key, width: true }, "k"), jsx22(Value, { text: row.value }, "v")]
+      }, `g${i}`)).concat(wideList.map((row, i) => jsxs21("div", {
+        className: "flex items-baseline gap-1.5 min-w-0",
+        // `1 / -1` — во всю ширину сетки. Ряд той же сетки, а не отдельный блок: ключи остаются в
+        // одном столбце с ячейками выше, и таблица читается как одна таблица.
+        style: {
+          gridColumn: "1 / -1",
+          borderLeft: `1px solid ${CELL_LINE}`,
+          borderBottom: `1px solid ${CELL_LINE}`,
+          padding: "0.05rem 0.25rem"
+        },
+        children: [jsx22(Key, { text: row.key, width: true }, "k"), jsx22(Value, { text: row.value }, "v")]
+      }, `w${i}`)))
+    }, "cells")
+  });
+}
+function FieldBlocks({ rows }) {
+  const list = Array.isArray(rows) ? rows : [];
+  return list.map((row, i) => jsxs21("div", {
+    children: [
+      row.key ? jsx22(Key, { text: row.key }, "k") : null,
+      row.nested ? jsx22("div", { className: "pl-2", style: { paddingLeft: "0.5rem" }, children: row.nested.map((part, j) => jsx22(NestedTable, { part }, `n${j}`)) }, "nested") : jsx22("div", { className: row.key ? "pl-2" : "", children: jsx22(Value, { text: row.value, tone: row.tone }) }, "body")
+    ]
+  }, `b${i}`));
+}
+function NestedTable({ part }) {
+  const { grid, wide, body } = splitFields(part.rows);
+  return jsxs21("div", {
+    className: "flex flex-col gap-1",
+    style: { borderLeft: `1px solid ${CELL_LINE}`, paddingLeft: "0.4rem", marginBottom: "0.25rem" },
+    children: [
+      part.label ? jsx22(Key, { text: part.label }, "label") : null,
+      jsx22(FieldGrid, { rows: grid, wide }, "grid"),
+      ...FieldBlocks({ rows: body })
+    ]
+  });
+}
+var NAME_CH = 14;
+function CallView({ name, args, limit }) {
+  const { grid, wide, body } = splitFields(callRows(args, limit));
+  const head = name ? jsx22("div", {
+    style: Object.assign({ fontWeight: 500 }, SELECTABLE),
+    children: name
+  }, "name") : jsx22("div", {
+    className: "text-(--ui-text-quaternary)",
+    style: { fontSize: "0.6rem" },
+    children: "call with no name"
+  }, "noname");
+  return jsxs21("div", {
+    className: "flex flex-col gap-1",
+    children: [
+      jsxs21("div", {
+        style: { display: "grid", gridTemplateColumns: `${NAME_CH}ch minmax(0, 1fr)`, columnGap: "0.5rem" },
+        children: [
+          head,
+          jsx22("div", { className: "min-w-0", children: jsx22(FieldGrid, { rows: grid, wide }) }, "table")
+        ]
+      }, "top"),
+      ...FieldBlocks({ rows: body })
+    ]
+  });
+}
+
+// desktop/src/result-render.js
+import { jsx as jsx23, jsxs as jsxs22 } from "react/jsx-runtime";
+var HEADER_PAIR_RE = /^([A-Za-z][A-Za-z0-9_]*(?: [A-Za-z][A-Za-z0-9_]*)?):\s*(.*)$/;
+function unwrap(line) {
+  const fallback = String(formatVocab().comment_fallback || "");
+  let text = String(line).replace(/^\s*(?:<!--\s*)?(?:\/\/\s*|#\s*)?/, "");
+  if (fallback && text.startsWith(fallback)) text = text.slice(fallback.length).replace(/^\s*/, "");
+  return text.replace(/\s*-->\s*$/, "").trimEnd();
+}
+function parsePreamble(line) {
+  const text = String(line || "").trim();
+  if (!text.startsWith("{") || !text.endsWith("}")) return null;
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+function splitResult(text) {
+  const whole = typeof text === "string" ? text : "";
+  if (whole === "") return { fields: [], notes: [], body: "" };
+  const lines = whole.split("\n");
+  let at = 0;
+  const preamble = parsePreamble(lines[0]);
+  const fields = [];
+  if (preamble) {
+    at = 1;
+    for (const key of Object.keys(preamble)) {
+      const value = preamble[key];
+      fields.push({ key, value: typeof value === "string" ? value : JSON.stringify(value) });
+    }
+  }
+  const sep = separatorRe();
+  let end = -1;
+  for (let i = at; i < lines.length; i += 1) {
+    if (sep.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  const notes = [];
+  if (end >= 0) {
+    for (let i = at; i < end; i += 1) {
+      const bare = unwrap(lines[i]);
+      if (bare === "") continue;
+      const m = bare.match(HEADER_PAIR_RE);
+      if (m && m[2] !== "") fields.push({ key: m[1], value: m[2] });
+      else notes.push(bare);
+    }
+    at = end + 1;
+  }
+  return { fields, notes, body: lines.slice(at).join("\n") };
+}
+function toRows(fields) {
+  return fields.map(({ key, value }) => {
+    const text = String(value);
+    const many = text.includes("\n");
+    return { key, value: text, block: many, wide: !many && text.length > GRID_MAX };
+  });
+}
+function ResultView({ text }) {
+  const { fields, notes, body } = splitResult(text);
+  const rows = toRows(fields);
+  const grid = rows.filter((r) => !r.block && !r.wide);
+  const wide = rows.filter((r) => r.wide);
+  const blocks = rows.filter((r) => r.block);
+  const parts = [];
+  if (grid.length || wide.length) parts.push(jsx23(FieldGrid, { rows: grid, wide }, "grid"));
+  if (blocks.length) parts.push(...FieldBlocks({ rows: blocks }));
+  if (notes.length) {
+    parts.push(jsx23("div", {
+      className: "text-(--ui-text-tertiary)",
+      style: Object.assign({ lineHeight: 1.3 }, SELECTABLE),
+      children: notes.map((line, i) => jsx23("div", { children: line }, `n${i}`))
+    }, "notes"));
+  }
+  if (body !== "") {
+    parts.push(jsx23("div", {
+      className: "font-mono",
+      style: Object.assign({
+        // `pre-wrap`, а НЕ `pre`. Оба сохраняют текст дословно — пробелы, отступы, пустые
+        // строки, — но `pre` запрещает перенос, и длинная строка уезжала вправо в
+        // горизонтальный скролл (владелец, 2026-09-23). Перенос длинной строки содержимое не
+        // меняет: это то, как её показывают, а не то, что в ней написано.
+        whiteSpace: "pre-wrap",
+        overflowWrap: "anywhere",
+        fontSize: "0.65rem",
+        lineHeight: 1.35,
+        // Воздух между таблицей и содержимым (владелец, 2026-09-23). Это граница двух разных
+        // вещей — наших служебных фактов и дословного текста, — и она должна читаться без линии.
+        marginTop: "0.35rem",
+        "--body-text": "var(--ui-text-primary)",
+        "--body-comment": "var(--ui-text-tertiary)",
+        "--body-marker": "var(--dt-secondary)",
+        "--body-mark": "var(--ui-orange)"
+        // Без `PRE`: он задаёт `width: max-content`, то есть растягивает блок по самой длинной
+        // строке — с переносом это несовместимо по смыслу.
+      }, SELECTABLE),
+      children: body.split("\n").map((line, i) => jsx23(BodyLine, { text: line }, `b${i}`))
+    }, "body"));
+  }
+  if (parts.length === 0) {
+    return jsx23("div", {
+      className: "text-(--ui-text-quaternary)",
+      style: Object.assign({ fontSize: "0.6rem" }, SELECTABLE),
+      children: "the tool answered nothing"
+    });
+  }
+  return jsxs22("div", { className: "flex flex-col gap-1", children: parts });
+}
+
+// desktop/src/mirror-bricks.js
+function FullText({ address, fallback, cut, raw }) {
+  const [text, setText] = useState8("");
+  useEffect3(() => {
+    let alive = true;
+    loadMessageText(address).then((value) => {
+      if (alive) setText(value);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [address]);
+  const shown = text || (cut ? fallback + " \u2026" : fallback);
+  return raw ? shown : jsx24(ResultView, { text: shown });
+}
+var REPLY_PREVIEW_CHARS = 64;
+var POPUP_PREVIEW_CHARS = 240;
+function isEmptyLeadIn(row) {
+  const fact = row.fact || {};
+  const role = String(fact.role || "");
+  const text = String(fact.text || "");
+  const calls = Array.isArray(fact.calls) ? fact.calls : [];
+  return role === "assistant" && calls.length > 0 && !text;
+}
+function EyeButton({ raw, onToggle }) {
+  return jsx24("button", {
+    onClick: (e) => {
+      e.stopPropagation();
+      onToggle();
+    },
+    className: "mirror-action-btn rounded px-1 shrink-0 cursor-pointer select-none transition-colors duration-150 ease-out",
+    style: {
+      fontSize: "0.7rem",
+      lineHeight: 1,
+      border: "1px solid transparent",
+      background: "transparent",
+      color: raw ? "var(--ui-orange)" : "var(--ui-text-quaternary)",
+      opacity: raw ? 1 : 0.75
+    },
+    title: raw ? "showing RAW \u2014 exactly what goes into an exported file; click to render" : "rendered; click to see the RAW text",
+    children: raw ? "\u25C9" : "\u25CE"
+  }, "eye");
+}
+function PopupHead({ tone, title, canPaste, address, fallback, raw, onToggleRaw }) {
+  const [note, setNote] = useState8("");
+  const [busy, setBusy] = useState8(false);
+  const [pending, setPending] = useState8(null);
+  const pasteWait = useRef4(null);
+  const stopWaiting = () => {
+    if (pasteWait.current) {
+      pasteWait.current();
+      pasteWait.current = null;
+    }
+  };
+  useEffect3(() => stopWaiting, []);
+  const run = (work) => {
+    stopWaiting();
+    setPending(null);
+    setBusy(true);
+    setNote("\u2026");
+    Promise.resolve(work()).then((res) => setNote(String(res && res.note || ""))).catch((err) => setNote(String(err && err.message || err))).then(() => setBusy(false));
+  };
+  const btn2 = (label, { disabled, tone: tone2, hint, onPress }) => jsx24("button", {
+    disabled: !!disabled,
+    // `stopPropagation` ОБЯЗАТЕЛЕН на каждой (см. выше): без него нажатие ещё и
+    // разворачивало бы всплывашку до полного текста.
+    onClick: (e) => {
+      e.stopPropagation();
+      if (onPress && !disabled) onPress();
+    },
+    // `mirror-action-btn` — тот же ховер, что у кнопок полос действий: правило живёт в
+    // `<style>` внутри `prompt-mirror.js` и красит через `box-shadow` от `currentColor`,
+    // поэтому подстраивается под цвет КАЖДОЙ кнопки само. Tailwind `hover:bg-*` тут не
+    // сработал бы — инлайновый `background` всегда обгоняет класс на ТОМ ЖЕ свойстве.
+    //
+    // `cursor-pointer` вместо прежнего `cursor-default`: курсор-стрелка и отсутствие отклика
+    // на наведение и были причиной, по которой рабочие кнопки читались как неактивные
+    // (владелец, 2026-09-23). У выключенной `paste` стрелка остаётся — она и правда не жмётся.
+    className: "mirror-action-btn rounded px-2 py-1 select-none transition-colors duration-150 ease-out" + (disabled ? " cursor-default" : " cursor-pointer active:scale-95"),
+    style: {
+      fontSize: "0.6rem",
+      lineHeight: 1,
+      border: `1px solid ${tone2 || "var(--ui-stroke-secondary)"}`,
+      color: tone2 || "var(--ui-text-quaternary)",
+      background: "transparent",
+      opacity: disabled ? 0.55 : 0.85
+    },
+    title: hint,
+    children: label
+  }, label);
+  const reading = jsx24("span", { className: "flex items-center gap-1", children: [
+    btn2("copy", {
+      disabled: busy,
+      hint: "copy the FULL text of this message to the clipboard",
+      onPress: () => run(() => copyMessage(address, fallback))
+    }),
+    btn2("save", {
+      disabled: busy,
+      hint: "save this message to a file under the export path from Config",
+      onPress: () => run(() => exportMessage(address))
+    })
+  ] }, "read");
+  const pressPaste = () => {
+    if (pending !== null) {
+      const text = pending;
+      run(() => pasteMessage(address, text));
+      return;
+    }
+    const take = (text) => {
+      if (!String(text || "").trim()) {
+        setNote("clipboard is empty");
+        return;
+      }
+      const head = text.replace(/\s+/g, " ").trim().slice(0, 60);
+      setPending(text);
+      setNote(`clipboard: ${text.length} chars \u2014 \u201C${head}${text.length > 60 ? "\u2026" : ""}\u201D \u2014 press paste again to replace`);
+    };
+    setBusy(true);
+    readClipboard().then((text) => {
+      setBusy(false);
+      if (text.trim()) {
+        take(text);
+        return;
+      }
+      stopWaiting();
+      setNote("press Ctrl+V to take the clipboard");
+      pasteWait.current = catchNextPaste((pasted) => {
+        pasteWait.current = null;
+        take(pasted);
+      });
+    });
+  };
+  const writing = canPaste ? jsx24("span", { className: "flex items-center", children: btn2(pending !== null ? "paste!" : "paste", {
+    disabled: busy,
+    tone: "var(--ui-orange)",
+    hint: pending !== null ? "press again: REPLACE this message with the clipboard text (irreversible; role and tool calls stay)" : "replace this message with the clipboard text \u2014 first press shows what will be pasted",
+    onPress: pressPaste
+  }) }, "write") : null;
+  const buttons = jsxs23("span", {
+    className: "flex items-center gap-4 shrink-0",
+    children: [reading, writing]
+  }, "buttons");
+  const line = jsxs23("div", {
+    className: "flex items-baseline gap-2",
+    style: Object.assign({ fontSize: "0.6rem", color: tone }, SELECTABLE),
+    children: [
+      onToggleRaw ? jsx24(EyeButton, { raw, onToggle: onToggleRaw }, "eye") : null,
+      // Подсказка с ПОЛНЫМ заголовком — по той же причине, что у строки сохранения: имя
+      // тула с именем файла и адресом в узкое окно не влезает, а `truncate` съедает как раз
+      // конец, где стоят адрес и размер (владелец, 2026-09-23).
+      jsx24("span", { className: "truncate", style: SELECTABLE, title, children: title }),
+      jsx24("span", { className: "flex-1" }),
+      buttons
+    ]
+  }, "line");
+  const said = note ? jsx24("div", {
+    className: "truncate text-right",
+    style: Object.assign({
+      fontSize: "0.55rem",
+      opacity: 0.75,
+      color: "var(--ui-text-quaternary)"
+    }, SELECTABLE),
+    title: note,
+    children: note
+  }, "note") : null;
+  return jsxs23("div", { className: "flex flex-col gap-1", children: [line, said] }, "head");
+}
+function addrMark(address) {
+  return jsx24("span", {
+    className: "shrink-0 text-(--ui-text-quaternary)",
+    style: Object.assign({ fontSize: "0.5rem", opacity: 0.7 }, SELECTABLE),
+    title: address ? `message address ${address}` : "no address \u2014 the indexer did not mark this row",
+    children: address || "----"
+  });
+}
+function ReplyBrick({ row, popup, setPopup }) {
+  const fact = row.fact || {};
+  const role = String(fact.role || "");
+  const text = String(fact.text || "");
+  const chars = Number(fact.chars || 0);
+  const calls = Array.isArray(fact.calls) ? fact.calls : [];
+  if (isEmptyLeadIn(row)) return null;
+  const cut = chars > text.length;
+  const emptyLabel = calls.length ? "no text \u2014 this row only calls tools" : "empty";
+  const tone = rowTone(fact);
+  const preview = briefPreview(text, REPLY_PREVIEW_CHARS);
+  return jsx24(BrickRow, {
+    tokens: tokensLabel(factTokens(fact)),
+    chip: jsx24(ChipTrigger, {
+      id: row.key,
+      popup,
+      setPopup,
+      tone,
+      border: true,
+      label: preview || emptyLabel,
+      tip: text ? briefPreview(text, 200) : emptyLabel,
+      renderPopup: (tier, eye) => ({
+        head: jsx24(PopupHead, {
+          tone,
+          canPaste: true,
+          address: row.address,
+          fallback: text,
+          raw: eye.raw,
+          onToggleRaw: eye.toggleRaw,
+          // Токены рядом с символами (владелец, 2026-09-23): цена сообщения читается в
+          // токенах, а не в символах, и это то же число, что стоит слева от чипа в ленте
+          // (`factTokens`) — одна оценка на все поверхности, не вторая рядом с первой.
+          title: `${(role || "no role").toUpperCase()} \xB7 ${row.address || "----"} \xB7 ${chars} chars \xB7 ~${tokensLabel(factTokens(fact))} tk`
+        }),
+        // Верхней секции у реплики НЕТ (решение владельца 2026-09-23): её вызовы уже
+        // нарисованы своими кирпичиками, и повторять их здесь значит показать одно и то же
+        // дважды. `TwoPanes` с пустым верхом схлопывается сам — своей ветки не нужно.
+        body: jsx24(TwoPanes, {
+          bottomChars: tier === "full" ? chars : Math.min(chars, POPUP_PREVIEW_CHARS),
+          bottom: jsx24("div", {
+            style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
+            children: !text ? emptyLabel : tier === "full" ? jsx24(FullText, { address: row.address, fallback: text, cut }) : briefPreview(text, POPUP_PREVIEW_CHARS)
+          })
+        }),
+        foot: tier === "summary" ? "click for full text" : null
+      })
+    }),
+    rest: [addrMark(row.address)]
+  });
+}
+function MessageTile({ row }) {
+  const fact = row.fact || {};
+  const role = String(fact.role || "");
+  const chars = Number(fact.chars || 0);
+  const text = String(fact.text || "");
+  const calls = Array.isArray(fact.calls) ? fact.calls : [];
+  const cut = chars > text.length;
+  const marks = [];
+  if (fact.name) marks.push(String(fact.name));
+  if (calls.length) marks.push("\u2192 " + calls.join(", "));
+  if (row.opener) marks.push("opens the carriage");
+  if (row.unrecorded) marks.push("ours, no ledger record");
+  if (fact.tool_call_id) marks.push("answers " + String(fact.tool_call_id).slice(0, 12));
+  if (fact.sent_as === "api_content") {
+    marks.push(fact.db_chars !== void 0 ? `sent as api_content (${fact.db_chars} stored)` : "sent as api_content");
+  }
+  if (fact.their_repair) marks.push(String(fact.their_repair));
+  return jsxs23("div", {
+    className: "px-2 py-1 rounded-md border border-(--ui-stroke-secondary) bg-card",
+    style: Object.assign({ fontSize: "0.65rem" }, CAPPED, SELECTABLE),
+    children: [
+      jsxs23("div", {
+        className: "flex items-center justify-between gap-2",
+        style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
+        children: [
+          // Роль ПЕРЕД номером и КАПСОМ (владелец, 2026-09-10): сначала «что это за
+          // строка», потом её адрес.
+          jsxs23("span", {
+            className: "font-medium",
+            style: Object.assign({ color: rowTone(fact), overflowWrap: "anywhere" }, SELECTABLE),
+            children: [(role || "no role").toUpperCase(), " \xB7 ", row.address || "\u2014"]
+          }),
+          // ПИМПОЧКА чужого вызова — в шапке плитки, а не строкой среди прочих
+          // пометок: «наше или не наше» находят взглядом по списку, а текст в
+          // общей строке для этого надо читать. Оранжевый, а не красный: чужой
+          // тул — это норма (десятая часть тул-строк живой базы), а не поломка.
+          jsxs23("span", {
+            className: "flex items-center gap-1.5 shrink-0",
+            style: SELECTABLE,
+            children: [
+              row.foreign ? jsx24("span", {
+                className: "px-1.5 rounded-full",
+                style: Object.assign({
+                  border: "1px solid var(--ui-orange)",
+                  color: "var(--ui-orange)",
+                  background: "color-mix(in srgb, var(--ui-orange) 12%, transparent)",
+                  whiteSpace: "nowrap"
+                }, SELECTABLE),
+                title: "no operation of ours carries this tool_call_id",
+                children: `${CHIP_STATUS.foreign.glyph} foreign`
+              }) : null,
+              jsx24("span", {
+                className: "text-(--ui-text-quaternary)",
+                style: SELECTABLE,
+                children: cut ? `${text.length}/${chars} chars` : `${chars} chars`
+              })
+            ]
+          })
+        ]
+      }),
+      // НЕ `truncate`: обрезанное имя тула нельзя скопировать, а копировать нужно всё
+      // (владелец, 2026-09-10). Переносим строкой.
+      marks.length ? jsx24("div", {
+        className: "text-(--ui-text-quaternary)",
+        style: Object.assign({ fontSize: "0.55rem", overflowWrap: "anywhere" }, SELECTABLE),
+        children: marks.join(" \xB7 ")
+      }) : null,
+      // Тело — с переносом, а не `truncate`: `truncate` это nowrap, то есть ширина
+      // max-content, и одна длинная строка растянула бы весь список (та же грабля, что
+      // уже оплачена в file-ops-pane.js).
+      text ? jsx24("div", {
+        className: "mt-0.5 text-(--ui-text-secondary)",
+        style: Object.assign(
+          { whiteSpace: "pre-wrap", overflowWrap: "anywhere" },
+          CAPPED,
+          SELECTABLE
+        ),
+        children: cut ? text + " \u2026" : text
+      }) : jsx24("div", {
+        className: "mt-0.5 text-(--ui-text-quaternary) italic",
+        style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
+        children: calls.length ? "no text \u2014 this row only calls tools" : "empty"
+      })
+    ]
+  });
+}
+function StepBar({ row }) {
+  return jsx24("div", {
+    style: { height: ROW_HEIGHT2.step, boxSizing: "border-box", display: "flex", alignItems: "center" },
+    title: `step ${row.index} \xB7 ${row.count} calls`,
+    children: jsx24("div", { className: "w-full border-t border-(--ui-stroke-tertiary)" })
+  });
+}
+function MessageNode({ row, popup, setPopup }) {
+  const role = String(row.fact && row.fact.role || "");
+  return role === "user" || role === "assistant" ? jsx24(ReplyBrick, { row, popup, setPopup }) : jsx24(MessageTile, { row });
+}
+var MOCK_OP = UNASSIGNED_OP;
+function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
+  const answer = row.answer;
+  const afact = answer && answer.fact || {};
+  const chars = Number(afact.chars || 0);
+  const text = String(afact.text || "");
+  const cut = chars > text.length;
+  const tone = toneOf("tool");
+  const name = row.name || "\u0442\u0443\u043B";
+  const realOp = afact.op || "";
+  const displayData = chipTarget({ brick, fact: afact, target: row.target });
+  const displayOp = realOp || MOCK_OP;
+  const plainLabel = [name, displayData, displayOp].filter(Boolean).join(" \xB7 ");
+  const addr = answer ? answer.address || "" : "";
+  const foreign = !!(answer && answer.foreign);
+  const unrecorded = !!(answer && answer.unrecorded);
+  const statusMark = foreign ? `${CHIP_STATUS.foreign.glyph} foreign` : unrecorded ? "no ledger record" : "";
+  const call = afact.call || null;
+  const callText = call ? String(call.raw || "") : "";
+  const realPct = realOp && stale && typeof stale[realOp] === "number" ? stale[realOp] : null;
+  const pct = answer ? realPct : null;
+  const statuses = chipStatuses({ brick, fact: afact, foreign, unrecorded });
+  const diff = chipDiff(brick);
+  const tip = chipTipLines({
+    name,
+    op: realOp,
+    brick,
+    fact: afact,
+    target: row.target,
+    statuses,
+    tokens: tokensLabel(factTokens(afact)),
+    freshness: pct === null ? "\u2014" : pct + "%"
+  }).join("\n") + (text ? "\n\n" + briefPreview(text, 200) : "");
+  const chipBody = jsx24(OpChipBody, {
+    marks: statuses,
+    name,
+    data: displayData,
+    diff,
+    op: displayOp,
+    overlapText: pct === null ? "" : `${pct}%`,
+    overlapTone: pct !== null && pct > 60 ? "var(--ui-orange)" : "var(--ui-text-quaternary)",
+    overlapTitle: pct === null ? void 0 : "covered by later operations on this file (buildContextView().stale)"
+  });
+  const rest = [addrMark(addr)];
+  return jsx24(BrickRow, {
+    tokens: tokensLabel(factTokens(afact)),
+    chip: jsx24(ChipTrigger, {
+      id: row.key,
+      popup,
+      setPopup,
+      tone,
+      flushLeft: true,
+      label: chipBody,
+      tip,
+      renderPopup: (tier, eye) => {
+        const callLimit = 0;
+        return {
+          // Без `paste`: результат инструмента правке не подлежит.
+          head: jsx24(PopupHead, {
+            tone,
+            canPaste: false,
+            address: addr,
+            fallback: text,
+            raw: eye.raw,
+            onToggleRaw: eye.toggleRaw,
+            title: `${plainLabel} \xB7 ${addr || "----"} \xB7 ${chars} chars \xB7 ~${tokensLabel(factTokens(afact))} tk` + (statusMark ? " \xB7 " + statusMark : "")
+          }),
+          // ДВЕ СЕКЦИИ: сверху вызов, снизу результат (Plan22-Task02). Пока в верхней тот же
+          // текст, что уходит в файл выгрузки (`call.raw`) — рендер таблицей это Task04, и слот
+          // под него здесь уже стоит.
+          body: jsx24(TwoPanes, {
+            topChars: callText.length,
+            bottomChars: tier === "full" ? chars : Math.min(chars, POPUP_PREVIEW_CHARS),
+            // В развёрнутом окне приоритет у ВЫЗОВА: он показывается целиком и не скроллится,
+            // результат забирает остаток (решение владельца 2026-09-23). Вызов читают один раз и
+            // целиком, результат листают — место, выигранное разворотом, честнее отдать первому.
+            topWhole: !!eye.tall,
+            // СЫРЬЁ — это `call.raw`, то есть БУКВАЛЬНО то, что уходит в файл выгрузки
+            // (`context_ctl/_export.py::render_call`). Обещание глазика «покажи как есть»
+            // держится тем, что сравнивать не с чем: строка одна и приехала с сервера.
+            top: !call ? null : eye.raw ? jsx24("div", {
+              style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
+              children: callText
+            }) : jsx24(CallView, { name: call.name, args: call.args, limit: callLimit }),
+            bottom: jsx24("div", {
+              style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
+              children: !answer ? "no answer row recorded for this call" : !text ? "empty" : tier === "full" ? jsx24(FullText, { address: addr, fallback: text, cut, raw: eye.raw }) : eye.raw ? briefPreview(text, POPUP_PREVIEW_CHARS) : jsx24(ResultView, { text: briefPreview(text, POPUP_PREVIEW_CHARS) })
+            })
+          }),
+          foot: tier === "summary" ? "click for full text" : null
+        };
+      }
+    }),
+    rest
+  });
+}
+
+// desktop/src/mirror-action-zone.js
+import { jsx as jsx25, jsxs as jsxs24 } from "react/jsx-runtime";
+var ACTION_BTN = {
+  fontSize: "0.625rem",
+  lineHeight: 1,
+  padding: "0.125rem 0.5625rem",
+  boxSizing: "border-box"
+};
+var ACTION_BTN_THIN = Object.assign({}, ACTION_BTN, { padding: "0 0.5rem", lineHeight: 1.25 });
+var ADDR_ACTIONS = [
+  {
+    kind: "content",
+    label: "drop content",
+    color: ACTION_COLOR.content,
+    hint: 'arm "drop content": tick tool results on the rail, then press Apply operation'
+  },
+  {
+    kind: "erase",
+    label: "erase",
+    color: ACTION_COLOR.erase,
+    hint: 'arm "erase": tick any messages on the rail, then press Apply operation'
+  }
+];
+function ActionZone({ op, thin }) {
+  const buttons = ADDR_ACTIONS.map((action) => {
+    const armed = !!op.mode && op.kind === action.kind;
+    return jsx25("button", {
+      key: action.kind,
+      onClick: (e) => {
+        e.stopPropagation();
+        if (op.busy) return;
+        if (armed) setAddrOpMode(false);
+        else setAddrOpMode(true, action.kind);
+      },
+      className: "mirror-action-btn rounded-full font-medium cursor-pointer select-none transition-colors duration-150 ease-out active:scale-95",
+      disabled: !!op.busy,
+      style: Object.assign({
+        border: `1px solid ${armed ? action.color : "var(--ui-stroke-secondary)"}`,
+        background: armed ? `color-mix(in srgb, ${action.color} 14%, transparent)` : "transparent",
+        color: armed ? action.color : "var(--ui-text-secondary)",
+        opacity: op.busy ? 0.5 : 1,
+        whiteSpace: "nowrap"
+      }, thin ? ACTION_BTN_THIN : ACTION_BTN),
+      title: armed ? `close "${action.label}" mode` : action.hint,
+      children: action.label
+    });
+  });
+  return jsxs24("div", {
+    className: thin ? "flex items-center gap-1.5 px-1" : "flex items-center gap-2 px-2 py-1",
+    style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
+    children: buttons
+  });
+}
+function ActionHint({ drop }) {
+  if (!drop.mode) return null;
+  const pickedCount = Object.keys(drop.picked || {}).length;
+  return jsx25("span", {
+    className: "font-semibold",
+    style: { fontSize: "0.7rem", color: ACTION_COLOR[drop.action] || "var(--ui-text-secondary)" },
+    children: drop.busy ? "applying\u2026" : pickedCount ? `${pickedCount} picked` : "tick a marker on a chip above"
+  });
+}
+function ExportZone({ exp, addresses, thin }) {
+  const armed = !!exp.mode;
+  const color = ACTION_COLOR.export;
+  return jsx25("div", {
+    className: thin ? "flex items-center px-1" : "flex items-center gap-2 px-2 py-1",
+    style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
+    children: jsx25("button", {
+      onClick: (e) => {
+        e.stopPropagation();
+        if (exp.busy) return;
+        if (armed) {
+          setExportMode(false);
+          return;
+        }
+        const picked = {};
+        (addresses || []).forEach((a) => {
+          if (a) picked[a] = true;
+        });
+        setExportMode(true, picked);
+      },
+      className: "mirror-action-btn rounded-full font-medium cursor-pointer select-none transition-colors duration-150 ease-out active:scale-95",
+      disabled: !!exp.busy,
+      style: Object.assign({
+        border: `1px solid ${armed ? color : "var(--ui-stroke-secondary)"}`,
+        background: armed ? `color-mix(in srgb, ${color} 14%, transparent)` : "transparent",
+        color: armed ? color : "var(--ui-text-secondary)",
+        opacity: exp.busy ? 0.5 : 1,
+        whiteSpace: "nowrap"
+      }, thin ? ACTION_BTN_THIN : ACTION_BTN),
+      title: armed ? "close export mode" : "arm export: tick messages on the rail, then press Apply operation",
+      children: "export"
+    })
+  });
+}
+function ImportZone({ imp, thin, onOpen }) {
+  const open = !!imp.open;
+  const color = ACTION_COLOR.import;
+  return jsx25("div", {
+    className: thin ? "flex items-center px-1" : "flex items-center gap-2 px-2 py-1",
+    style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
+    children: jsx25("button", {
+      onClick: (e) => {
+        e.stopPropagation();
+        if (imp.busy) return;
+        if (open) {
+          closeImport();
+          return;
+        }
+        const box = e.currentTarget && e.currentTarget.getBoundingClientRect ? e.currentTarget.getBoundingClientRect() : null;
+        if (onOpen) onOpen(box ? { x: box.left + box.width / 2, y: box.bottom } : null);
+        openImport();
+      },
+      className: "mirror-action-btn rounded-full font-medium cursor-pointer select-none transition-colors duration-150 ease-out active:scale-95",
+      disabled: !!imp.busy,
+      style: Object.assign({
+        border: `1px solid ${open ? color : "var(--ui-stroke-secondary)"}`,
+        background: open ? `color-mix(in srgb, ${color} 14%, transparent)` : "transparent",
+        color: open ? color : "var(--ui-text-secondary)",
+        opacity: imp.busy ? 0.5 : 1,
+        whiteSpace: "nowrap"
+      }, thin ? ACTION_BTN_THIN : ACTION_BTN),
+      title: "import a session from an export folder \u2014 REPLACES this chat's whole context",
+      children: "import"
+    })
+  });
+}
+
+// desktop/src/mirror-zones.js
+import { jsx as jsx27, jsxs as jsxs26 } from "react/jsx-runtime";
+
+// desktop/src/compact-progress.js
+import { jsx as jsx26, jsxs as jsxs25 } from "react/jsx-runtime";
+var STAGE_TEXT = {
+  export: "exporting the session",
+  prepare: "selecting",
+  warmup: "warming up the model",
+  questions: "asking",
+  assemble: "assembling the tape",
+  checks: "checking the tape",
+  write: "writing the base",
+  handover: "handing the tape to Hermes",
+  wait_turn: "waiting for the turn to end"
+};
+var STAGE_PCT = { export: 1, prepare: 2, warmup: 4, assemble: 95, checks: 97, write: 99, handover: 99, wait_turn: 98 };
+var Q_FROM = 5;
+var Q_SPAN = 88;
+function fmtClock(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+function runLine(run) {
+  const r = run || {};
+  if (!r.running) return null;
+  const now = Number(r.now) || 0;
+  const elapsed = now && r.started_at ? now - Number(r.started_at) : 0;
+  const silentFor = now && r.beat ? now - Number(r.beat) : 0;
+  const silent = Number(r.silence_s) > 0 && silentFor > Number(r.silence_s);
+  const parts = [r.who === "auto" ? "\u27F3 auto" : "\u27F3 compact"];
+  if (r.span) parts.push(r.span);
+  let pct = STAGE_PCT[r.stage] || 0;
+  if (r.stage === "questions") {
+    const step = Number(r.step) || 0;
+    const total = Number(r.total) || 0;
+    parts.push(total ? `question ${step}/${total}` : `question ${step}`);
+    const what = [r.topic ? `topic ${r.topic}` : "", r.label || ""].filter(Boolean).join(": ");
+    if (what) parts.push(what);
+    pct = total ? Q_FROM + Q_SPAN * Math.min(1, Math.max(0, (step - 1) / total)) : Q_FROM;
+  } else {
+    parts.push(STAGE_TEXT[r.stage] || r.stage || "starting");
+  }
+  parts.push(fmtClock(elapsed));
+  let text = parts.join(" \xB7 ");
+  if (silent) text += ` \xB7 no step for ${fmtClock(silentFor)} \u2014 may be hung`;
+  return { text, pct: Math.round(pct), silent, silentFor };
+}
+function CompactProgress({ run, font }) {
+  const line = runLine(run);
+  if (!line) return null;
+  const tone = line.silent ? "var(--ui-yellow)" : ACTION_COLOR.compact;
+  return jsxs25("div", {
+    className: "flex flex-col min-w-0 w-full",
+    "data-compact-progress": "",
+    children: [
+      jsx26("span", {
+        className: "truncate",
+        title: line.text,
+        style: { color: tone, fontSize: font, userSelect: "text", minWidth: 0 },
+        children: line.text
+      }),
+      jsx26("div", {
+        style: { height: 2, width: "100%", background: "var(--ui-stroke-quaternary)", borderRadius: 1 },
+        children: jsx26("div", {
+          style: { height: "100%", width: `${line.pct}%`, background: tone, borderRadius: 1, transition: "width 0.4s" }
+        })
+      })
+    ]
+  });
+}
+
+// desktop/src/mirror-zones.js
+var HEAD_FONT = "0.55rem";
+var TOGGLE_FONT = "0.8rem";
+function ZoneToggle({ title, open, onToggle }) {
+  return jsx27("button", {
+    type: "button",
+    onClick: (e) => {
+      e.stopPropagation();
+      onToggle();
+    },
+    className: "cursor-pointer shrink-0",
+    style: {
+      color: "var(--ui-text-quaternary)",
+      fontSize: TOGGLE_FONT,
+      lineHeight: 1,
+      border: "none",
+      background: "transparent",
+      padding: "0 2px"
+    },
+    title: open ? `collapse ${title.toLowerCase()}` : `expand ${title.toLowerCase()}`,
+    children: open ? "\u25BE" : "\u25B8"
+  });
+}
+function OpGroup({ label, lead, children }) {
+  return jsxs26("div", {
+    className: "flex items-center flex-wrap",
+    children: [
+      jsx27("span", {
+        className: "flex items-center shrink-0",
+        style: { width: "3.6rem", paddingLeft: "0.375rem", gap: "2px" },
+        children: [
+          lead || jsx27("span", { style: { display: "inline-block", width: "0.95rem" } }, "pad"),
+          jsx27("span", { className: "text-(--ui-text-quaternary)", style: { fontSize: HEAD_FONT }, children: label }, "label")
+        ]
+      }),
+      ...[].concat(children)
+    ]
+  });
+}
+function noteTone(ok) {
+  return ok === true ? "var(--ui-green)" : ok === false ? "var(--ui-red)" : "var(--ui-text-quaternary)";
+}
+var AUTO_RESULT_MS = 6e4;
+function StatusLine({ report, run }) {
+  if (run && run.running) {
+    return jsx27("div", {
+      className: "shrink-0 flex items-center px-2 min-w-0 border-b border-(--ui-stroke-quaternary)",
+      style: { fontSize: HEAD_FONT, lineHeight: 1.6, paddingBottom: 2 },
+      children: jsx27(CompactProgress, { run, font: HEAD_FONT })
+    });
+  }
+  if (run && run.who === "auto" && run.doneAt && Date.now() - run.doneAt < AUTO_RESULT_MS) {
+    const lines = Array.isArray(run.lines) ? run.lines : [];
+    report = {
+      note: "auto-compaction: " + (run.error || lines[lines.length - 1] || (run.ok ? "done" : "not done")),
+      ok: run.ok === true
+    };
+  }
+  if (!report || !report.note) {
+    return jsx27("div", {
+      className: "shrink-0 px-2 border-b border-(--ui-stroke-quaternary) text-(--ui-text-quaternary)",
+      style: { fontSize: HEAD_FONT, lineHeight: 1.6 },
+      children: "no reports yet"
+    });
+  }
+  return jsxs26("div", {
+    className: "shrink-0 flex items-center gap-2 px-2 min-w-0 border-b border-(--ui-stroke-quaternary)",
+    style: { fontSize: HEAD_FONT, lineHeight: 1.6 },
+    children: [
+      report.dir ? jsx27("button", {
+        type: "button",
+        className: "mirror-action-btn rounded-full cursor-pointer select-none shrink-0",
+        title: "copy the folder path to the clipboard",
+        onClick: (e) => {
+          e.stopPropagation();
+          copyExportDir();
+        },
+        style: Object.assign({
+          border: "1px solid var(--ui-stroke-secondary)",
+          color: "var(--ui-text-secondary)",
+          background: "transparent",
+          whiteSpace: "nowrap"
+        }, ACTION_BTN),
+        children: "copy path"
+      }) : null,
+      jsx27("span", {
+        className: "truncate",
+        title: report.note,
+        style: Object.assign({ color: noteTone(report.ok), minWidth: 0 }, SELECTABLE),
+        children: report.note
+      })
+    ]
+  });
+}
+
+// desktop/src/file-context-panel.js
+import { jsx as jsx28, jsxs as jsxs27 } from "react/jsx-runtime";
+import { useMemo, useRef as useRef5, useState as useState9, useLayoutEffect as useLayoutEffect3 } from "react";
+var MIN_H = 56;
+var MAX_H = 420;
+var DEFAULT_H = 132;
+var AUTO_ROWS = 3.5;
+function shortLength(n2) {
+  const v = Number(n2);
+  if (!Number.isFinite(v) || v < 0) return "";
+  if (v < 1e3) return String(Math.round(v));
+  if (v < 1e4) return `${(v / 1e3).toFixed(1).replace(/\.0$/, "")}k`;
+  return `${Math.round(v / 1e3)}k`;
+}
+function truncateName(name, max = 20) {
+  const s = typeof name === "string" ? name : "";
+  if (s.length <= max) return s;
+  if (max <= 1) return s.slice(0, Math.max(0, max));
+  const headLen = Math.ceil((max - 1) / 2);
+  const tailLen = max - 1 - headLen;
+  return tailLen > 0 ? `${s.slice(0, headLen)}\u2026${s.slice(s.length - tailLen)}` : `${s.slice(0, headLen)}\u2026`;
+}
+function graySegments(files, order, selectedOp) {
+  if (!Array.isArray(files) || !selectedOp || !order || !(selectedOp in order)) return files;
+  if (!files.some((f) => Array.isArray(f.segments) && f.segments.some((s) => s.op === selectedOp))) {
+    return files;
+  }
+  const cutoff = order[selectedOp];
+  return files.map((f) => Object.assign({}, f, {
+    segments: f.segments.map((s) => Object.assign({}, s, {
+      gray: s.op && s.op in order ? order[s.op] > cutoff : false
+    }))
+  }));
+}
+var BAR_BASE = "var(--ui-bg-elevated)";
+var FADE_STEP = 0.75;
+function mixWithBase(color, pct) {
+  return `color-mix(in srgb, ${color} ${pct}%, ${BAR_BASE})`;
+}
+function kindBase(kind) {
+  if (kind === "patch") return "var(--ui-orange)";
+  if (kind === "read_nested") return "var(--ui-cyan)";
+  return "var(--ui-green)";
+}
+function segFill(kind, rank, gray) {
+  if (gray) return mixWithBase("var(--ui-text-quaternary)", 30);
+  const pct = Math.pow(FADE_STEP, Math.max(0, rank || 0)) * 100;
+  return mixWithBase(kindBase(kind), Math.round(pct * 10) / 10);
+}
+function segZ(rank) {
+  return -Math.max(0, rank || 0);
+}
+var POPUP_MAX_W = 280;
+var POPUP_EDGE = 8;
+function popupStyle(x, y, extra) {
+  const vw = typeof window !== "undefined" ? window.innerWidth : Infinity;
+  const flip = x + 10 + POPUP_MAX_W > vw - POPUP_EDGE;
+  return Object.assign({
+    position: "fixed",
+    top: `${y}px`,
+    left: flip ? "auto" : `${x}px`,
+    right: flip ? `${vw - x + 10}px` : "auto",
+    transform: flip ? "translate(0, 12px)" : "translate(10px, 12px)",
+    zIndex: 999,
+    maxWidth: `${POPUP_MAX_W}px`,
+    backgroundColor: "var(--ui-bg-elevated)",
+    border: "1px solid var(--ui-stroke-secondary)",
+    color: "var(--ui-text-primary)",
+    borderRadius: "6px",
+    padding: "4px 6px",
+    fontSize: "0.62rem",
+    lineHeight: 1.35,
+    whiteSpace: "pre-line"
+  }, extra);
+}
+function dirOf(path) {
+  const s = String(path || "");
+  const cut = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return cut > 0 ? s.slice(0, cut) : cut === 0 ? "/" : "";
+}
+function NameHover({ file, children }) {
+  const [pos, setPos] = useState9(null);
+  const dir = dirOf(file.path);
+  return jsxs27("div", {
+    style: { minWidth: 0, cursor: "default" },
+    onMouseMove: (e) => setPos({ x: e.clientX, y: e.clientY }),
+    onMouseLeave: () => setPos(null),
+    children: [
+      children,
+      pos ? jsxs27("div", {
+        style: Object.assign(popupStyle(pos.x, pos.y), { pointerEvents: "none", whiteSpace: "normal" }),
+        children: [
+          jsx28("div", { style: { fontSize: "0.68rem", color: "var(--ui-text-primary)" }, children: file.name }),
+          dir ? jsx28("div", {
+            className: "font-mono",
+            style: { fontSize: "0.55rem", color: "var(--ui-text-quaternary)", wordBreak: "break-all" },
+            children: dir
+          }) : null
+        ]
+      }) : null
+    ]
+  });
+}
+function toolLabel(tool) {
+  return String(tool || "").replace(/_files?$/, "");
+}
+function opIdsBadge(ids) {
+  const list = (ids || []).filter(Boolean).map(String);
+  if (!list.length) return "";
+  return list.length > 1 ? `${list[list.length - 1]} \xD7${list.length}` : list[0];
+}
+function opIdsLine(ids) {
+  const list = (ids || []).filter(Boolean).map(String);
+  if (!list.length) return "";
+  const rest = list.slice(1).map((id) => id.replace(/^0+(?=.)/, ""));
+  return [list[0]].concat(rest).join("  ");
+}
+function rangeText(from, to) {
+  if (from == null || to == null) return "\u2014";
+  return from === to ? String(from) : `${from}-${to}`;
+}
+function OpIdsPopup({ file, pos, onClose }) {
+  if (!pos) return null;
+  const rows = file.rows || [];
+  return jsx28("div", {
+    // Текст выделяется мышью (владелец, 2026-09-29: «выделяешь и копируешь, когда нужно сказать
+    // агенту — вот ты читал 100-123»). Панель целиком `select-none`, поэтому разрешаем явно.
+    style: Object.assign(popupStyle(pos.x, pos.y), { whiteSpace: "normal", cursor: "text" }, SELECTABLE),
+    onMouseDown: (e) => e.stopPropagation(),
+    onMouseLeave: onClose,
+    children: jsx28("div", {
+      className: "font-mono",
+      style: {
+        display: "grid",
+        gridTemplateColumns: "auto auto auto",
+        columnGap: "6px",
+        rowGap: "1px",
+        fontSize: "0.58rem"
+      },
+      children: rows.flatMap((r, i) => [
+        jsxs27("div", { key: `t${i}`, style: { color: "var(--ui-text-secondary)" }, children: [
+          toolLabel(r.tool),
+          // Метка вложенности. Говорит РОВНО одно: операция выполнена внутри `execute_code` —
+          // именно это и означает флаг `nested` в леджере. «Из терминала» показать нельзя: правка
+          // файла шелл-командой нашими тулами не проходит вовсе и в леджер не попадает, так что
+          // такого факта у нас просто нет, и выдумывать его метка не станет.
+          r.nested ? jsx28("span", {
+            // Тот же плотный оттенок, что у вложенного чтения на баре, и БЕЗ `opacity`: правило
+            // «только оттенки, не прозрачности» держим по всей панели, а не только на слоях.
+            style: { color: segFill("read_nested", 0, false) },
+            children: " exec"
+          }) : null
+        ] }),
+        jsx28("div", { key: `o${i}`, style: { color: "var(--ui-text-primary)", textAlign: "right" }, children: `${r.op}:` }),
+        jsx28("div", {
+          key: `r${i}`,
+          style: { color: r.from == null ? "var(--ui-text-quaternary)" : "var(--ui-text-primary)" },
+          children: rangeText(r.from, r.to)
+        })
+      ])
+    })
+  });
+}
+function Tile({ file, popupPos, onTogglePopup, onClosePopup }) {
+  const segs = file.segments;
+  return jsxs27("div", {
+    className: "rounded-sm border",
+    // Над именем почти без воздуха (владелец, 2026-09-29): 1px и строка без наследуемого
+    // межстрочного интервала.
+    style: Object.assign({ borderColor: "var(--ui-stroke-tertiary)", padding: "1px 4px 2px", minWidth: 0 }, CAPPED),
+    children: [
+      jsxs27("div", {
+        className: "flex items-baseline gap-1",
+        style: { lineHeight: 1.2 },
+        children: [
+          jsx28("div", {
+            className: "flex-1 min-w-0",
+            children: jsx28(NameHover, {
+              file,
+              children: jsx28("div", {
+                className: "truncate",
+                style: { fontSize: "0.6rem", color: "var(--ui-text-secondary)" },
+                children: truncateName(file.name)
+              })
+            })
+          }),
+          // Номера операций: клик — список целиком (повторный закрывает; другая плитка —
+          // закрывает эту и открывает ту, решает панель). Усекаются первыми: полный список
+          // всегда в попапе.
+          jsx28("div", {
+            className: "truncate shrink",
+            style: {
+              fontSize: "0.5rem",
+              maxWidth: "45%",
+              color: "var(--ui-text-quaternary)",
+              cursor: file.op_ids.length ? "pointer" : "default"
+            },
+            onClick: (e) => {
+              if (!file.op_ids.length) return;
+              onTogglePopup(file.path, { x: e.clientX, y: e.clientY });
+            },
+            title: file.op_ids.length > 1 ? opIdsLine(file.op_ids) : void 0,
+            children: (opIdsBadge(file.op_ids) || "") + (file.desync ? " \u26A0" : "")
+          })
+        ]
+      }),
+      jsxs27("div", {
+        className: "flex items-center gap-1",
+        style: { marginTop: "2px" },
+        children: [
+          // Бар: базовый слой чтений (непрозрачный, свежее НАД старым — DOM-порядок делает это
+          // бесплатно), поверх — патчи (полупрозрачные, multiply, копятся сами). `isolation:isolate`
+          // держит блендинг внутри этой плитки, чтобы он не утёк на соседей/страницу.
+          jsxs27("div", {
+            style: { position: "relative", height: "4px", flex: "1 1 auto", minWidth: 0, isolation: "isolate" },
+            children: [
+              // Обрезающая обёртка ВОКРУГ СЛОЁВ, а не вокруг всего бара: подпись длины висит выше
+              // бара (`top:-7px`), и `overflow:hidden` на внешнем контейнере срезал бы её.
+              // Сама обрезка — вторая линия защиты к зажиму процентов в модели: если сегмент однажды
+              // снова придёт шире длины файла, он обрежется по бару, а не полезет за габариты плитки
+              // (живой симптом 2026-09-07).
+              jsx28("div", {
+                style: { position: "absolute", inset: 0, overflow: "hidden" },
+                children: segs.map((s, i) => jsx28("div", {
+                  key: `${s.op}-${i}`,
+                  style: {
+                    position: "absolute",
+                    top: 0,
+                    bottom: 0,
+                    left: `${s.pct[0]}%`,
+                    width: `${Math.max(s.pct[1] - s.pct[0], 0)}%`,
+                    minWidth: "1px",
+                    // даже однострочное чтение — видимый штрих (спека §4)
+                    // Плотный оттенок, посчитанный заранее. Ни `opacity`, ни `mix-blend-mode`: см.
+                    // segFill — смешанный цвет читался бы как состояние, которого нет.
+                    backgroundColor: segFill(s.kind, s.rank, s.gray),
+                    // Свежее — выше, без исключений для видов (см. segZ).
+                    zIndex: segZ(s.rank)
+                  }
+                }))
+              })
+            ]
+          }),
+          // Длина — цветом имени: такая же характеристика файла. Не в кликабельной зоне.
+          jsx28("div", {
+            className: "shrink-0",
+            style: { fontSize: "0.5rem", lineHeight: 1, color: "var(--ui-text-secondary)" },
+            title: `${file.total} lines`,
+            children: shortLength(file.total)
+          })
+        ]
+      }),
+      jsx28(OpIdsPopup, { file, pos: popupPos, onClose: onClosePopup })
+    ]
+  });
+}
+function FileContextPanel({ view, selectedOp, open, onToggle }) {
+  const [height, setHeight] = useState9(DEFAULT_H);
+  const [manual, setManual] = useState9(false);
+  const [autoH, setAutoH] = useState9(DEFAULT_H);
+  const gridRef = useRef5(null);
+  const [localCollapsed, setLocalCollapsed] = useState9(false);
+  const driven = typeof open === "boolean";
+  const collapsed = driven ? !open : localCollapsed;
+  const setCollapsed = driven ? () => onToggle && onToggle() : setLocalCollapsed;
+  const dragState = useRef5(null);
+  const [openOps, setOpenOps] = useState9(null);
+  const { files, desync, order } = view || { files: [], desync: [], order: {} };
+  const desyncPaths = useMemo(() => new Set((desync || []).map((d) => d.path)), [desync]);
+  const grayed = useMemo(() => graySegments(files, order, selectedOp), [files, order, selectedOp]);
+  function togglePopup(path, pos) {
+    setOpenOps((cur) => cur && cur.path === path ? null : { path, pos });
+  }
+  useLayoutEffect3(() => {
+    const el = gridRef.current;
+    if (!el || manual) return;
+    const measure = () => {
+      const tile = el.firstElementChild;
+      const row = tile ? tile.getBoundingClientRect().height + 2 : 30;
+      const want = Math.ceil(el.getBoundingClientRect().height);
+      const next = Math.min(want, Math.ceil(row * AUTO_ROWS + 4));
+      setAutoH((prev) => Math.abs(prev - next) < 1 ? prev : next);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [manual, collapsed, files.length]);
+  function onDragStart(e) {
+    e.preventDefault();
+    const startH = manual ? height : autoH;
+    setHeight(startH);
+    setManual(true);
+    dragState.current = { startY: e.clientY, startH };
+    const onMove = (ev) => {
+      const st = dragState.current;
+      if (!st) return;
+      setHeight(Math.min(MAX_H, Math.max(MIN_H, st.startH + (ev.clientY - st.startY))));
+    };
+    const onUp = () => {
+      dragState.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+  return jsxs27("div", {
+    className: "flex items-stretch border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
+    style: CAPPED,
+    children: [
+      jsxs27("div", { className: "flex flex-col flex-1 min-w-0", style: CAPPED, children: [
+        // Треугольник ПЕРВЫМ, то есть слева (владелец, 2026-09-09): обе панели — файловая и
+        // полоса работы с контекстом — обязаны раскрываться с одной стороны, иначе жест
+        // приходится искать заново у каждой. Отсюда и `gap` вместо `justify-between`: прижимать
+        // подпись к правому краю больше незачем, она идёт следом за своим органом управления.
+        jsxs27("div", { className: "flex items-center gap-1 px-1.5", style: { fontSize: "0.55rem", lineHeight: 1.2 }, children: [
+          jsx28("button", {
+            onClick: () => setCollapsed((c) => !c),
+            type: "button",
+            className: "cursor-pointer shrink-0",
+            // Вдвое крупнее прежнего (владелец: «сейчас они очень очень маленькие»). Размер
+            // задан отдельно от строки: подпись рядом остаётся мелкой, а орган управления
+            // должен попадаться под курсор без прицеливания.
+            // 0.8rem, не 1.2rem: заголовок зоны на треть ниже (Plan23-Task01, владелец 2026-09-29).
+            style: { color: "var(--ui-text-quaternary)", fontSize: "0.8rem", lineHeight: 1, border: "none", background: "transparent", padding: "0 2px" },
+            title: collapsed ? "expand files" : "collapse files",
+            children: collapsed ? "\u25B8" : "\u25BE"
+          }),
+          // Легенда прямо в этой строке (владелец, 2026-09-08): цвет — единственный носитель
+          // смысла на баре, и он обязан быть подписан там же, где виден. Слово окрашено ТЕМ ЖЕ
+          // цветом, что даёт `segFill` свежайшей операции, — иначе легенда объясняла бы не то,
+          // что нарисовано.
+          jsxs27("span", { className: "text-(--ui-text-quaternary) truncate min-w-0 flex-1", children: [
+            `context \xB7 ${files.length} files \xB7 `,
+            jsx28("span", { style: { color: segFill("read", 0, false) }, children: "read" }),
+            " ",
+            jsx28("span", { style: { color: segFill("read_nested", 0, false) }, children: "exec" }),
+            " ",
+            jsx28("span", { style: { color: segFill("patch", 0, false) }, children: "patch" }),
+            // Режим НАЗЫВАЕТ себя и говорит, как из него выйти (владелец, 2026-09-08).
+            // «grey от 0012» не объясняло ни что произошло, ни почему всё посерело: человек не
+            // включал никакого «grey» и слова этого нигде не видел. Теперь строка отвечает на оба
+            // вопроса — что показано и что сделать, чтобы вернуть как было.
+            selectedOp ? jsx28("span", {
+              style: { color: "var(--ui-text-secondary)" },
+              children: ` \xB7 shadowed at operation ${selectedOp} \u2014 click anywhere to clear`
+            }) : ""
+          ] })
+        ] }),
+        // Бегунок — планка как у ленты (`.fops-scroll`: 8px, без скругления), только на 1px ближе
+        // к правому краю (владелец, 2026-09-29). Трек УЖЕ, чем у ленты (13px, слева 1px): у ленты
+        // слева от трека своё поле, а здесь сразу плитки со своим отступом сетки, и прежние 3px
+        // прозрачного края плюс он давали широкую щель между плитками и планкой. Правило живёт
+        // ЗДЕСЬ: панель стоит и над стаканом, и в зеркале, и должна выглядеть одинаково.
+        collapsed ? null : jsx28("style", { children: `
+          .fctx-scroll::-webkit-scrollbar { width: 13px; }
+          .fctx-scroll::-webkit-scrollbar-track { background: transparent; }
+          .fctx-scroll::-webkit-scrollbar-thumb {
+            background-color: var(--ui-stroke-secondary);
+            border-radius: 0;
+            border-style: solid;
+            border-color: transparent;
+            border-width: 0 4px 0 1px;
+            background-clip: padding-box;
+          }
+          .fctx-scroll::-webkit-scrollbar-thumb:hover { background-color: var(--ui-stroke-primary); }
+        ` }),
+        collapsed ? null : jsx28("div", {
+          className: "fctx-scroll",
+          style: Object.assign({ height: `${manual ? height : autoH}px`, overflowY: "auto", overflowX: "hidden" }, CAPPED),
+          children: jsx28("div", {
+            ref: gridRef,
+            // Плитка шире на ~30% (74 → 96px, владелец 2026-09-07): имена файлов усекались слишком
+            // рано. Зазор между плитками и внутренний отступ снизу — меньше: вертикаль в этой
+            // панели дороже горизонтали, её отдают стакану.
+            className: "grid gap-0.5 p-1",
+            style: { gridTemplateColumns: "repeat(auto-fill, minmax(96px, 1fr))", alignContent: "start" },
+            children: grayed.map((f) => jsx28(Tile, {
+              key: f.path,
+              file: Object.assign({}, f, { desync: desyncPaths.has(f.path) }),
+              popupPos: openOps && openOps.path === f.path ? openOps.pos : null,
+              onTogglePopup: togglePopup,
+              onClosePopup: () => setOpenOps(null)
+            }))
+          })
+        }),
+        collapsed ? null : jsx28("div", {
+          onMouseDown: onDragStart,
+          title: "drag to resize",
+          style: { height: "5px", cursor: "ns-resize", backgroundColor: "var(--ui-stroke-tertiary)", opacity: 0.35 }
+        })
+      ] }),
+      // Правая зона кнопок (спека §3): режим один, кнопок в нём нет — зона схлопнута до нуля,
+      // ширины не тратит. Зарезервирована под compress/compact/summarize следующим планом.
+      jsx28("div", { style: { width: 0, flexShrink: 0 } })
+    ]
+  });
+}
+
+// desktop/src/mirror-compact-zone.js
+import { jsx as jsx29, jsxs as jsxs28 } from "react/jsx-runtime";
+import { useState as useState10, useEffect as useEffect4 } from "react";
+var DEFAULT_CUT = { headKeep: 6, cutPercent: 30, tailKeep: 20 };
+var SHARE_STEP = 5;
+function CompactZone({ compact, addresses, thin }) {
+  const [cutCfg, setCutCfg] = useState10(DEFAULT_CUT);
+  const [share, setShare] = useState10(String(DEFAULT_CUT.cutPercent));
+  useEffect4(() => {
+    let cancelled = false;
+    loadConfig().then((data) => {
+      if (cancelled || !data || data.error) return;
+      const c = data && data.compaction || {};
+      const cfg = {
+        headKeep: Number(c.head_keep),
+        cutPercent: Number(c.cut_percent),
+        tailKeep: Number(c.tail_keep)
+      };
+      const clean = {
+        headKeep: Number.isFinite(cfg.headKeep) ? cfg.headKeep : DEFAULT_CUT.headKeep,
+        cutPercent: Number.isFinite(cfg.cutPercent) ? cfg.cutPercent : DEFAULT_CUT.cutPercent,
+        tailKeep: Number.isFinite(cfg.tailKeep) ? cfg.tailKeep : DEFAULT_CUT.tailKeep
+      };
+      setCutCfg(clean);
+      setShare(String(clean.cutPercent));
+    }).catch(() => {
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  function stepShare(dir) {
+    const cur = Number(share);
+    const base = Number.isFinite(cur) ? cur : cutCfg.cutPercent;
+    const next = dir > 0 ? Math.floor(base / SHARE_STEP) * SHARE_STEP + SHARE_STEP : Math.ceil(base / SHARE_STEP) * SHARE_STEP - SHARE_STEP;
+    setShare(String(Math.min(100, Math.max(0, next))));
+  }
+  function stepBtn(dir) {
+    return jsx29("button", {
+      type: "button",
+      disabled: compact.mode,
+      title: dir > 0 ? `+${SHARE_STEP}%` : `-${SHARE_STEP}%`,
+      onClick: (e) => {
+        e.stopPropagation();
+        stepShare(dir);
+      },
+      className: "mirror-action-btn select-none",
+      style: {
+        flex: "1 1 0",
+        minHeight: 0,
+        padding: "0 0.2rem",
+        lineHeight: 1,
+        fontSize: "0.45rem",
+        border: "1px solid var(--ui-stroke-secondary)",
+        borderRadius: dir > 0 ? "0.2rem 0.2rem 0 0" : "0 0 0.2rem 0.2rem",
+        background: "transparent",
+        color: "var(--ui-text-secondary)",
+        cursor: compact.mode ? "default" : "pointer",
+        opacity: compact.mode ? 0.45 : 1
+      },
+      children: dir > 0 ? "\u25B2" : "\u25BC"
+    });
+  }
+  function handleClick() {
+    if (!compact.mode) {
+      const pct = Number(share);
+      armCompactFromServer(Number.isFinite(pct) && String(share).trim() !== "" ? pct : void 0);
+      return;
+    }
+    setCompactMode(false);
+  }
+  const armed = !!compact.mode;
+  const color = ACTION_COLOR.compact;
+  return jsxs28("div", {
+    className: thin ? "flex items-center px-1" : "flex items-center gap-2 px-2 py-1",
+    style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
+    children: [
+      jsx29("button", {
+        onClick: (e) => {
+          e.stopPropagation();
+          if (!compact.busy) handleClick();
+        },
+        className: "mirror-action-btn rounded-full font-medium cursor-pointer select-none transition-colors duration-150 ease-out active:scale-95",
+        disabled: !!compact.busy,
+        style: Object.assign({
+          minWidth: thin ? 0 : "5.5rem",
+          textAlign: "center",
+          border: `1px solid ${armed ? color : "var(--ui-stroke-secondary)"}`,
+          background: armed ? `color-mix(in srgb, ${color} 14%, transparent)` : "transparent",
+          color: armed ? color : "var(--ui-text-secondary)",
+          opacity: compact.busy ? 0.5 : 1,
+          whiteSpace: "nowrap"
+        }, thin ? ACTION_BTN_THIN : ACTION_BTN),
+        title: armed ? "close compaction mode" : "arm compaction: ticks the rail from the config numbers, then press Apply operation",
+        // `compact GO` снят (Plan16-Task07): он был нужен, пока второе нажатие ПРИМЕНЯЛО, а
+        // кнопка, называющаяся одинаково в двух смыслах, это «непонятно» (владелец,
+        // 2026-09-23). Теперь применяет `Apply operation`, у кнопки снова один смысл — вход и
+        // выход из режима, — и имя возвращается к правилу 2026-09-10: не меняется при взводе.
+        children: "compact"
+      }),
+      thin ? null : jsxs28("label", {
+        className: "flex items-center gap-1",
+        style: SELECTABLE,
+        onClick: (e) => e.stopPropagation(),
+        children: [
+          "cut %:",
+          jsx29("input", {
+            type: "text",
+            inputMode: "numeric",
+            value: share,
+            disabled: compact.mode,
+            onChange: (e) => setShare(e.currentTarget.value),
+            className: "w-10 px-1 rounded",
+            style: { border: "1px solid var(--ui-stroke-secondary)", backgroundColor: "var(--ui-bg-tertiary)" }
+          }),
+          jsxs28("span", {
+            style: { display: "flex", flexDirection: "column", alignSelf: "stretch", gap: 0 },
+            children: [stepBtn(1), stepBtn(-1)]
+          })
+        ]
+      }),
+      // Счётчик «N ticked» снят (владелец, 2026-09-28): число отмеченных стоит под крестиком
+      // рельсы.
+      thin ? null : jsx29("div", { className: "flex-1 min-w-0" })
+      // Модалка подтверждения переехала в `prompt-mirror.js`: она встаёт рядом с `Apply
+      // operation`, а координаты этой кнопки знает только шапка зеркала (Plan16-Task08).
+    ]
+  });
+}
+
+// desktop/src/confirm-modal.js
+import { jsx as jsx30, jsxs as jsxs29 } from "react/jsx-runtime";
+var KEYFRAMES = `
+  @keyframes confirm-modal-appear {
+    from { opacity: 0; transform: translateY(4px) scale(0.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .confirm-modal-appear { animation: confirm-modal-appear 220ms ease-out both; will-change: opacity, transform; }
+  @keyframes confirm-modal-spin { to { transform: rotate(360deg); } }
+  .confirm-modal-spin { animation: confirm-modal-spin 1s linear infinite; will-change: transform; }
+  @keyframes confirm-modal-sweep {
+    from { transform: translateX(-120%); }
+    to   { transform: translateX(220%); }
+  }
+  .confirm-modal-sweep { animation: confirm-modal-sweep 1.8s linear infinite; will-change: transform; }
+`;
+var ANCHOR_GAP_PX = 14;
+var ANCHOR_WIDTH_REM = 20;
+var EDGE_PX = 8;
+function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, anchor, canConfirm = true }) {
+  if (!open) return null;
+  const anchored = anchor && Number.isFinite(anchor.x) && Number.isFinite(anchor.y);
+  const place = anchored ? {
+    position: "absolute",
+    width: `${ANCHOR_WIDTH_REM}rem`,
+    minWidth: 0,
+    left: `clamp(${EDGE_PX}px, calc(${anchor.x}px - ${ANCHOR_WIDTH_REM / 2}rem), calc(100vw - ${ANCHOR_WIDTH_REM}rem - ${EDGE_PX}px))`,
+    top: `min(${anchor.y + ANCHOR_GAP_PX}px, calc(100vh - 12rem))`
+  } : {};
+  return jsxs29("div", {
+    // stopPropagation on the whole overlay: every other click-to-cancel listener in this
+    // panel (drop-mode, compact-mode, popups) reacts to ANY document click, and a click on
+    // the modal's own backdrop must not fall through to them and cancel the arm underneath.
+    onClick: (e) => e.stopPropagation(),
+    style: {
+      position: "fixed",
+      inset: 0,
+      // ВЫШЕ ВСЕГО, что панель умеет поднимать (правка 2026-09-23). Было 50 — ровно столько
+      // же, сколько у раскрытой всплывашки сообщения (`mirror-primitives.js`, 50/51), и на
+      // живой проверке она накрывала модалку: вопрос виден, а нажать нельзя. Подсказки и
+      // оверлеи в панели живут на 999, поэтому модалка садится над ними.
+      zIndex: 1e3,
+      display: anchored ? "block" : "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      // Затемнение как было: жалоба владельца была НЕ про него (2026-09-23, поправила меня —
+      // «я ничего не говорила про затемнение»). Просвечивала сама КАРТОЧКА, см. ниже.
+      backgroundColor: "rgba(0,0,0,0.45)"
+    },
+    children: [
+      jsx30("style", { dangerouslySetInnerHTML: { __html: KEYFRAMES } }),
+      jsxs29("div", {
+        className: "confirm-modal-appear rounded-md p-4 flex flex-col gap-2",
+        style: {
+          // АЛЬФА С ФОНА СНЯТА ПРИНУДИТЕЛЬНО (владелец, 2026-09-23: «модалка должна иметь
+          // прозрачность 0, сейчас сквозь неё видно текст»). `var(--ui-bg-secondary)` — токен
+          // ХОСТА, и он несёт собственную альфу < 1; карточка наследовала её и просвечивала
+          // разговор под собой.
+          //
+          // Ровно та же грабля и ровно то же лекарство, что у подложек зеркала:
+          // `oklch(from var(...) l c h)` — relative-color-syntax без альфа-канала
+          // (`mirror-primitives.js::opaque`, заведён по этому же поводу 2026-09-15, её слова
+          // тогда: «нужно прозрачности обоих цветов присвоить 0»). Помощник импортируется, а
+          // не переписывается: второй экземпляр этого знания однажды разойдётся с первым.
+          // ОБЫЧНЫЙ ФОН, А НЕ АКЦЕНТ (владелец, 2026-09-23). `--ui-bg-secondary` оказался
+          // ярким акцентным цветом, который хост и глушил той самой альфой — сняв её, мы
+          // получили честно непрозрачное, но кричащее пятно. Берём ту же базу, на которой
+          // сидит вся наша панель (`SURFACE_BASE`, он же `--ui-editor-surface-background`),
+          // и делаем непрозрачной её.
+          backgroundColor: opaque(SURFACE_BASE),
+          border: "1px solid var(--ui-stroke-secondary)",
+          minWidth: "18rem",
+          maxWidth: "26rem",
+          ...place
+        },
+        children: [
+          jsx30("div", { className: "text-sm font-semibold", style: SELECTABLE, children: title }),
+          jsx30("div", { className: "text-xs text-(--ui-text-secondary)", style: SELECTABLE, children: body }),
+          busy ? jsxs29("div", { className: "flex flex-col gap-1 mt-1", children: [
+            jsx30("div", {
+              className: "h-2 w-full rounded-full overflow-hidden relative",
+              style: { backgroundColor: "var(--ui-stroke-quaternary)" },
+              children: jsx30("div", {
+                className: "confirm-modal-sweep absolute inset-y-0 w-1/3",
+                style: { background: "linear-gradient(90deg, transparent, var(--dt-primary), transparent)" }
+              })
+            }),
+            // Строка сообщений/процент — место под индикатор хода (задел, п.7 задачи):
+            // данных для него ещё нет, значит и текста конкретнее "running…" тоже нет.
+            jsx30("div", {
+              className: "text-[0.65rem] text-(--ui-text-quaternary)",
+              style: SELECTABLE,
+              children: progress || "running in the background\u2026"
+            })
+          ] }) : null,
+          // РАСКЛАДКА КНОПОК — НАРОЧНО НЕ ПРИВЫЧНАЯ (владелец, 2026-09-22/23).
+          //
+          // Подтверждение — В ЦЕНТРЕ, закрытие — в правом НИЖНЕМ углу. Причина не в
+          // эстетике: правка необратима, а кнопка на привычном месте (справа внизу, где у
+          // всех «ОК») нажимается рефлекторно, как «ладно, закрыть». Пусть подтверждение
+          // требует секунды внимания, а рефлекс уводит в безопасное.
+          //
+          // Крестика наверху НЕТ намеренно: у модалки нет титульной полосы, и крестик был бы
+          // цитатой из окна, которого здесь не существует (владелец: «этож модалка»).
+          //
+          // Сетка из трёх колонок, а не `justify-between`: центр должен быть центром ОКНА, а
+          // не серединой между двумя кнопками разной ширины.
+          jsxs29("div", {
+            className: "mt-3 grid items-center gap-2",
+            style: { gridTemplateColumns: "1fr auto 1fr" },
+            children: [
+              jsx30("div", {}),
+              jsxs29("button", {
+                disabled: !!busy || !canConfirm,
+                onClick: onConfirm,
+                className: "px-4 py-1 rounded-md text-xs font-medium cursor-pointer select-none flex items-center gap-1.5 justify-center",
+                style: { border: "1px solid var(--ui-red)", color: "var(--ui-red)", opacity: canConfirm ? 1 : 0.35 },
+                children: [
+                  busy ? jsx30("div", {
+                    className: "w-2.5 h-2.5 rounded-full confirm-modal-spin",
+                    style: { border: "2px solid var(--ui-stroke-secondary)", borderTopColor: "var(--ui-red)" }
+                  }) : null,
+                  "confirm"
+                ]
+              }),
+              jsx30("div", { className: "flex justify-end", children: jsx30("button", {
+                disabled: !!busy,
+                onClick: onCancel,
+                className: "px-3 py-1 rounded-md text-xs cursor-pointer select-none",
+                style: { border: "1px solid var(--ui-stroke-secondary)" },
+                children: "close"
+              }) })
+            ]
+          })
+        ]
+      })
+    ]
+  });
+}
+
+// desktop/src/prompt-mirror.js
+var TAIL_SPACE = "40%";
+var EXPORT_PAINT = {
+  border: ACTION_COLOR.export,
+  fill: railFill(ACTION_COLOR.export),
+  active: (row) => !!row.msgAddr
+};
+var ADDR_PAINT = {
+  content: {
+    border: ACTION_COLOR.content,
+    fill: railFill(ACTION_COLOR.content),
+    active: (row) => !!row.result && !!row.msgAddr
+  },
+  erase: {
+    border: ACTION_COLOR.erase,
+    fill: railFill(ACTION_COLOR.erase),
+    active: (row) => !!row.msgAddr
+  }
+};
+var COMPACT_PAINT = {
+  border: ACTION_COLOR.compact,
+  fill: railFill(ACTION_COLOR.compact),
+  active: (row) => !!row.msgAddr
+};
+function pairToolCalls(items) {
+  const consumed = /* @__PURE__ */ new Set();
+  const pairsByIdx = /* @__PURE__ */ new Map();
+  items.forEach((row, idx) => {
+    if (row.kind !== "msg") return;
+    const fact = row.fact || {};
+    if (String(fact.role) !== "assistant") return;
+    const info = Array.isArray(fact.call_info) ? fact.call_info : [];
+    if (!info.length) return;
+    const pairs = info.map((call, c) => {
+      const id = call && call.id || "";
+      let answer = null;
+      if (id) {
+        for (let j = idx + 1; j < items.length; j++) {
+          if (items[j].kind !== "msg" || consumed.has(j)) continue;
+          const cf = items[j].fact || {};
+          if (String(cf.role) === "tool" && String(cf.tool_call_id || "") === id) {
+            answer = items[j];
+            consumed.add(j);
+            break;
+          }
+        }
+      }
+      return {
+        kind: "toolpair",
+        key: `pair-${row.key}-${c}`,
+        stepKey: row.key,
+        name: call && call.name || "\u0442\u0443\u043B",
+        target: call && call.target || "",
+        answer
+      };
+    });
+    pairsByIdx.set(idx, pairs);
+  });
+  const out = [];
+  items.forEach((row, idx) => {
+    if (consumed.has(idx)) return;
+    const fact = row.fact || {};
+    if (row.kind === "msg" && String(fact.role) === "tool") {
+      out.push({
+        kind: "toolpair",
+        key: `lone-${row.key}`,
+        stepKey: `lone-${row.key}`,
+        name: fact.name || "\u0442\u0443\u043B",
+        target: "",
+        answer: row
+      });
+      return;
+    }
+    out.push(row);
+    const pairs = pairsByIdx.get(idx);
+    if (pairs) pairs.forEach((p) => out.push(p));
+  });
+  return out;
+}
+function buildCarriageGroups(rows) {
+  const groups = [];
+  let current = null;
+  rows.forEach((row) => {
+    if (row.kind === "carriage") {
+      current = { header: row, items: [] };
+      groups.push(current);
+    } else if (row.kind === "orphan") {
+      current = null;
+    } else if (current) {
+      current.items.push(row);
+    }
+  });
+  return groups;
+}
+function buildCarriage(group, popup, setPopup, stale, drop, compact, row, pickColumn, bricksByCall) {
+  const header = group.header;
+  const opener = group.items.find((r) => r.kind === "msg" && r.opener);
+  const rest = opener ? group.items.filter((r) => r !== opener) : group.items;
+  const railEntries = [{ kind: "header", pickable: false }];
+  if (opener) {
+    railEntries.push({
+      kind: "opener",
+      pickable: false,
+      tone: opener.fact ? rowTone(opener.fact) : toneOf("user"),
+      msgAddr: opener.address || ""
+    });
+  }
+  let prevKind = null;
+  const restNodes = pairToolCalls(rest).map((row2) => {
+    const gapBefore = row2.kind === "toolpair" && prevKind === "msg";
+    prevKind = row2.kind;
+    let node;
+    if (row2.kind === "step") {
+      node = jsx31(StepBar, { row: row2 });
+      railEntries.push({ kind: "step", pickable: false });
+    } else if (row2.kind === "toolpair") {
+      const callId = String(row2.answer && row2.answer.fact && row2.answer.fact.tool_call_id || "");
+      node = jsx31(ToolPairBrick, {
+        row: row2,
+        popup,
+        setPopup,
+        stale,
+        brick: callId && bricksByCall && bricksByCall.get(callId) || null
+      });
+      const afact = row2.answer && row2.answer.fact || {};
+      const realOp = afact.op || "";
+      railEntries.push({
+        kind: "brick",
+        pickable: !!realOp,
+        op: realOp,
+        result: true,
+        toolId: afact.tool_call_id || "",
+        stepKey: row2.stepKey,
+        gapBefore,
+        tone: toneOf("tool"),
+        // Адрес ОТВЕТА, не вызова — вызов уже свой lead-in-строкой выше (см. `isEmptyLeadIn`
+        // ниже), и оба даются компакции независимыми ячейками.
+        msgAddr: row2.answer && row2.answer.address || ""
+      });
+    } else if (isEmptyLeadIn(row2)) {
+      node = null;
+      railEntries.push({ kind: "empty", pickable: false, gapBefore, msgAddr: row2.address || "" });
+    } else {
+      node = jsx31(MessageNode, { row: row2, popup, setPopup });
+      railEntries.push({
+        kind: "brick",
+        pickable: false,
+        gapBefore,
+        tone: rowTone(row2.fact),
+        msgAddr: row2.address || ""
+      });
+    }
+    return jsx31("div", { style: gapBefore ? { marginTop: "0.125rem" } : void 0, children: node }, row2.key);
+  });
+  const railRows = buildRailRows(railEntries);
+  const vagon = jsxs30("div", {
+    // Ширина — ПО СОДЕРЖИМОМУ (`fit-content`), не фиксированный процент (владелец,
+    // 2026-09-15, второй заход: «вот как раз после этого номера [адреса] и должна сразу
+    // заканчиваться ширина этого прямоугольника... но он продолжается направо дальше пока не
+    // займёт всю ширину» — колонки строки (`BrickRow`) и так фиксированы, `fit-content`
+    // просто обводит их по факту, не гадая с процентом). `maxWidth` — потолок на случай
+    // непредвиденно длинного адреса/бейджа. Раньше здесь стоял тот же `width` в объекте, что
+    // и в `CAPPED` (`width: '100%'`) — `Object.assign` идёт по порядку, и `CAPPED` шёл
+    // ВТОРЫМ, поэтому его `100%` тихо перезаписывал явную ширину до неё — оттого вагон и
+    // расползался на всю ширину стакана, несмотря на явно заданный процент.
+    //
+    // БЕЗ `maxWidth` (был потолок `70%`) и С `overflow: 'hidden'` — живая правка: при сужении
+    // панели ниже потолка колонки-таблицы (`BrickRow`, фиксированная сетка) сжаться не могут,
+    // контейнер оказывался ýже своего содержимого, и рамка визуально резалась поверх
+    // вылезающих кирпичиков. `fit-content` без верхнего предела просто отдаёт контейнеру
+    // естественную ширину его строк; если панель у́же этого — обрезает СВОЙ собственный край
+    // чисто (`overflow: hidden`), а не рисует границу поверх чужого содержимого.
+    className: "rounded-md border border-(--ui-stroke-secondary)",
+    "data-mirror-wagon": "",
+    style: Object.assign({}, CAPPED, {
+      width: "fit-content",
+      overflow: "hidden",
+      backgroundColor: VAGON_BG,
+      gridColumn: 1,
+      gridRow: row
+    }),
+    children: [
+      // Шапка вагона — сетка строк (`BrickHead`): `Turn …` слева, `op ID` над номерами операций,
+      // `message ID` над адресами (владелец, 2026-09-23 и 2026-09-29). Адрес — наша система
+      // координат, но по одному виду `m001f` этого не угадать.
+      jsx31("div", {
+        className: "px-2 pt-1",
+        style: { height: ROW_HEIGHT2.header, boxSizing: "border-box" },
+        // «carriage» → «Turn» (владелец, 2026-09-15).
+        children: jsx31(BrickHead, {
+          left: `Turn ${header.index} \xB7 ${header.count} msg`,
+          opLabel: "op ID",
+          addrLabel: "message ID",
+          addrTitle: "the address of each message \u2014 what you name in /ctx-compact and see in the run report",
+          height: "100%"
+        })
+      }),
+      opener ? jsx31("div", {
+        className: "flex justify-end items-center px-2 pt-1",
+        style: { height: ROW_HEIGHT2.opener, boxSizing: "border-box" },
+        children: jsx31(MessageNode, { row: opener, popup, setPopup })
+      }) : null,
+      // `pb-1`, БЕЗ `pt-1` (Таск 10a) — верхний паддинг этой обёртки не был бы учтён в
+      // `railEntries` (там нет строки под «просто отступ»), и первая строка внутри
+      // съехала бы вниз относительно своей ячейки на рельсе на эту величину. Нижний
+      // паддинг безопасен — он ПОСЛЕ последней строки, ничьей ячейки не сдвигает.
+      jsx31("div", { className: "flex flex-col px-2 pb-1 gap-0", children: restNodes })
+    ]
+  }, `${group.header.key}-vagon`);
+  const pickRail = drop && drop.mode ? jsx31(Rail, {
+    railRows,
+    cells: pickCells(railRows, drop),
+    gridRow: row,
+    gridColumn: pickColumn
+  }, `${group.header.key}-pick`) : null;
+  return { vagon, pickRail, railRows };
+}
+function ImportBody({ imp }) {
+  const check = imp.check;
+  const fresh = check && check.folder === imp.folder;
+  const roles = fresh && check.roles ? Object.keys(check.roles).map((k2) => `${k2} ${check.roles[k2]}`).join(" \xB7 ") : "";
+  const problems = fresh && Array.isArray(check.problems) ? check.problems : [];
+  return jsxs30("div", {
+    className: "flex flex-col gap-2",
+    children: [
+      jsx31("div", { children: "Replaces this chat's WHOLE context with the messages from the folder. Order is the file number. Irreversible." }),
+      jsxs30("div", {
+        className: "flex items-center gap-1",
+        children: [
+          jsx31("input", {
+            type: "text",
+            value: imp.folder || "",
+            placeholder: "export snapshot folder \u2014 or press Ctrl+V",
+            onChange: (e) => setImportFolder(e.target.value),
+            onKeyDown: (e) => {
+              if (e.key === "Enter") checkImport();
+            },
+            style: {
+              flex: "1 1 auto",
+              minWidth: 0,
+              fontSize: "0.65rem",
+              padding: "0.15rem 0.3rem",
+              border: "1px solid var(--ui-stroke-secondary)",
+              borderRadius: "0.25rem",
+              background: "transparent",
+              color: "var(--ui-text-primary)"
+            }
+          }, "folder"),
+          jsx31("button", {
+            type: "button",
+            disabled: !!imp.checking || !String(imp.folder || "").trim(),
+            onClick: (e) => {
+              e.stopPropagation();
+              checkImport();
+            },
+            className: "rounded-md cursor-pointer select-none",
+            style: {
+              border: "1px solid var(--ui-stroke-secondary)",
+              padding: "0.15rem 0.5rem",
+              fontSize: "0.65rem",
+              whiteSpace: "nowrap",
+              opacity: imp.checking ? 0.5 : 1
+            },
+            children: imp.checking ? "checking\u2026" : "check"
+          }, "check")
+        ]
+      }, "row"),
+      fresh ? jsx31("div", {
+        style: { color: check.ok ? "var(--ui-green)" : "var(--ui-red)", whiteSpace: "pre-wrap" },
+        children: check.error ? String(check.error) : `${check.files || 0} files \u2192 ${check.messages || 0} messages` + (roles ? ` (${roles})` : "") + (problems.length ? `
+${problems.length} problem(s):
+` + problems.slice(0, 8).join("\n") + (problems.length > 8 ? `
+\u2026 and ${problems.length - 8} more` : "") : "\npairs OK \u2014 ready to import")
+      }, "result") : null,
+      imp.note && imp.ok === false ? jsx31("div", { style: { color: "var(--ui-red)" }, children: imp.note }, "note") : null
+    ]
+  });
+}
+function PromptMirror() {
+  const view = useView();
+  const st = useMessages();
+  const tok = useTokens();
+  useEffect5(() => {
+    loadMessages();
+  }, [view.sessionId]);
+  const [popup, setPopup] = useState11(null);
+  const exp = useExportRail();
+  const addrOp = useAddrOp();
+  const [applyAt, setApplyAt] = useState11(null);
+  const [dropConfirm, setDropConfirm] = useState11(false);
+  const imp = useImportOp();
+  const [importAt, setImportAt] = useState11(null);
+  const dragRef = useRef6(null);
+  const tapeRef = useRef6(null);
+  const headRef = useRef6(null);
+  const [railBoxes, setRailBoxes] = useState11({});
+  function railDrag(read, write) {
+    function mark(id, add) {
+      const marks = read();
+      if (!!marks[id] === add) return;
+      const next = Object.assign({}, marks);
+      if (add) next[id] = true;
+      else delete next[id];
+      write(next);
+    }
+    return {
+      onDown: (id) => {
+        const add = !read()[id];
+        dragRef.current = { read, mode: add ? "add" : "remove" };
+        mark(id, add);
+      },
+      onEnter: (id) => {
+        const drag = dragRef.current;
+        if (!drag || drag.read !== read) return;
+        mark(id, drag.mode === "add");
+      }
+    };
+  }
+  const readExport = () => ($exportRail.get() || {}).picked || {};
+  const readAddrOp = () => ($addrOp.get() || {}).picked || {};
+  useEffect5(() => {
+    const up = () => {
+      dragRef.current = null;
+    };
+    document.addEventListener("mouseup", up);
+    return () => document.removeEventListener("mouseup", up);
+  }, []);
+  useEffect5(() => {
+    if (!popup) return;
+    const clear = () => setPopup(null);
+    document.addEventListener("click", clear);
+    return () => document.removeEventListener("click", clear);
+  }, [popup]);
+  const drop = useDrop();
+  const fileContext = useFileContext();
+  const ctxView = useMemo2(() => buildContextView(liveContextOps(fileContext.ops)), [fileContext.ops]);
+  const bricksByCall = useMemo2(() => {
+    const map = /* @__PURE__ */ new Map();
+    (view.bricks || []).forEach((b) => {
+      if (b && b.tool_id) map.set(String(b.tool_id), b);
+    });
+    return map;
+  }, [view.bricks]);
+  useEffect5(() => {
+    if (!drop.mode) return;
+    const clear = () => setDropMode(false);
+    document.addEventListener("click", clear);
+    return () => document.removeEventListener("click", clear);
+  }, [drop.mode]);
+  const compact = useCompact();
+  const compactRun = useCompactRun();
+  useEffect5(() => {
+    if (!compact.mode) return;
+    document.addEventListener("mouseup", compactMouseUp);
+    const onKey = (e) => {
+      if (e.key === "Escape") setCompactMode(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mouseup", compactMouseUp);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [compact.mode]);
+  useEffect5(() => {
+    if (!exp.mode) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setExportMode(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [exp.mode]);
+  useEffect5(() => {
+    if (!addrOp.mode) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setAddrOpMode(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [addrOp.mode]);
+  useEffect5(() => {
+    if (compact.confirming) setPopup(null);
+  }, [compact.confirming]);
+  const zones = useZones();
+  useEffect5(() => {
+    loadZones();
+  }, []);
+  const [lastReport, setLastReport] = useState11("");
+  useEffect5(() => {
+    if (addrOp.note) setLastReport("addr");
+  }, [addrOp.note]);
+  useEffect5(() => {
+    if (compact.note) setLastReport("compact");
+  }, [compact.note]);
+  useEffect5(() => {
+    if (exp.note) setLastReport("export");
+  }, [exp.note]);
+  useEffect5(() => {
+    if (drop.note) setLastReport("drop");
+  }, [drop.note]);
+  useEffect5(() => {
+    if (imp.note) setLastReport("import");
+  }, [imp.note]);
+  const { rows, placed, orphans } = layoutMessages(st.carriages, st.messages);
+  const total = Array.isArray(st.messages) ? st.messages.length : 0;
+  const foreign = rows.filter((r) => r.foreign).length;
+  useLayoutEffect4(() => {
+    const tape = tapeRef.current;
+    if (!tape) return;
+    const measure = () => {
+      const head2 = headRef.current;
+      const origin = head2 ? head2.getBoundingClientRect().left : 0;
+      const boxes = {};
+      tape.querySelectorAll("[data-rail-body]").forEach((el) => {
+        const r = el.getBoundingClientRect();
+        boxes[el.getAttribute("data-rail-body")] = { left: Math.round(r.left - origin), width: Math.round(r.width) };
+      });
+      const sig = JSON.stringify(boxes);
+      setRailBoxes((prev) => JSON.stringify(prev) === sig ? prev : boxes);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(tape);
+    if (headRef.current) ro.observe(headRef.current);
+    return () => ro.disconnect();
+  }, [exp.mode, drop.mode, compact.mode, addrOp.mode, rows.length]);
+  const armedOp = exp.mode ? "export" : compact.mode ? "compact" : addrOp.mode ? addrOp.kind : null;
+  const armedPicked = armedOp === "export" ? exp.picked : armedOp === "compact" ? compact.picked : addrOp.mode ? addrOp.picked : {};
+  const armedBusy = armedOp === "export" ? !!exp.busy : armedOp === "compact" ? !!compact.busy : addrOp.mode ? !!addrOp.busy : false;
+  const armedCount = markedAddresses(armedPicked).length;
+  const canApply = !!armedOp && !armedBusy && armedCount > 0;
+  const applyColor = armedOp ? ACTION_COLOR[armedOp] : null;
+  const armedLabel = { export: "export", compact: "compact", content: "drop content", erase: "erase" }[armedOp] || "";
+  const report = lastReport === "addr" ? addrOp : lastReport === "compact" ? compact : lastReport === "export" ? exp : lastReport === "drop" ? drop : lastReport === "import" ? imp : null;
+  function applyArmed(button) {
+    const box = button && button.getBoundingClientRect ? button.getBoundingClientRect() : null;
+    setApplyAt(box ? { x: box.left + box.width / 2, y: box.bottom } : null);
+    if (armedOp === "export") applyExport();
+    else if (armedOp === "compact") openCompactConfirm();
+    else if (armedOp === "content" || armedOp === "erase") setDropConfirm(true);
+  }
+  const head = jsxs30("div", {
+    className: "items-center gap-2 px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0",
+    style: Object.assign({
+      fontSize: "0.55rem",
+      display: "grid",
+      gridTemplateColumns: "1fr auto 1fr",
+      alignItems: "center"
+    }, SELECTABLE),
+    children: [
+      jsx31("button", {
+        type: "button",
+        disabled: !canApply,
+        title: canApply ? armedOp === "export" ? `export ${armedCount} ticked message(s) to files` : armedOp === "content" ? `drop the content of ${armedCount} ticked tool result(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "erase" ? `erase ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : `compact ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp ? "nothing ticked" : "arm an operation first",
+        onClick: (e) => {
+          e.stopPropagation();
+          if (canApply) applyArmed(e.currentTarget);
+        },
+        className: canApply ? "mirror-action-btn rounded-full font-medium cursor-pointer select-none active:scale-95" : "rounded-full font-medium select-none",
+        style: Object.assign({
+          justifySelf: "start",
+          border: `1px solid ${canApply ? applyColor : "var(--ui-stroke-secondary)"}`,
+          color: canApply ? applyColor : void 0,
+          userSelect: "none",
+          cursor: canApply ? "pointer" : "default",
+          opacity: canApply ? 1 : 0.45
+        }, ACTION_BTN),
+        children: armedBusy ? "applying\u2026" : "Apply operation"
+      }),
+      jsx31("span", {
+        className: orphans ? "text-(--ui-text-primary)" : "text-(--ui-text-quaternary)",
+        style: Object.assign({ justifySelf: "center", minWidth: 0, textAlign: "center" }, SELECTABLE),
+        // Число, которое и есть вердикт прогона: сколько сообщений легло в структуру
+        // и сколько осталось за бортом.
+        children: st.loading ? "loading\u2026" : `${placed}/${total} placed` + (orphans ? ` \xB7 ${orphans} not placed` : "") + (foreign ? ` \xB7 ${foreign} foreign` : "")
+      }),
+      jsx31("button", {
+        onClick: () => loadMessages(),
+        className: "rounded-full font-medium cursor-pointer select-none transition-colors duration-150 ease-out hover:bg-(--ui-bg-tertiary) active:scale-95",
+        style: Object.assign({
+          justifySelf: "end",
+          border: "1px solid var(--ui-stroke-secondary)",
+          userSelect: "none"
+        }, ACTION_BTN),
+        children: "\u21BB Reload"
+      })
+    ]
+  });
+  if (st.note) {
+    return jsxs30("div", {
+      className: "flex flex-col h-full w-full overflow-hidden",
+      style: CAPPED,
+      children: [head, sdkC(sdk7.EmptyState, "div", { title: "No messages", description: st.note })]
+    });
+  }
+  if (!rows.length) {
+    return jsxs30("div", {
+      className: "flex flex-col h-full w-full overflow-hidden",
+      style: CAPPED,
+      children: [head, sdkC(sdk7.EmptyState, "div", {
+        title: st.loading ? "Loading\u2026" : "Nothing addressed yet",
+        description: "Messages appear once the session has history and the indexer has run."
+      })]
+    });
+  }
+  const msgTokens = (Array.isArray(st.messages) ? st.messages : []).reduce((sum, m) => sum + factTokens(m), 0);
+  const tokRep = tok && tok.sessionId === view.sessionId && tok.rep && tok.rep.ours || null;
+  const fixedTokens = tokRep ? (tokRep.system || 0) + (tokRep.tools || 0) : 0;
+  const totalTokens = msgTokens + fixedTokens;
+  const pickedTokens = rows.reduce((sum, r) => r.kind === "msg" && r.address && (compact.picked || {})[r.address] ? sum + factTokens(r.fact) : sum, 0);
+  const RAIL_HEAD = "1.35rem";
+  const statsBar = jsxs30("div", {
+    className: "flex items-center gap-2 min-w-0",
+    style: Object.assign({ fontSize: "0.55rem", width: "100%" }, SELECTABLE),
+    children: [
+      jsx31("span", {
+        className: "text-(--ui-text-quaternary)",
+        style: SELECTABLE,
+        title: tokRep ? `messages ${msgTokens} + system ${tokRep.system || 0} + tools ${tokRep.tools || 0} \u2014 our estimator` : "messages only \u2014 the token counter has not answered yet",
+        children: `~${tokensLabel(totalTokens)} tk total${tokRep ? "" : " (msgs)"}`
+      }),
+      // `PRESS ESC` снят вместе с приходом крестика на рельсу компакции (Plan16-Task07,
+      // CARRY Task05: «убрать вместе с крестиком компакта»). Esc остался клавиатурным близнецом.
+      // СКОЛЬКО ТОКЕНОВ ОТМЕЧЕНО (владелец, 2026-09-23). Считается ТЕМ ЖЕ `factTokens`, что
+      // уже стоит числом перед каждым сообщением в ленте — не вторая оценка рядом с первой, а
+      // сумма ровно тех чисел, которые человек видит слева. Иначе сумма не сошлась бы с
+      // слагаемыми, и доверия к ней не было бы никакого.
+      //
+      // Источник — `rows`, а не `st.messages`: отметка стоит на АДРЕСЕ, и только в `rows`
+      // адрес лежит рядом с длиной. `~` не для красоты: это оценка по символам, а не счёт
+      // токенизатором (см. `factTokens`).
+      compact.mode ? jsx31("span", {
+        className: "font-semibold",
+        style: Object.assign({ fontSize: "0.7rem", color: ACTION_COLOR.compact }, SELECTABLE),
+        title: "rough token estimate of the ticked messages \u2014 same per-message numbers as in the tape, summed",
+        children: `~${tokensLabel(pickedTokens)} tk ticked`
+      }) : null,
+      // Подсказка режима отметки живёт ЗДЕСЬ, а не среди кнопок (владелец, 2026-09-23: «эта
+      // строчка сдвигает кнопку compact»): она появляется и исчезает вместе с режимом, и в
+      // полосе кнопок двигала соседнюю зону на каждое взведение. Полоса статистики — место,
+      // где ширина своя и прыгать нечему.
+      jsx31(ActionHint, { drop })
+    ]
+  });
+  const groups = buildCarriageGroups(rows);
+  const railSpecs = [];
+  if (exp.mode) {
+    railSpecs.push({
+      key: "export",
+      picked: exp.picked,
+      paint: EXPORT_PAINT,
+      setPicks: setExportPicks,
+      drag: railDrag(readExport, setExportPicks),
+      onClose: () => setExportMode(false)
+    });
+  }
+  if (addrOp.mode) {
+    railSpecs.push({
+      key: addrOp.kind,
+      picked: addrOp.picked,
+      paint: ADDR_PAINT[addrOp.kind],
+      setPicks: setAddrOpPicks,
+      drag: railDrag(readAddrOp, setAddrOpPicks),
+      onClose: () => setAddrOpMode(false)
+    });
+  }
+  if (compact.mode) {
+    railSpecs.push({
+      key: "compact",
+      picked: compact.picked,
+      paint: COMPACT_PAINT,
+      setPicks: setCompactPicks,
+      drag: { onDown: beginCompactDrag, onEnter: dragCompactOver },
+      onClose: () => setCompactMode(false)
+    });
+  }
+  const openRails = railSpecs;
+  const pickColumn = 2 + railSpecs.length;
+  const items = [];
+  const idsBySpec = railSpecs.map(() => []);
+  groups.forEach((g, i) => {
+    const built2 = buildCarriage(
+      g,
+      popup,
+      setPopup,
+      ctxView.stale,
+      drop,
+      compact,
+      i + 1,
+      pickColumn,
+      bricksByCall
+    );
+    items.push(built2.vagon);
+    railSpecs.forEach((spec, slot) => {
+      activeAddresses(built2.railRows, spec.paint.active).forEach((id) => {
+        if (idsBySpec[slot].indexOf(id) < 0) idsBySpec[slot].push(id);
+      });
+      items.push(jsx31(Rail, {
+        railRows: built2.railRows,
+        cells: baseCells(built2.railRows, spec.picked, spec.drag, spec.paint),
+        guide: true,
+        gridRow: i + 1,
+        gridColumn: 2 + slot
+      }, `${g.header.key}-rail-${spec.key}`));
+    });
+    if (built2.pickRail) items.push(built2.pickRail);
+  });
+  function pickAll(slot, clear) {
+    const next = {};
+    if (!clear) idsBySpec[slot].forEach((id) => {
+      next[id] = true;
+    });
+    railSpecs[slot].setPicks(next);
+  }
+  function invertRail(slot) {
+    const next = Object.assign({}, railSpecs[slot].picked || {});
+    idsBySpec[slot].forEach((id) => {
+      if (next[id]) delete next[id];
+      else next[id] = true;
+    });
+    railSpecs[slot].setPicks(next);
+  }
+  function railPickBtn(title, glyph, onClick, disabled) {
+    return jsx31("button", {
+      type: "button",
+      className: "mirror-action-btn rounded-md border border-(--ui-stroke-secondary)",
+      title,
+      disabled,
+      onClick: (e) => {
+        e.stopPropagation();
+        onClick();
+      },
+      style: {
+        flex: "1 1 0",
+        minWidth: 0,
+        boxSizing: "border-box",
+        height: "100%",
+        padding: 0,
+        cursor: "pointer",
+        lineHeight: 1,
+        fontSize: "0.65rem",
+        color: "var(--ui-text-secondary)",
+        backgroundColor: VAGON_BG
+      },
+      children: glyph
+    }, title);
+  }
+  const chromes = groups.length ? railSpecs.map((spec, slot) => {
+    const marked = markedAddresses(spec.picked);
+    const ids = idsBySpec[slot];
+    const allOn = ids.length > 0 && ids.every((id) => marked.indexOf(id) !== -1);
+    return selectionRailChrome({
+      key: spec.key,
+      column: 2 + slot,
+      rowSpan: groups.length,
+      fill: VAGON_BG,
+      headHeight: RAIL_HEAD,
+      markedCount: marked.length,
+      onClose: spec.onClose,
+      capChildren: [
+        railPickBtn(allOn ? "clear all" : "select all", allOn ? "\u25CB" : "\u2713", () => pickAll(slot, allOn), ids.length === 0),
+        railPickBtn("invert", "\u21C4", () => invertRail(slot), ids.length === 0)
+      ]
+    });
+  }) : [];
+  const railLefts = Object.keys(railBoxes).map((k2) => railBoxes[k2].left);
+  const firstRail = railLefts.length ? Math.min.apply(null, railLefts) : null;
+  const tapeHead = jsx31("div", {
+    style: {
+      position: "relative",
+      zIndex: 4,
+      height: RAIL_HEAD,
+      width: firstRail !== null ? `${Math.max(0, firstRail - 6)}px` : "100%",
+      boxSizing: "border-box",
+      display: "flex",
+      alignItems: "center",
+      padding: "0 0.5rem",
+      backgroundColor: WORKAREA_BG,
+      borderBottom: "1px solid var(--ui-stroke-quaternary)"
+    },
+    children: statsBar
+  }, "tape-head");
+  const orphanRows = rows.filter((r) => r.kind === "orphan");
+  if (orphanRows.length) {
+    items.push(jsxs30("div", {
+      className: "flex items-center gap-2 mt-3 mb-1",
+      style: Object.assign({ fontSize: "0.55rem", width: "60%", gridColumn: "1 / -1" }, SELECTABLE),
+      children: [
+        jsx31("span", {
+          className: "px-1.5 py-0.5 rounded-full border border-(--ui-stroke-secondary) text-(--ui-text-primary) shrink-0",
+          children: `not placed \xB7 ${orphans}`
+        }),
+        jsx31("div", { className: "grow", style: { borderTop: "1px solid var(--ui-stroke-primary)" } })
+      ]
+    }, "orphan-bar"));
+    orphanRows.forEach((row) => items.push(jsx31("div", {
+      style: { gridColumn: "1 / -1" },
+      children: jsx31(MessageNode, { row, popup, setPopup })
+    }, row.key)));
+  }
+  const msgAddresses = rows.filter((r) => r.kind === "msg").map((r) => r.address).filter(Boolean);
+  const railTerms = [];
+  openRails.forEach(() => railTerms.push(RAIL_BODY_WIDTH));
+  if (drop.mode) railTerms.push(RAIL_WIDTH);
+  const railCols = railTerms.length ? ` ${railTerms.join(" ")}` : "";
+  const railColumnGap = "0.375rem";
+  return jsxs30("div", {
+    className: "flex flex-col h-full w-full overflow-hidden",
+    style: CAPPED,
+    children: [
+      head,
+      // ЗОНА КОМАНД — НАВЕРХУ контейнера, сразу под шапкой, и ВСЕ кнопки в одной полосе
+      // (владелец, 2026-09-23: «так будет удобнее», «забирай их все наверх и ложи покачто в
+      // одну строку»). Были внизу, за скроллером. Разница не в привычке: рельсы тянутся
+      // вдоль ВСЕЙ ленты, и кнопка, которая их взводит, должна быть видна там, где человек
+      // начинает выбирать, а не там, куда он доскроллит.
+      //
+      // `flex-wrap` — кнопок пять и поле доли; на узкой панели полоса переносится, а не
+      // выдавливает содержимое за срез (ровно та беда, что была у строки состояния).
+      // Рамку несёт ЭТА обёртка, а не каждая зона: иначе между половинами одной полосы
+      // появилась бы линия.
+      // ЗОНЫ (Plan23-Task01, владелец 2026-09-29: «сейчас очень хаотично»): Operations — кнопки
+      // группами, Status — одна строка отчёта, Files — FileOps. Каждая сворачивается, свёрнутая
+      // показывает сводку. `Apply` остался в шапке: виден и при свёрнутой Operations.
+      // `Operations` БЕЗ заголовка (владелец, 2026-09-29: «мы теряем высоту на заголовке»):
+      // развёрнутая — группы кнопок, треугольник в начале первой; свёрнутая — одна строка
+      // тонких кнопок без опций. `Status` — просто одна строка: разворачивать там пока нечего.
+      zones.operations ? jsxs30("div", { className: "shrink-0 flex flex-col border-b border-(--ui-stroke-quaternary)", children: [
+        jsx31(OpGroup, {
+          label: "context",
+          lead: jsx31(ZoneToggle, { title: "Operations", open: true, onToggle: () => toggleZone("operations") }),
+          children: [
+            jsx31(ActionZone, { op: addrOp }, "addr"),
+            jsx31(CompactZone, { compact, addresses: msgAddresses }, "compact")
+          ]
+        }),
+        jsx31(OpGroup, { label: "save", children: [
+          jsx31(ExportZone, { exp, addresses: msgAddresses }, "export"),
+          jsx31(ImportZone, { imp, onOpen: setImportAt }, "import")
+        ] })
+      ] }, "zone-operations") : jsxs30("div", {
+        className: "shrink-0 flex items-center flex-wrap border-b border-(--ui-stroke-quaternary)",
+        style: { paddingLeft: "0.375rem", minHeight: "1.25rem" },
+        children: [
+          jsx31(ZoneToggle, { title: "Operations", open: false, onToggle: () => toggleZone("operations") }, "toggle"),
+          jsx31(ActionZone, { op: addrOp, thin: true }, "addr"),
+          jsx31(CompactZone, { compact, addresses: msgAddresses, thin: true }, "compact"),
+          jsx31(ExportZone, { exp, addresses: msgAddresses, thin: true }, "export"),
+          jsx31(ImportZone, { imp, thin: true, onOpen: setImportAt }, "import")
+        ]
+      }, "zone-operations"),
+      jsx31(StatusLine, { report, run: compactRun }, "zone-status"),
+      // `Files` пропадает целиком, пока файлов в контексте нет (владелец: «сжимать в ноль»).
+      ctxView.files && ctxView.files.length ? jsx31(FileContextPanel, {
+        view: ctxView,
+        selectedOp: fileContext.selectedOp,
+        open: zones.files,
+        onToggle: () => toggleZone("files")
+      }, "zone-files") : null,
+      jsx31("style", { children: `
+        .fops-scroll::-webkit-scrollbar { width: 16px; }
+        .fops-scroll::-webkit-scrollbar-track { background: transparent; }
+        .fops-scroll::-webkit-scrollbar-thumb {
+          background-color: var(--ui-stroke-secondary);
+          border-radius: 0;
+          border-style: solid;
+          border-color: transparent;
+          border-width: 0 5px 0 3px;
+          background-clip: padding-box;
+        }
+        .fops-scroll::-webkit-scrollbar-thumb:hover { background-color: var(--ui-stroke-primary); }
+        /* \u0421\u043A\u0440\u043E\u043B\u043B \u0421\u0415\u041A\u0426\u0418\u0419 \u043E\u043A\u043D\u0430, \u043D\u0435 \u043B\u0435\u043D\u0442\u044B. \u041B\u0435\u043D\u0442\u043E\u0447\u043D\u044B\u0439 \u0431\u0435\u0433\u0443\u043D\u043E\u043A \u0448\u0438\u0440\u043E\u043A\u0438\u0439 \u0438 \u0441\u0438\u043B\u044C\u043D\u043E \u0441\u043A\u0440\u0443\u0433\u043B\u0451\u043D
+           (\u0445\u0438\u0442-\u0437\u043E\u043D\u0430 \u0441\u043A\u0440\u043E\u043B\u043B\u0431\u0430\u0440\u0430). \u0417\u0434\u0435\u0441\u044C \u0431\u0435\u0433\u0443\u043D\u043E\u043A \u0442\u043E\u043D\u044C\u0448\u0435 \u0438 \u043F\u043E\u0447\u0442\u0438 \u043F\u0440\u044F\u043C\u043E\u0439. \u041A\u043B\u0430\u0441\u0441\u0438\u0447\u0435\u0441\u043A\u0438\u0439, \u043D\u0435
+           \u043E\u0432\u0435\u0440\u043B\u0435\u0439\u043D\u044B\u0439: \u043E\u0432\u0435\u0440\u043B\u0435\u0439\u043D\u044B\u0439 \u043F\u0440\u043E\u043F\u0430\u0434\u0430\u0435\u0442 \u043F\u043E\u0441\u043B\u0435 \u0440\u0430\u0437\u0432\u043E\u0440\u043E\u0442\u0430, \u043F\u043E\u043A\u0430 \u043F\u043E \u043F\u043E\u043B\u043E\u0441\u0435 \u043D\u0435 \u043A\u043B\u0438\u043A\u043D\u0435\u0448\u044C. */
+        .mirror-pane-scroll::-webkit-scrollbar { width: 6px; }
+        .mirror-pane-scroll::-webkit-scrollbar-track { background: transparent; }
+        .mirror-pane-scroll::-webkit-scrollbar-thumb {
+          background-color: var(--ui-stroke-secondary);
+          border-radius: 2px;
+        }
+        .mirror-pane-scroll::-webkit-scrollbar-thumb:hover { background-color: var(--ui-stroke-primary); }
+        /* \u0425\u043E\u0432\u0435\u0440-\u043F\u043E\u0434\u0441\u0432\u0435\u0442\u043A\u0430 \u0447\u0438\u043F\u0430 (Plan19, \u0432\u043B\u0430\u0434\u0435\u043B\u0435\u0446 2026-09-15: \xAB\u0445\u043E\u0432\u0435\u0440 \u0438\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u044F \u0446\u0432\u0435\u0442\u0430... \u0442\u043E\u0436\u0435
+           \u043D\u0435\u0442, \u043D\u0443\u0436\u043D\u043E \u0434\u043E\u0431\u0430\u0432\u0438\u0442\u044C\xBB). filter \u0432\u043C\u0435\u0441\u0442\u043E \u0441\u043C\u0435\u043D\u044B \u0444\u043E\u043D\u0430 \u043A\u043B\u0430\u0441\u0441\u043E\u043C: \u0438\u043D\u043B\u0430\u0439\u043D-\u0444\u043E\u043D \u0447\u0438\u043F\u0430 (color-mix
+           \u043F\u043E\u0434 \u0442\u043E\u043D \u0440\u043E\u043B\u0438/\u0442\u0443\u043B\u0430) \u0432\u0441\u0435\u0433\u0434\u0430 \u043E\u0431\u0433\u043E\u043D\u044F\u0435\u0442 Tailwind hover:bg-* \u043F\u043E \u043F\u0440\u0438\u043E\u0440\u0438\u0442\u0435\u0442\u0443, \u0430 filter
+           \u043F\u0440\u0438\u043C\u0435\u043D\u044F\u0435\u0442\u0441\u044F \u043F\u043E\u0432\u0435\u0440\u0445 \u0433\u043E\u0442\u043E\u0432\u043E\u0439 \u043A\u0430\u0440\u0442\u0438\u043D\u043A\u0438 \u043D\u0435\u0437\u0430\u0432\u0438\u0441\u0438\u043C\u043E \u043E\u0442 \u0442\u043E\u0433\u043E, \u043A\u0430\u043A \u0437\u0430\u0434\u0430\u043D \u0444\u043E\u043D. */
+        .mirror-chip:hover:not(.mirror-chip-open) { filter: brightness(${CHIP_HOVER_BRIGHTNESS}); }
+        /* \u0425\u043E\u0432\u0435\u0440 \u043A\u043D\u043E\u043F\u043E\u043A \u043D\u0438\u0437\u0430 (Palette \u2192 Buttons #A5-A6, \u0432\u043B\u0430\u0434\u0435\u043B\u0435\u0446 2026-09-15: \xAB\u0434\u043E\u0431\u0430\u0432\u044C \u0445\u043E\u0432\u0435\u0440,
+           \u0438\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u0435 \u0446\u0432\u0435\u0442\u0430, \u0447\u0442\u043E\u0431\u044B \u043E\u043D\u0438 \u0432\u044B\u0433\u043B\u044F\u0434\u0435\u043B\u0438 \u0436\u0438\u0432\u0435\u0435\xBB). box-shadow, \u043D\u0435 background \u2014 \u0438\u043D\u043B\u0430\u0439\u043D-
+           \u0444\u043E\u043D \u043A\u043D\u043E\u043F\u043A\u0438 (\u043F\u0440\u043E\u0437\u0440\u0430\u0447\u043D\u044B\u0439/color-mix \u043F\u043E \u0441\u043E\u0441\u0442\u043E\u044F\u043D\u0438\u044E armed) \u043D\u0435 \u0442\u0440\u043E\u0433\u0430\u0435\u0442\u0441\u044F, \u0430 currentColor
+           \u043F\u043E\u0434\u0445\u0432\u0430\u0442\u044B\u0432\u0430\u0435\u0442 \u0446\u0432\u0435\u0442 \u041A\u0410\u0416\u0414\u041E\u0419 \u043A\u043D\u043E\u043F\u043A\u0438 \u0431\u0435\u0437 \u043F\u0435\u0440\u0435\u0447\u0438\u0441\u043B\u0435\u043D\u0438\u044F. */
+        .mirror-action-btn { transition: box-shadow 150ms ease-out, filter 150ms ease-out; }
+        .mirror-action-btn:hover { box-shadow: inset 0 0 0 999px color-mix(in srgb, currentColor 12%, transparent); }
+        .mirror-action-btn:disabled:hover { box-shadow: none; }
+      ` }),
+      jsxs30("div", {
+        className: "min-h-0 w-full",
+        style: {
+          flex: "1 1 auto",
+          minHeight: 0,
+          display: "flex",
+          flexDirection: "column",
+          padding: "0 0 0 0.5rem",
+          backgroundColor: WORKAREA_BG
+        },
+        children: [
+          // Вагоны и рельса слева, по содержимому. Бегунок — на правом крае окна,
+          // потому что скроллер на всю ширину, а лента внутри него не растянута.
+          jsxs30("div", {
+            ref: headRef,
+            style: {
+              flex: "0 0 auto",
+              position: "relative",
+              width: "100%",
+              height: RAIL_HEAD,
+              backgroundColor: WORKAREA_BG
+            },
+            children: [
+              tapeHead,
+              ...railSpecs.map((spec, slot) => {
+                const box = railBoxes[spec.key];
+                if (!box || !chromes[slot]) return null;
+                return jsx31("div", {
+                  style: {
+                    position: "absolute",
+                    top: 0,
+                    left: `${box.left}px`,
+                    width: `${box.width}px`,
+                    height: RAIL_HEAD,
+                    zIndex: 5
+                  },
+                  children: chromes[slot].close
+                }, `close-${spec.key}`);
+              })
+            ]
+          }),
+          jsx31("div", {
+            className: "w-full fops-scroll",
+            style: {
+              flex: "1 1 auto",
+              width: "100%",
+              minHeight: 0,
+              overflowY: "auto",
+              overflowX: "hidden",
+              backgroundColor: WORKAREA_BG
+            },
+            children: jsxs30("div", {
+              ref: tapeRef,
+              style: {
+                display: "grid",
+                width: "fit-content",
+                maxWidth: "100%",
+                // 2px справа ВНУТРИ ширины (владелец, 2026-09-29): на минимальной ширине рамка
+                // правой рельсы срезалась окном. 1px на рамку, 1px зазора до среза.
+                paddingRight: "2px",
+                boxSizing: "border-box",
+                gridTemplateColumns: "minmax(0, max-content)" + railCols,
+                columnGap: railColumnGap,
+                rowGap: "0.5rem",
+                alignItems: "start",
+                justifyItems: "start"
+              },
+              children: [
+                ...chromes.reduce((acc, c) => acc.concat(c.body, c.cap), []),
+                ...items,
+                jsx31("div", { style: { height: TAIL_SPACE, pointerEvents: "none", gridColumn: "1 / -1" } }, "tail-space")
+              ]
+            })
+          })
+        ]
+      }),
+      jsx31(ConfirmModal, {
+        open: !!compact.confirming,
+        anchor: applyAt,
+        title: "Compact messages?",
+        body: `This summarizes ${markedAddresses(compact.picked).length} ticked message(s) into one summary and removes the rest from the model's context. Irreversible.`,
+        busy: !!compact.busy,
+        onConfirm: () => confirmCompact(),
+        onCancel: () => cancelCompactConfirm()
+      }, "confirm-compact"),
+      jsx31(ConfirmModal, {
+        open: dropConfirm,
+        anchor: applyAt,
+        title: addrOp.kind === "erase" ? "Erase messages?" : "Drop content?",
+        body: addrOp.kind === "erase" ? `This removes ${markedAddresses(addrOp.picked).length} ticked message(s) from the model's context. A tool result takes its call with it. Irreversible.` : `This replaces the body of ${markedAddresses(addrOp.picked).length} ticked tool result(s) with a stub; our header stays, a foreign result keeps only its tool name and size. Irreversible.`,
+        busy: !!addrOp.busy,
+        onConfirm: () => {
+          applyAddrOp().then(() => {
+            setDropConfirm(false);
+            loadMessages();
+          });
+        },
+        onCancel: () => setDropConfirm(false)
+      }, "confirm-drop"),
+      jsx31(ConfirmModal, {
+        open: !!imp.open,
+        anchor: importAt,
+        title: "Import session from a folder?",
+        body: jsx31(ImportBody, { imp }),
+        busy: !!imp.busy,
+        canConfirm: !!(imp.check && imp.check.ok === true && imp.check.folder === imp.folder),
+        onConfirm: () => {
+          applyImport();
+        },
+        onCancel: () => closeImport()
+      }, "confirm-import")
+      // НИЖНЕЙ ПОЛОСЫ ДЕЙСТВИЙ БОЛЬШЕ НЕТ (владелец, 2026-09-23: «эту панель можно удалить»).
+      // Она осталась дублем после переезда команд наверх: те же три кнопки, тот же атом, тот
+      // же обработчик — два входа в одно и то же действие на одном экране.
+    ]
+  });
+}
+
+// desktop/src/token-strip.js
+import { jsx as jsx33, jsxs as jsxs32 } from "react/jsx-runtime";
+import { useEffect as useEffect6, useState as useState13 } from "react";
+
+// desktop/src/token-bar.js
+import { jsx as jsx32, jsxs as jsxs31 } from "react/jsx-runtime";
+import { useState as useState12, useRef as useRef7 } from "react";
+var k = (x) => typeof x === "number" && isFinite(x) ? x >= 1e4 ? Math.round(x / 1e3) + "k" : (x / 1e3).toFixed(1) + "k" : "\u2014";
+var n = (x) => typeof x === "number" && isFinite(x) ? x.toLocaleString("en-US").replace(/,/g, " ") : "\u2014";
+var pad = (s, w) => (String(s) + " ".repeat(w)).slice(0, Math.max(w, String(s).length));
+var rpad = (s, w) => (" ".repeat(w) + String(s)).slice(-Math.max(w, String(s).length));
+function mainNumber(r) {
+  if (r && typeof r.next === "number" && r.anchor) return { value: r.next, mark: "\u2693", label: "server number + growth after it" };
+  if (r && r.exact && typeof r.exact.total === "number") return { value: r.exact.total, mark: "\u2713", label: "exact count by the model server" };
+  if (r && r.ours && typeof r.ours.total === "number") return { value: r.ours.total, mark: "\u2248", label: "our estimate only" };
+  return null;
+}
+function tipText(r, main, win, auto, autoPercent, ticked) {
+  const o = r.ours || {};
+  const fx = o.fixed_exact || {};
+  const e = r.exact;
+  const a = r.anchor;
+  const w = r.window || {};
+  const tk = r.tokenizer || {};
+  const s = r.server || {};
+  const L = (label, value, note) => "  " + pad(label, 26) + rpad(value, 9) + (note ? "  " + note : "");
+  const lines = [];
+  lines.push(`CONTEXT  ${n(main.value)} / ${n(win)}  (${win ? (100 * main.value / win).toFixed(1) : "\u2014"}%)  ${main.mark} ${main.label}`);
+  lines.push(L("system prompt", n(o.system), fx.system ? "\u2713 exact" : "\u2248"));
+  lines.push(L("tool schemas", n(o.tools), (fx.tools ? "\u2713 exact" : "\u2248") + ` \xB7 ${n(o.tools_count)} tools`));
+  lines.push(L("messages", n(o.msgs), `\u2248 \xB7 ${n((r.rows || {}).total)} rows \xB7 markup ${n(o.markup)}`));
+  if (a) lines.push(L("growth after last reply", "+" + n(main.value - a.prompt), `${n((r.rows || {}).after_anchor)} rows`));
+  lines.push("");
+  lines.push("AUTO-COMPACTION");
+  lines.push(L(
+    `threshold ${autoPercent != null ? autoPercent + "%" : "\u2014"}`,
+    n(auto),
+    auto != null ? main.value >= auto ? `passed by ${n(main.value - auto)}` : `${n(auto - main.value)} left` : ""
+  ));
+  const d = r.decision;
+  if (d) lines.push(L(
+    "decision",
+    d.fire ? "FIRE" : "not yet",
+    d.enabled ? "automaton ON" : "automaton off \u2014 compact_auto_enabled: false"
+  ));
+  const ask = r.last_ask;
+  lines.push(L(
+    "their automaton asked",
+    ask ? "@" + ask.at : "never",
+    ask ? `they counted ${n(ask.their_tokens)} \xB7 we answered ${ask.answer ? "yes" : "no"}${ask.why ? " \u2014 " + ask.why : ""}` : "compression.enabled is off in config.yaml"
+  ));
+  const au = r.auto || {};
+  if (au.last || au.fails) {
+    lines.push(L(
+      "last automatic run",
+      au.last ? au.last.ok ? "ok" : "failed" : "\u2014",
+      (au.last ? "@" + au.last.at + " " + (au.last.why || "") : "") + (au.fails ? ` \xB7 ${au.fails} failures in a row` : "")
+    ));
+  }
+  if (au.pause_until && au.pause_until * 1e3 > Date.now()) {
+    lines.push(L("paused until", new Date(au.pause_until * 1e3).toLocaleTimeString(), "after failures in a row"));
+  }
+  if (ticked) lines.push(L("ticked for compaction", n(ticked), `\u2192 \u2248 ${n(main.value - ticked)} after (distillate not counted)`));
+  lines.push("");
+  lines.push("SOURCES");
+  lines.push(L("ServerPrompt (last reply)", a ? n(a.prompt) : "\u2014", a ? `+${n(a.completion)} out` : "no reply yet"));
+  lines.push(L("Next (anchor + ours)", n(r.next)));
+  lines.push(L(
+    "Exact (model server)",
+    e && typeof e.total === "number" ? n(e.total) : "\u2014",
+    e && e.error ? e.error : e && e.at ? "@" + e.at : ""
+  ));
+  lines.push(L("Ours (estimate)", n(o.total)));
+  lines.push(L("Hermes (their estimate)", n(r.hermes)));
+  lines.push("");
+  lines.push("MODEL");
+  lines.push(L("window: Hermes / server", `${n(w.hermes)} / ${n(w.server)}`));
+  lines.push(L("tokenizer", `${tk.fp || "\u2014"} ${tk.fp ? tk.exact_model ? "\u2713" : "\u2248" : ""}`, `\xD7${tk.mult != null ? tk.mult : "\u2014"}`));
+  lines.push(L("server", `${s.kind || "\u2014"}${s.status ? "/" + s.status : ""}`));
+  if (s.via) lines.push(`  counted via ${s.via}`);
+  lines.push(`  model ${r.model || "\u2014"}`);
+  lines.push(`  session ${r.session || "\u2014"}`);
+  return lines.join("\n");
+}
+function seg(key, width, color, extra) {
+  return width > 0 ? jsx32("div", { style: Object.assign({ width: width + "%", height: "100%", backgroundColor: color, flex: "none" }, extra || {}) }, key) : null;
+}
+function TokenBar({ rep, autoPercent, ticked }) {
+  const [open, setOpen] = useState12(null);
+  const rootRef = useRef7(null);
+  const toggle = () => {
+    if (open) {
+      setOpen(null);
+      return;
+    }
+    const strip = rootRef.current && rootRef.current.closest("[data-token-strip]");
+    const box = (strip || rootRef.current).getBoundingClientRect();
+    const own = rootRef.current.getBoundingClientRect();
+    setOpen({
+      right: Math.max(0, window.innerWidth - box.right),
+      bottom: Math.max(0, window.innerHeight - own.top),
+      maxWidth: Math.max(160, box.right - 8)
+    });
+  };
+  const r = rep || {};
+  const main = mainNumber(r);
+  const w = r.window || {};
+  const win = w.server || w.hermes || 0;
+  if (!main || !win) return null;
+  const o = r.ours || {};
+  const auto = autoPercent != null ? Math.round(win * autoPercent / 100) : null;
+  const pct = (x) => Math.max(0, Math.min(100, 100 * (x || 0) / win));
+  const fixed = (o.system || 0) + (o.tools || 0);
+  const growth = r.anchor && main.mark === "\u2693" ? Math.max(0, main.value - r.anchor.prompt) : 0;
+  const pick = Math.min(ticked || 0, Math.max(0, main.value - fixed - growth));
+  const msgs = Math.max(0, main.value - fixed - growth - pick);
+  const over = auto != null && main.value >= auto;
+  const bar = jsxs31("div", {
+    style: { position: "relative", flex: "1 1 auto", minWidth: "4rem", height: "0.4rem" },
+    children: [
+      jsxs31("div", {
+        style: {
+          position: "absolute",
+          inset: 0,
+          borderRadius: "0.2rem",
+          overflow: "hidden",
+          display: "flex",
+          backgroundColor: TOKEN_COLOR.track
+        },
+        children: [
+          seg("fixed", pct(fixed), TOKEN_COLOR.fixed),
+          seg("msgs", pct(msgs), TOKEN_COLOR.msgs),
+          seg("ticked", pct(pick), TOKEN_COLOR.ticked),
+          seg("growth", pct(growth), TOKEN_COLOR.growth)
+        ]
+      }),
+      auto != null ? jsx32("div", { style: {
+        position: "absolute",
+        left: `${pct(auto)}%`,
+        top: "-0.15rem",
+        bottom: "-0.15rem",
+        width: "1px",
+        backgroundColor: over ? TOKEN_COLOR.over : TOKEN_COLOR.threshold
+      } }, "auto") : null
+    ]
+  });
+  const text = jsxs31("span", {
+    style: { whiteSpace: "nowrap", flex: "none" },
+    children: [
+      jsx32("span", {
+        className: "font-semibold",
+        style: { color: "var(--ui-text-secondary)" },
+        children: `${k(main.value)} / ${k(win)}`
+      }),
+      ` \xB7 ${Math.round(100 * main.value / win)}% ${main.mark}`,
+      auto != null ? jsx32("span", {
+        style: { color: over ? TOKEN_COLOR.over : void 0 },
+        children: `   auto ${k(auto)} \xB7 ${over ? "over by " + k(main.value - auto) : k(auto - main.value) + " left"}`
+      }) : null,
+      ticked ? jsx32("span", { style: { color: TOKEN_COLOR.ticked }, children: `   \u2192 \u2248${k(main.value - ticked)}` }) : null
+    ]
+  });
+  return jsxs31("div", {
+    // Без `position: relative`: окошко встаёт относительно всей мини-панели и получает её
+    // ширину целиком, вместе с колонкой кнопок (владелец: «окно узковатое»).
+    style: { display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer" },
+    title: open ? void 0 : "click \u2014 all numbers",
+    ref: rootRef,
+    onMouseLeave: () => setOpen(null),
+    children: [
+      jsxs31("div", {
+        style: { display: "flex", alignItems: "center", gap: "0.5rem", flex: "1 1 auto", minWidth: 0 },
+        onClick: toggle,
+        children: [bar, text]
+      }),
+      open ? jsx32("div", {
+        // Прозрачная подложка до самой полосы — мост для мыши; окошко сидит на её верхнем краю.
+        style: {
+          position: "fixed",
+          right: open.right + "px",
+          bottom: open.bottom + "px",
+          zIndex: 1e3,
+          maxWidth: open.maxWidth + "px",
+          cursor: "text"
+        },
+        children: jsx32("pre", {
+          style: {
+            margin: 0,
+            padding: "0.4rem 0.5rem",
+            fontSize: "0.5rem",
+            lineHeight: "0.75rem",
+            whiteSpace: "pre",
+            overflowX: "auto",
+            width: "max-content",
+            maxWidth: "100%",
+            fontFamily: "var(--font-mono, ui-monospace, monospace)",
+            userSelect: "text",
+            WebkitUserSelect: "text",
+            background: "var(--ui-editor-surface-background, var(--background))",
+            border: "1px solid var(--ui-stroke-secondary)",
+            borderRadius: "0.3rem",
+            color: "var(--ui-text-secondary)"
+          },
+          children: tipText(r, main, win, auto, autoPercent, ticked)
+        })
+      }) : null
+    ]
+  });
+}
+
+// desktop/src/token-strip.js
+function btn(label, onClick, lit, title, disabled) {
+  return jsx33("button", {
+    onClick,
+    disabled,
+    title,
+    className: "px-1.5 rounded cursor-pointer select-none hover:bg-(--ui-bg-tertiary) active:scale-95",
+    style: {
+      border: "1px solid " + (lit ? "hsl(var(--primary))" : "var(--ui-stroke-secondary)"),
+      color: lit ? "hsl(var(--primary))" : void 0,
+      opacity: disabled ? 0.5 : 1,
+      fontSize: "0.55rem",
+      lineHeight: "0.7rem",
+      whiteSpace: "nowrap",
+      width: "100%"
+    },
+    children: label
+  }, label);
+}
+function TokenStrip() {
+  const t = useTokens();
+  const compact = useCompact();
+  const st = useMessages();
+  const [autoPercent, setAutoPercent] = useState13(null);
+  useEffect6(() => {
+    loadConfig().then((c) => {
+      const p = c && c.compaction && c.compaction.auto_percent;
+      if (typeof p === "number") setAutoPercent(p);
+    }).catch(() => {
+    });
+  }, []);
+  const r = t.rep || {};
+  const s = r.server || {};
+  const notLoaded = s.kind === "router" && (s.status === "unloaded" || s.status === "loading");
+  const canCount = s.kind !== "none" && (s.status === "loaded" || s.status == null || !!s.via);
+  const ticked = compact.mode ? (Array.isArray(st.messages) ? st.messages : []).reduce((sum, m) => sum + ((compact.picked || {})[m && m.msg] ? factTokens(m) : 0), 0) : 0;
+  const cell = (child) => jsx33("div", { className: "min-w-0", children: child });
+  return jsxs32("div", {
+    "data-token-strip": "1",
+    // Зазоры ужаты (владелец, 2026-09-29: высота ~0.7 от прежней). `relative` — окошко полосы
+    // встаёт относительно всей панели.
+    className: "shrink-0 border-t border-(--ui-stroke-quaternary) px-2 text-(--ui-text-tertiary)",
+    style: {
+      position: "relative",
+      fontSize: "0.55rem",
+      lineHeight: "0.75rem",
+      fontVariantNumeric: "tabular-nums",
+      display: "grid",
+      gridTemplateColumns: "minmax(0, 1fr) max-content",
+      columnGap: "0.5rem",
+      rowGap: "0.1rem",
+      alignItems: "center",
+      paddingTop: "0.15rem",
+      paddingBottom: "0.15rem"
+    },
+    children: [
+      cell(t.rep ? jsx33(TokenBar, { rep: t.rep, autoPercent, ticked }) : jsx33("span", { children: t.note || "no token report yet" })),
+      btn(
+        "count",
+        () => loadTokens({ exact: true }),
+        false,
+        s.via ? `exact count now via ${s.via} (same tokenizer)` : "exact count by the model server now",
+        t.busy || !canCount
+      ),
+      cell(jsx33("div", {
+        style: { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", userSelect: "text" },
+        title: t.note || r.model || "",
+        // Ошибка — ПЕРВОЙ (владелец: «ушла под срез»): иначе её не видно за длинным именем модели.
+        children: (t.note ? `\u26A0 ${t.note}   \xB7 ` : "") + `sess ${r.session ? String(r.session).slice(-6) : "\u2014"}   model ${r.model || "\u2014"}`
+      })),
+      btn(
+        "load",
+        () => loadTokens({ exact: true, load: true }),
+        notLoaded,
+        notLoaded ? "the model is not loaded \u2014 load it on the server and count (nothing is sent to it)" : "load is only for an unloaded model on a llama.cpp router",
+        t.busy || !notLoaded
+      )
+    ]
+  });
+}
+
+// desktop/src/config-pane.js
+import { jsx as jsx34, jsxs as jsxs33 } from "react/jsx-runtime";
+import { useState as useState14, useEffect as useEffect7, useLayoutEffect as useLayoutEffect5, useRef as useRef8 } from "react";
+function InfoLabel({ id, text, info, openInfo, setOpenInfo, className }) {
+  const open = openInfo === id;
+  const popRef = useRef8(null);
+  const [flipLeft, setFlipLeft] = useState14(false);
+  useLayoutEffect5(() => {
+    if (!open) {
+      setFlipLeft(false);
+      return;
+    }
+    const el = popRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.right > window.innerWidth) setFlipLeft(true);
+  }, [open]);
+  return jsxs33("span", { className: "relative inline-flex min-w-0 flex-1", children: [
+    jsx34("span", {
+      key: "label",
+      onClick: (e) => {
+        e.stopPropagation();
+        setOpenInfo(open ? null : id);
+      },
+      className: (className || "") + " cursor-pointer",
+      style: SELECTABLE,
+      children: text
+    }),
+    open ? jsx34("div", {
+      key: "pop",
+      ref: popRef,
+      onClick: (e) => e.stopPropagation(),
+      className: "absolute z-20 rounded-md p-2 text-[0.65rem] leading-snug whitespace-pre-wrap",
+      style: Object.assign(
+        { top: "100%", marginTop: "3px", width: "220px", maxWidth: "80vw", backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", boxShadow: "0 4px 12px rgba(0,0,0,0.35)" },
+        flipLeft ? { right: 0 } : { left: 0 },
+        SELECTABLE
+      ),
+      children: info || "\u2014"
+    }) : null
+  ] });
+}
+function sectionHead(text, infoId, info, openInfo, setOpenInfo) {
+  return jsx34("div", { className: "px-1 pt-1 pb-0.5", children: jsx34(InfoLabel, {
+    id: infoId,
+    info,
+    openInfo,
+    setOpenInfo,
+    className: "text-[0.65rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary)",
+    text
+  }) });
+}
+function zone(children) {
+  return jsx34("div", { className: "flex flex-col border-b border-(--ui-stroke-quaternary) pb-1 mb-1", children });
+}
+function textInput(value, onChange, placeholder, extraClassName) {
+  return jsx34("input", {
+    type: "text",
+    value,
+    onChange,
+    placeholder,
+    className: (extraClassName || "w-full") + " px-1.5 py-0.5 rounded text-[10px] outline-none transition-colors duration-100 ease-out",
+    style: { backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)" },
+    onFocus: (e) => {
+      e.currentTarget.style.borderColor = "var(--dt-ring)";
+    },
+    onBlur: (e) => {
+      e.currentTarget.style.borderColor = "var(--ui-stroke-secondary)";
+    }
+  });
+}
+function seamsElapsedText(ms) {
+  const sec = Math.max(0, Math.floor((Number(ms) || 0) / 1e3));
+  return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0") + " / ~3:00";
+}
+function seamsTallyText(tally) {
+  if (!tally || typeof tally !== "object") return "";
+  return Object.keys(tally).sort().map((k2) => k2 + ": " + tally[k2]).join(" \xB7 ");
+}
+function textArea(value, rows, small) {
+  return jsx34("textarea", {
+    readOnly: true,
+    value,
+    rows: rows || 5,
+    className: "w-full px-2 py-1 rounded-md outline-none resize-none font-mono" + (small ? "" : " text-xs"),
+    style: Object.assign(
+      { backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)" },
+      small ? { fontSize: "8.5px", lineHeight: "1.25" } : {}
+    )
+  });
+}
+function smallNumberField(value, onChange) {
+  return jsx34("input", {
+    type: "text",
+    inputMode: "numeric",
+    value,
+    onChange,
+    className: "w-full px-1 rounded outline-none text-right transition-colors duration-100 ease-out",
+    style: {
+      fontSize: "0.65rem",
+      lineHeight: 1.5,
+      backgroundColor: "var(--ui-bg-elevated)",
+      border: "1px solid var(--ui-stroke-secondary)",
+      color: "var(--ui-text-primary)"
+    },
+    onFocus: (e) => {
+      e.currentTarget.style.borderColor = "var(--dt-ring)";
+    },
+    onBlur: (e) => {
+      e.currentTarget.style.borderColor = "var(--ui-stroke-secondary)";
+    }
+  });
+}
+function compactCell(label, title, control) {
+  return [
+    jsx34("span", { title, className: "text-right text-(--ui-text-secondary)", style: SELECTABLE, children: label }, label + ":l"),
+    jsx34("div", { title, className: "flex items-center", children: control }, label + ":c")
+  ];
+}
+function actionButton(label, onClick) {
+  return jsx34("button", {
+    onClick,
+    className: "px-2 py-0.5 rounded text-[10px] font-medium cursor-pointer select-none transition-colors duration-100 ease-out hover:bg-(--ui-bg-tertiary) active:scale-95",
+    style: { border: "1px solid var(--ui-stroke-secondary)" },
+    children: label
+  });
+}
+var SELECT_STYLE = { backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)", height: "18px", margin: 0 };
+var CHECKBOX_STYLE = { accentColor: "var(--dt-primary)", width: "14px", height: "14px" };
+function disableRow(name, info, checked, onChange, openInfo, setOpenInfo) {
+  return jsxs33("div", {
+    className: "flex items-center justify-between gap-2 pl-1 pr-1 py-0 text-[10px] transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background)",
+    style: { borderRight: "1px solid var(--ui-stroke-quaternary)" },
+    children: [
+      // Hard clip, no ellipsis — the owner explicitly wants letters cut off, not "...": that
+      // reads as "still complete, just tight" instead of announcing a truncation.
+      jsx34(InfoLabel, { id: "dis-" + name, text: name, info, openInfo, setOpenInfo, className: "block w-full overflow-hidden whitespace-nowrap" }),
+      jsxs33("label", { className: "flex items-center gap-1 shrink-0 text-(--ui-text-quaternary) cursor-pointer", style: SELECTABLE, children: [
+        jsx34("span", { style: SELECTABLE, children: "disable" }),
+        jsx34("input", { type: "checkbox", checked, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE })
+      ] })
+    ]
+  }, name);
+}
+function paramControl(toolKey, param, onChange, openInfo, setOpenInfo) {
+  const id = "param-" + toolKey + "-" + param.key;
+  let control;
+  if (param.type === "bool") {
+    control = jsx34("input", { type: "checkbox", checked: param.value, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE });
+  } else if (param.type === "number") {
+    control = jsx34("input", {
+      type: "text",
+      inputMode: "numeric",
+      maxLength: 3,
+      value: String(param.value),
+      onChange: (e) => {
+        const digits = e.currentTarget.value.replace(/\D/g, "").slice(0, 3);
+        onChange(digits === "" ? 0 : Number(digits));
+      },
+      className: "w-8 px-1 rounded text-[10px] text-center outline-none",
+      style: SELECT_STYLE
+    });
+  } else if (param.type === "enum") {
+    control = jsx34("select", {
+      value: param.value,
+      onChange: (e) => onChange(e.currentTarget.value),
+      className: "rounded text-[10px] outline-none",
+      style: SELECT_STYLE,
+      children: (param.options || []).map((o) => jsx34("option", { value: o, children: o }, o))
+    });
+  } else {
+    control = jsx34("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: String(param.value) });
+  }
+  return jsxs33("div", { className: "flex items-center justify-between gap-2 w-full", children: [
+    jsx34(InfoLabel, { id, text: param.key, info: param.help, openInfo, setOpenInfo, className: "text-[10px]" }),
+    control
+  ] }, param.key);
+}
+function paramsEditor(toolKey, params, onChange, openInfo, setOpenInfo) {
+  if (!params.length) return jsx34("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: "\u2014" });
+  return jsx34("div", {
+    className: "flex flex-col gap-0.5 w-full",
+    children: params.map((p) => paramControl(toolKey, p, (value) => onChange(p.key, value), openInfo, setOpenInfo))
+  });
+}
+function pathSelect(key, value, onChange) {
+  return jsx34("select", {
+    value,
+    onChange: (e) => onChange(e.currentTarget.value),
+    className: "rounded text-[10px] outline-none",
+    style: SELECT_STYLE,
+    children: ["old", "new"].map((o) => jsx34("option", { value: o, children: o }, o))
+  });
+}
+var COL_PX = { tool: 100, params: 120, enabled: 60, path: 70 };
+function toolTableRow(key, state, onChange, showParams, showPath, hoverKey, setHoverKey) {
+  const onEnter = () => setHoverKey(key);
+  const onLeave = () => setHoverKey(null);
+  const cellStyle = (extra) => Object.assign(
+    { display: "flex", alignItems: "flex-start", borderBottom: "1px solid var(--ui-stroke-quaternary)", backgroundColor: hoverKey === key ? "var(--ui-row-hover-background)" : "transparent" },
+    extra
+  );
+  const cells = [
+    jsx34("div", {
+      className: "px-1 py-0.5 min-w-0 text-[10px]",
+      style: cellStyle(),
+      onMouseEnter: onEnter,
+      onMouseLeave: onLeave,
+      // text-[0.8rem]: text-sm (0.875rem) was competing with the section header's own text-xs
+      // for visual weight; dialed back a touch while keeping the added font-semibold.
+      children: jsx34(InfoLabel, { id: "slot-" + key, text: key, info: state.help, openInfo: state.openInfo, setOpenInfo: state.setOpenInfo, className: "text-[10px] font-semibold truncate" })
+    }, key + "-name")
+  ];
+  if (showParams) {
+    cells.push(jsx34("div", {
+      className: "px-1 py-0.5",
+      onMouseEnter: onEnter,
+      onMouseLeave: onLeave,
+      style: cellStyle({ borderRight: "1px solid var(--ui-stroke-quaternary)" }),
+      children: paramsEditor(
+        key,
+        state.params,
+        (paramKey, value) => onChange({ params: state.params.map((p) => p.key === paramKey ? Object.assign({}, p, { value }) : p) }),
+        state.openInfo,
+        state.setOpenInfo
+      )
+    }, key + "-params"));
+  }
+  cells.push(jsx34("div", {
+    className: "px-1 py-0.5",
+    style: cellStyle({ justifyContent: "center" }),
+    onMouseEnter: onEnter,
+    onMouseLeave: onLeave,
+    children: jsx34("span", { className: "inline-flex items-center", children: jsx34("input", { type: "checkbox", checked: state.enabled, onChange: (e) => onChange({ enabled: e.currentTarget.checked }), style: CHECKBOX_STYLE }) })
+  }, key + "-enabled"));
+  if (showPath) {
+    cells.push(jsx34("div", {
+      className: "px-1 py-0.5 text-[10px]",
+      style: cellStyle(),
+      onMouseEnter: onEnter,
+      onMouseLeave: onLeave,
+      children: pathSelect(key, state.path, (v) => onChange({ path: v }))
+    }, key + "-path"));
+  }
+  return cells;
+}
+function useElementWidth() {
+  const ref = useRef8(null);
+  const [width, setWidth] = useState14(9999);
+  useEffect7(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0] && entries[0].contentRect && entries[0].contentRect.width;
+      if (typeof w === "number") setWidth(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, width];
+}
+function splitDisabledTools(rawDisabled, help) {
+  const canonical = Object.keys(help);
+  return {
+    legacy: rawDisabled.filter((n2) => !canonical.includes(n2)),
+    disabled: Object.fromEntries(canonical.map((n2) => [n2, rawDisabled.includes(n2)]))
+  };
+}
+function ConfigPane() {
+  const [status, setStatus] = useState14("loading");
+  const [errorMsg, setErrorMsg] = useState14("");
+  const [zoneHelp, setZoneHelp] = useState14({ disabled: "" });
+  const [disabledHelp, setDisabledHelp] = useState14({});
+  const [legacyDisabled, setLegacyDisabled] = useState14([]);
+  const [disabled, setDisabled] = useState14({});
+  const [slots, setSlots] = useState14({});
+  const [auxModel, setAuxModel] = useState14("");
+  const [ctxEnabled, setCtxEnabled] = useState14(true);
+  const [compactHeadKeep, setCompactHeadKeep] = useState14("6");
+  const [compactAutoPercent, setCompactAutoPercent] = useState14("70");
+  const [compactCutPercent, setCompactCutPercent] = useState14("30");
+  const [compactTailKeep, setCompactTailKeep] = useState14("20");
+  const [compactAutoOn, setCompactAutoOn] = useState14(false);
+  const [compactPauseMin, setCompactPauseMin] = useState14("3");
+  const [compactSilenceMin, setCompactSilenceMin] = useState14("5");
+  const [compactWaitTurnMin, setCompactWaitTurnMin] = useState14("10");
+  const [dataRoot, setDataRoot] = useState14("");
+  const [settingsFile, setSettingsFile] = useState14("");
+  const [exportRoot, setExportRoot] = useState14("");
+  const [seamsState, setSeamsState] = useState14("idle");
+  const [seamsOutput, setSeamsOutput] = useState14("Check - quick seam check (search). Full check - plus the behaviour tests (minutes).");
+  const [seamsTally, setSeamsTally] = useState14("");
+  const [seamsFull, setSeamsFull] = useState14(false);
+  const [seamsStarted, setSeamsStarted] = useState14(0);
+  const [seamsNow, setSeamsNow] = useState14(0);
+  useEffect7(() => {
+    if (seamsState !== "pending" || !seamsFull) return void 0;
+    const id = setInterval(() => setSeamsNow(Date.now()), 1e3);
+    return () => clearInterval(id);
+  }, [seamsState, seamsFull]);
+  const [openInfo, setOpenInfo] = useState14(null);
+  const [hoverKey, setHoverKey] = useState14(null);
+  const [tableRef, tableWidth] = useElementWidth();
+  const [saveState, setSaveState] = useState14("idle");
+  const [reloadState, setReloadState] = useState14("idle");
+  const [reloadMsg, setReloadMsg] = useState14("");
+  function applyConfigData(data) {
+    if (!data || data.error) {
+      setErrorMsg(data && data.error || "empty response");
+      setStatus("error");
+      return;
+    }
+    const { legacy, disabled: canonicalDisabled } = splitDisabledTools(
+      Array.isArray(data.disabled_tools) ? data.disabled_tools : [],
+      data.disabled_tools_help || {}
+    );
+    setDisabledHelp(data.disabled_tools_help || {});
+    setLegacyDisabled(legacy);
+    setDisabled(canonicalDisabled);
+    setZoneHelp({ disabled: data.disabled_tools_zone_help || "" });
+    setSlots(Object.fromEntries(Object.entries(data.tools || {}).map(([key, t]) => [key, {
+      enabled: !!t.enabled,
+      path: t.path || "new",
+      help: t.help || "",
+      params: (t.params || []).map((p) => Object.assign({}, p))
+    }])));
+    setCtxEnabled(!!data.context_ctl_enabled);
+    setDataRoot(String(data.data_root || ""));
+    setSettingsFile(String(data.settings_file || ""));
+    const compaction = data.compaction || {};
+    setCompactHeadKeep(String(compaction.head_keep ?? 6));
+    setCompactAutoPercent(String(compaction.auto_percent ?? 70));
+    setCompactCutPercent(String(compaction.cut_percent ?? 30));
+    setCompactTailKeep(String(compaction.tail_keep ?? 20));
+    setCompactAutoOn(compaction.auto_enabled === true);
+    setCompactPauseMin(String(compaction.pause_minutes ?? 3));
+    setCompactSilenceMin(String(compaction.silence_minutes ?? 5));
+    setCompactWaitTurnMin(String(compaction.wait_turn_minutes ?? 10));
+    setExportRoot(String(compaction.export_root ?? ""));
+    setStatus("ready");
+  }
+  useEffect7(() => {
+    if (!hasRest()) {
+      setStatus("unavailable");
+      return;
+    }
+    let cancelled = false;
+    loadConfig().then((data) => {
+      if (!cancelled) applyConfigData(data);
+    }).catch((err) => {
+      if (cancelled) return;
+      setErrorMsg(err && err.message || String(err));
+      setStatus("error");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  useEffect7(() => {
+    if (!openInfo) return;
+    const clear = () => setOpenInfo(null);
+    document.addEventListener("click", clear);
+    return () => document.removeEventListener("click", clear);
+  }, [openInfo]);
+  if (status === "loading") {
+    return jsx34("div", { className: "flex items-center justify-center h-full text-xs text-(--ui-text-quaternary)", style: SELECTABLE, children: "loading config\u2026" });
+  }
+  if (status === "unavailable") {
+    return jsx34("div", { className: "flex items-center justify-center h-full text-xs text-(--ui-text-quaternary) text-center px-4", style: SELECTABLE, children: "REST is not available in this build \u2014 Config needs the live plugin API." });
+  }
+  if (status === "error") {
+    return jsx34("div", { className: "flex items-center justify-center h-full text-xs text-center px-4", style: Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE), children: "/config failed: " + errorMsg });
+  }
+  const setDisabledOne = (name, v) => setDisabled((cur) => Object.assign({}, cur, { [name]: v }));
+  const setSlot = (key, patch) => setSlots((cur) => Object.assign({}, cur, { [key]: Object.assign({}, cur[key], patch) }));
+  function handleSave() {
+    setSaveState("saving");
+    const patch = {
+      disabled_tools: legacyDisabled.concat(Object.keys(disabled).filter((n2) => disabled[n2])),
+      tools: Object.fromEntries(Object.entries(slots).map(([key, s]) => [key, {
+        enabled: s.enabled,
+        path: s.path,
+        params: s.params.map((p) => ({ key: p.key, value: p.value }))
+      }])),
+      context_ctl_enabled: ctxEnabled,
+      // Битое/пустое поле не уходит в патч вовсе (сервер держит своё прежнее значение) — та же
+      // осторожность, что и у остальных числовых полей этого файла (`anchor_gap` и т.п.):
+      // отправить NaN в конфиг компакции значило бы молча сломать расстановку галочек кнопки.
+      compaction: Object.fromEntries(
+        [
+          ["head_keep", compactHeadKeep],
+          ["auto_percent", compactAutoPercent],
+          ["cut_percent", compactCutPercent],
+          ["tail_keep", compactTailKeep],
+          ["pause_minutes", compactPauseMin],
+          ["silence_minutes", compactSilenceMin],
+          ["wait_turn_minutes", compactWaitTurnMin]
+        ].filter(([, v]) => Number.isFinite(Number(v)) && String(v).trim() !== "").map(([k2, v]) => [k2, Number(v)]).concat([["export_root", exportRoot], ["auto_enabled", compactAutoOn]])
+      )
+    };
+    saveConfig(patch).then((data) => {
+      applyConfigData(data);
+      setSaveState("saved");
+    }).catch((err) => {
+      setErrorMsg(err && err.message || String(err));
+      setSaveState("error");
+    });
+  }
+  function handleReload() {
+    setReloadState("pending");
+    reloadPlugin().then((data) => {
+      if (data && data.ok) {
+        setReloadState("done");
+        return;
+      }
+      setReloadMsg(data && data.error || "unknown error");
+      setReloadState("error");
+    }).catch((err) => {
+      setReloadMsg(err && err.message || String(err));
+      setReloadState("error");
+    });
+  }
+  function handleCheckSeams(full) {
+    if (seamsState === "pending") return;
+    setSeamsState("pending");
+    setSeamsFull(!!full);
+    setSeamsTally("");
+    setSeamsStarted(Date.now());
+    setSeamsNow(Date.now());
+    if (full) setSeamsOutput("running the seam tests on the server\u2026 (about 3 minutes - the timer next to the buttons shows it is alive)");
+    checkSeams(full).then((data) => {
+      if (!data || data.error) {
+        setSeamsOutput(data && data.error || "no answer");
+        setSeamsTally("");
+        setSeamsState("error");
+        return;
+      }
+      setSeamsOutput(data.text || "");
+      setSeamsTally(seamsTallyText(data.tally));
+      setSeamsState(data.ok ? "done" : "error");
+    }).catch((err) => {
+      setSeamsOutput(err && err.message || String(err));
+      setSeamsTally("");
+      setSeamsState("error");
+    });
+  }
+  const head = jsxs33("div", {
+    className: "flex items-center justify-between gap-2 px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0",
+    style: { fontSize: "0.55rem" },
+    children: [
+      jsx34("span", { className: "text-(--ui-text-quaternary)", style: SELECTABLE, children: "tool settings need a new agent session to apply \u2014 compaction settings (ours) may apply live" }),
+      jsxs33("div", { className: "flex items-center gap-2 shrink-0", children: [
+        saveState === "saved" ? jsx34("span", { className: "text-(--dt-primary)", style: SELECTABLE, children: "saved" }) : null,
+        saveState === "error" ? jsx34("span", { style: Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE), children: "save failed: " + errorMsg }) : null
+      ] })
+    ]
+  });
+  const disabledZone = zone([
+    sectionHead("Disabled Hermes tools", "zone-disabled", zoneHelp.disabled, openInfo, setOpenInfo),
+    // minmax(170px, 1fr) + auto-fill: a column NEVER shrinks below 170px (truncation still
+    // kicks in if it somehow had to), but extra panel width is now shared out evenly across
+    // every existing column instead of being wasted — the earlier "compress unevenly" bug was
+    // actually the missing name-truncation fix (now in InfoLabel), not this stretch by itself:
+    // auto-fill keeps one shared track size for the whole grid, not a per-row thing.
+    jsx34("div", {
+      className: "grid",
+      style: { gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))" },
+      children: Object.keys(disabledHelp).map((name) => disableRow(name, disabledHelp[name], !!disabled[name], (v) => setDisabledOne(name, v), openInfo, setOpenInfo))
+    })
+  ]);
+  const showParams = tableWidth >= COL_PX.tool + COL_PX.params + COL_PX.enabled;
+  const showPath = tableWidth >= COL_PX.tool + COL_PX.params + COL_PX.enabled + COL_PX.path;
+  const gridCols = [COL_PX.tool + "px"];
+  if (showParams) gridCols.push(COL_PX.params + "px");
+  gridCols.push(COL_PX.enabled + "px");
+  if (showPath) gridCols.push(COL_PX.path + "px");
+  const headerCell = (text, center) => jsx34("div", {
+    className: "text-[0.6rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary) opacity-50 px-1 pb-0.5" + (center ? " text-center" : ""),
+    style: SELECTABLE,
+    children: text
+  });
+  const slotsZone = zone([
+    sectionHead("Our tools", "zone-slots", "", openInfo, setOpenInfo),
+    // No alignItems override: grid's default `stretch` makes every cell in a row match the
+    // tallest one (Params, when it stacks several controls) — needed so hover paints one even
+    // rectangle instead of a staircase.
+    jsx34("div", { ref: tableRef, className: "grid", style: { gridTemplateColumns: gridCols.join(" "), rowGap: 0 }, children: [
+      headerCell("Tool Name"),
+      showParams ? headerCell("Params") : null,
+      headerCell("Enable", true),
+      showPath ? headerCell("Path") : null,
+      ...Object.keys(slots).flatMap((key) => toolTableRow(key, Object.assign({}, slots[key], { openInfo, setOpenInfo }), (patch) => setSlot(key, patch), showParams, showPath, hoverKey, setHoverKey))
+    ].filter(Boolean) })
+  ]);
+  const auxZone = zone([
+    sectionHead("Aux model \u2014 compression (not wired)", "zone-aux", "", openInfo, setOpenInfo),
+    jsx34("div", { className: "px-1 pb-0.5", children: textInput(auxModel, (e) => setAuxModel(e.currentTarget.value), "(empty \u2014 falls back to their default)") })
+  ]);
+  const compactionZone = zone([
+    sectionHead("Compaction", "zone-compaction", "", openInfo, setOpenInfo),
+    jsx34("div", { className: "px-1 pb-0.5", children: jsxs33("label", { className: "inline-flex items-center gap-2 cursor-pointer text-[10px]", children: [
+      jsx34("input", { type: "checkbox", checked: ctxEnabled, onChange: (e) => setCtxEnabled(e.currentTarget.checked), style: CHECKBOX_STYLE }),
+      jsx34("span", { style: SELECTABLE, children: "context_ctl.enabled \u2014 our context engine kill switch" })
+    ] }) }),
+    // Числа и выключатель компакции (Plan16-Task03; автомат и ход прогона — 2026-09-30) — одной
+    // СЕТКОЙ в четыре колонки «подпись · поле», мелко (владелец: «раскидано хрен пойми как»).
+    // Сохраняются общей кнопкой Save выше, не своей.
+    jsx34("div", {
+      className: "px-1 pb-0.5 grid items-center text-[10px]",
+      style: {
+        gridTemplateColumns: "repeat(4, max-content 2.5rem)",
+        columnGap: "0.4rem",
+        rowGap: "0.25rem",
+        justifyContent: "start"
+      },
+      children: [
+        compactCell(
+          "head keep",
+          "compact_head_keep \u2014 messages at the start never pre-ticked",
+          smallNumberField(compactHeadKeep, (e) => setCompactHeadKeep(e.currentTarget.value))
+        ),
+        compactCell(
+          "auto %",
+          "compact_auto_percent \u2014 context fill at which the automaton compacts",
+          smallNumberField(compactAutoPercent, (e) => setCompactAutoPercent(e.currentTarget.value))
+        ),
+        compactCell(
+          "cut %",
+          "compact_cut_percent \u2014 OUR share of the middle to pre-tick",
+          smallNumberField(compactCutPercent, (e) => setCompactCutPercent(e.currentTarget.value))
+        ),
+        compactCell(
+          "tail keep",
+          "compact_tail_keep \u2014 messages at the end never pre-ticked",
+          smallNumberField(compactTailKeep, (e) => setCompactTailKeep(e.currentTarget.value))
+        ),
+        compactCell(
+          "auto on",
+          'compact_auto_enabled \u2014 the automaton compacts at "auto %"; off = the decision is only shown',
+          jsx34("input", {
+            type: "checkbox",
+            checked: compactAutoOn,
+            onChange: (e) => setCompactAutoOn(e.currentTarget.checked),
+            style: Object.assign({}, CHECKBOX_STYLE, { width: "12px", height: "12px", cursor: "pointer" })
+          })
+        ),
+        compactCell(
+          "pause min",
+          "compact_auto_pause_minutes \u2014 after two automaton failures in a row, no new attempt for this long",
+          smallNumberField(compactPauseMin, (e) => setCompactPauseMin(e.currentTarget.value))
+        ),
+        compactCell(
+          "silence min",
+          "compact_silence_minutes \u2014 no step of a running compaction this long: the progress line turns yellow (the run is not killed)",
+          smallNumberField(compactSilenceMin, (e) => setCompactSilenceMin(e.currentTarget.value))
+        ),
+        compactCell(
+          "wait turn min",
+          "compact_wait_turn_minutes \u2014 manual compaction done while a turn runs waits this long for the turn to end, then writes; 0 = do not wait",
+          smallNumberField(compactWaitTurnMin, (e) => setCompactWaitTurnMin(e.currentTarget.value))
+        )
+      ].flat()
+    }),
+    // Предупреждение про направление третьего числа (владелец, 2026-09-22) — ставится тут же,
+    // рядом с полем, а не только в комментарии кода: экран этот числа и меняет.
+    jsx34("div", {
+      className: "px-1 pb-0.5 text-[0.6rem] text-(--ui-text-quaternary)",
+      style: SELECTABLE,
+      children: '"cut %" is OUR share to cut \u2014 not their "shrink to" target. Same shape of number, opposite meaning.'
+    })
+  ]);
+  const referenceZone = zone([
+    sectionHead("Reference (read-only, from their config)", "zone-reference", "", openInfo, setOpenInfo),
+    jsx34("div", { className: "px-1 pb-0.5 flex flex-col text-[10px]", children: [
+      ["auxiliary.compression.provider", "auto"],
+      ["auxiliary.compression.model", "(not set)"],
+      ["auxiliary.compression.timeout", "60000"]
+    ].map(([k2, v]) => jsxs33("div", { style: SELECTABLE, children: [k2 + ": ", jsx34("span", { className: "text-(--ui-text-quaternary)", children: v })] }, k2)) })
+  ]);
+  const dataZone = zone([
+    sectionHead("Paths", "zone-data", "", openInfo, setOpenInfo),
+    // Только чтение: дом плагина и файл, куда Save пишет ваши настройки (умолчания — plugin.yaml).
+    jsxs33("div", { className: "px-1 pb-0.5 grid gap-x-2 text-[10px]", style: { gridTemplateColumns: "max-content 1fr" }, children: [
+      jsx34("span", { className: "text-(--ui-text-quaternary)", style: SELECTABLE, children: "data root" }),
+      jsx34("span", { className: "font-mono break-all", style: SELECTABLE, children: dataRoot || "\u2014" }),
+      jsx34("span", { className: "text-(--ui-text-quaternary)", style: SELECTABLE, children: "your settings" }),
+      jsx34("span", { className: "font-mono break-all", style: SELECTABLE, children: settingsFile || "\u2014" })
+    ] }),
+    // НАСТОЯЩАЯ настройка, в отличие от строки выше: едет в `plugin.yaml` и обратно. Само
+    // сохранение сообщений ещё не написано (`Vision09`) — ключ заведён заранее, чтобы путь
+    // выбирался один раз и на виду, а не изобретался первым кодом, которому он понадобится.
+    jsx34("div", {
+      className: "px-1 pb-0.5 text-[0.6rem] text-(--ui-text-quaternary)",
+      style: SELECTABLE,
+      children: "export root \u2014 where messages and sessions are saved as .md (empty = plugin home)"
+    }),
+    // Подсказка косыми ВПЕРЁД, хотя система Windows: обратный слэш в конце строкового
+    // литерала экранирует закрывающую кавычку, и это уже стоило одной сломанной сборки.
+    // Путь всё равно разбирает `pathlib`, которому направление косой безразлично.
+    jsx34("div", { className: "px-1 pb-0.5", children: textInput(exportRoot, (e) => setExportRoot(e.currentTarget.value), "<hermes home>/filetools/export/", "w-full font-mono") })
+  ]);
+  const seamsZone = zone([
+    sectionHead("Check Seams", "zone-seams", "", openInfo, setOpenInfo),
+    // Строка из двух колонок (владелец): [Check] [вердикт], под ней — поле отчёта во всю ширину.
+    jsxs33("div", { className: "px-1 pb-0.5 flex flex-col gap-1", children: [
+      jsxs33("div", { className: "grid gap-2 items-center", style: { gridTemplateColumns: "max-content 1fr" }, children: [
+        jsxs33("div", { className: "flex items-center gap-1", children: [
+          actionButton(seamsState === "pending" && !seamsFull ? "Checking\u2026" : "Check", () => handleCheckSeams(false)),
+          actionButton(seamsState === "pending" && seamsFull ? "Running tests\u2026" : "Full check", () => handleCheckSeams(true))
+        ] }),
+        jsx34("span", {
+          className: "font-medium text-[10px]" + (seamsState === "error" ? "" : " text-(--dt-primary)"),
+          style: seamsState === "error" ? Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE) : SELECTABLE,
+          children: seamsState === "pending" && seamsFull ? "running\u2026 " + seamsElapsedText(seamsNow - seamsStarted) : seamsTally
+        })
+      ] }),
+      textArea(seamsOutput, seamsState === "idle" ? 2 : 28, true)
+    ] })
+  ]);
+  const reloadZone = jsx34("div", { className: "shrink-0 px-1 py-1 flex items-center gap-2 border-t border-(--ui-stroke-quaternary)", children: [
+    actionButton(saveState === "saving" ? "Saving\u2026" : "Save", handleSave),
+    actionButton(reloadState === "pending" ? "Reloading\u2026" : "\u21BB Reload plugin", handleReload),
+    reloadState === "done" ? jsx34("span", { className: "text-(--dt-primary) text-xs", style: SELECTABLE, children: "reloaded" }) : null,
+    reloadState === "error" ? jsx34("span", { className: "text-xs", style: Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE), children: "reload failed: " + reloadMsg }) : null
+  ] });
+  return jsxs33("div", {
+    className: "flex flex-col h-full w-full overflow-hidden",
+    style: CAPPED,
+    children: [
+      head,
+      jsx34("div", {
+        className: "flex-1 overflow-y-auto py-0.5 px-1",
+        // Порядок (владелец, 2026-09-30): рабочие зоны сверху, справка ниже,
+        // неподключённое (Aux model) — в самом низу.
+        children: [
+          disabledZone,
+          slotsZone,
+          compactionZone,
+          seamsZone,
+          referenceZone,
+          dataZone,
+          auxZone
+        ]
+      }),
+      reloadZone
+    ]
+  });
+}
+
+// desktop/src/file-ops-strip.js
+import { jsx as jsx35, jsxs as jsxs34 } from "react/jsx-runtime";
+var STRIP_BTN = "px-2 py-0.5 rounded-full text-[0.7rem] font-medium cursor-pointer select-none transition-colors duration-150 ease-out hover:bg-(--ui-bg-tertiary) active:scale-95";
+var STRIP_EDGE = { borderBottom: "2px solid var(--ui-stroke-secondary)" };
+var ACTIONS = Object.keys(CONTEXT_ACTIONS).map((key) => CONTEXT_ACTIONS[key]);
+function StripHandle({ open }) {
+  return jsx35("button", {
+    // stopPropagation: на document висит снятие режима (см. FileOpsPane), и без этого свой же
+    // клик по треугольнику схлопывал бы то, что им только что открыли.
+    onClick: (e) => {
+      e.stopPropagation();
+      setStripOpen(!open);
+    },
+    className: "cursor-pointer select-none shrink-0",
+    style: {
+      border: "none",
+      background: "transparent",
+      padding: "0 2px",
+      lineHeight: 1,
+      // Вдвое крупнее прежнего: 0.55rem был меньше подписи рядом и требовал прицеливания.
+      fontSize: "1.1rem",
+      color: "var(--ui-text-quaternary)"
+    },
+    title: open ? "collapse context actions" : "context actions",
+    children: open ? "\u25BE" : "\u25B8"
+  });
+}
+function ActionButton({ action, drop }) {
+  const armed = drop.mode && drop.action === action.mode;
+  const picked = Object.keys(drop.picked || {}).length;
+  return jsx35("button", {
+    onClick: (e) => {
+      e.stopPropagation();
+      if (drop.busy) return;
+      if (!armed) setDropMode(true, action.mode);
+      else applyDrop();
+    },
+    className: STRIP_BTN,
+    disabled: !!drop.busy,
+    style: {
+      border: `1px solid ${armed ? "var(--ui-red)" : "var(--ui-stroke-secondary)"}`,
+      background: armed ? "color-mix(in srgb, var(--ui-red) 14%, transparent)" : "transparent",
+      userSelect: "none",
+      color: armed ? "var(--ui-red)" : "var(--ui-text-secondary)",
+      opacity: drop.busy ? 0.5 : 1,
+      whiteSpace: "nowrap"
+    },
+    title: armed ? `apply "${action.label}" to the ${picked} ticked operation(s) \u2014 IRREVERSIBLE. Click anywhere else to cancel` : `arm "${action.label}": tick the operations it should apply to`,
+    children: action.label
+  });
+}
+function DropStrip({ bricks, drop }) {
+  if (!drop.open) {
+    return jsxs34("div", {
+      className: "flex items-center gap-1 px-2 py-0.5 shrink-0",
+      style: Object.assign({ fontSize: "0.55rem" }, STRIP_EDGE),
+      children: [
+        jsx35(StripHandle, { open: false }),
+        // Исход последнего применения виден и в свёрнутой полосе: правка необратима, и
+        // сообщение о ней не должно исчезать из-за того, что полосу закрыли.
+        drop.note ? jsx35("span", {
+          className: "truncate",
+          title: drop.note,
+          style: {
+            minWidth: 0,
+            color: drop.ok === true ? "var(--ui-green)" : drop.ok === false ? "var(--ui-red)" : "var(--ui-text-quaternary)"
+          },
+          children: drop.note
+        }) : null
+      ]
+    });
+  }
+  const picked = Object.keys(drop.picked || {});
+  const chosen = new Set(picked);
+  let tokens = 0;
+  let exact = true;
+  for (const b of bricks) {
+    const op = b && b.meta && typeof b.meta.op === "string" ? b.meta.op : null;
+    if (!op || !chosen.has(op)) continue;
+    const w = opTokens(b);
+    tokens += w.tokens;
+    if (!w.exact) exact = false;
+  }
+  const children = [jsx35(StripHandle, { open: true })];
+  ACTIONS.forEach((action) => {
+    children.push(jsx35(ActionButton, { key: action.mode, action, drop }));
+  });
+  if (drop.mode) {
+    children.push(jsx35("span", {
+      style: { color: "var(--ui-text-quaternary)" },
+      children: drop.busy ? "applying\u2026" : picked.length ? `${picked.length} ops \xB7 ${exact ? "" : "~"}${tokensLabel(tokens)} tk` : "tick operations in the card drawers"
+    }));
+  }
+  children.push(jsx35("div", { className: "flex-1 min-w-0" }));
+  if (drop.note) {
+    children.push(jsx35("span", {
+      className: "truncate",
+      title: drop.note,
+      style: {
+        minWidth: 0,
+        maxWidth: "60%",
+        color: drop.ok === true ? "var(--ui-green)" : drop.ok === false ? "var(--ui-red)" : "var(--ui-text-quaternary)"
+      },
+      children: drop.note
+    }));
+  }
+  return jsxs34("div", {
+    className: "flex items-center gap-2 px-2 py-1 shrink-0",
+    style: Object.assign({ fontSize: "0.55rem" }, STRIP_EDGE),
+    children
+  });
+}
+var FILTER_LABEL = "show erased";
+function FilterBar({ showErased, hidden }) {
+  return jsxs34("div", {
+    className: "flex items-center gap-2 px-2 py-1 shrink-0 border-t border-(--ui-stroke-secondary)",
+    style: { fontSize: "0.55rem" },
+    children: [
+      jsxs34("label", {
+        className: "inline-flex items-center gap-1 cursor-pointer select-none",
+        // Клик не всплывает: выше на document висят снятие режима выбора и снятие затенения.
+        onClick: (e) => {
+          e.stopPropagation();
+        },
+        title: "show operations that were erased from the context",
+        children: [
+          jsx35("input", {
+            type: "checkbox",
+            checked: !!showErased,
+            onChange: (e) => setShowErased(e && e.target ? e.target.checked : !showErased),
+            style: { accentColor: "var(--dt-primary)", width: "10px", height: "10px" }
+          }),
+          jsx35("span", { style: { color: "var(--ui-text-secondary)" }, children: FILTER_LABEL })
+        ]
+      }),
+      // Сколько спрятано. Молчаливое сокрытие — ложь того же рода, что молчаливое удаление:
+      // без этого числа человек не поймёт, влияет ли фильтр на что-нибудь вообще.
+      hidden > 0 && !showErased ? jsx35("span", {
+        style: { color: "var(--ui-text-quaternary)" },
+        children: `${hidden} hidden`
+      }) : null
+    ]
+  });
+}
+
+// desktop/src/file-ops-pane.js
+var USE_CARD_V2 = true;
+var TAIL_SPACE2 = "40%";
+function renderCard(brick, key, toolColumnWidth, onSelectOp, stale, drop, onPick) {
+  if (!USE_CARD_V2) return jsx36(Brick, { key, brick });
+  const opId0 = brick.meta && typeof brick.meta.op === "string" ? brick.meta.op : null;
+  const props = brickToCardProps(brick, toolColumnWidth, opId0 && stale ? stale[opId0] : void 0, drop, onPick);
+  const opId = opId0;
+  if (opId && onSelectOp) props.headerProps.onSelectOp = () => onSelectOp(opId);
+  return jsx36("div", {
+    key,
+    className: "mb-1 animate-appear-once",
+    style: CAPPED,
+    children: jsx36(OperationCard, props)
+  });
+}
+function FileOpsPaneImpl() {
+  const view = useView();
+  const fileContext = useFileContext();
+  const drop = useDrop();
+  const scrollerRef = useRef9(null);
+  const shownSessionRef = useRef9(null);
+  const shownListRef = useRef9("");
+  const [version, setVersion] = useState15("");
+  useEffect8(() => {
+    let dead = false;
+    loadConfig().then((data) => {
+      if (!dead && data && !data.error) setVersion(String(data.version || ""));
+    }).catch(() => {
+    });
+    return () => {
+      dead = true;
+    };
+  }, []);
+  const [viewport, setViewport] = useState15({ top: 0, height: 600 });
+  const bricksForWindowRef = useRef9([]);
+  const winBoundsRef = useRef9({ start: 0, end: 0 });
+  const scrollRaf = useRef9(null);
+  const onScroll = () => {
+    if (scrollRaf.current) return;
+    scrollRaf.current = requestAnimationFrame(() => {
+      scrollRaf.current = null;
+      const el = scrollerRef.current;
+      if (!el) return;
+      const probe = renderWindow(bricksForWindowRef.current, el.scrollTop, el.clientHeight);
+      if (probe.start === winBoundsRef.current.start && probe.end === winBoundsRef.current.end) return;
+      setViewport({ top: el.scrollTop, height: el.clientHeight });
+    });
+  };
+  useLayoutEffect6(() => {
+    const el = scrollerRef.current;
+    if (el) setViewport({ top: el.scrollTop, height: el.clientHeight });
+  }, []);
+  function selectOp(opId) {
+    $fileContext.set(Object.assign({}, fileContext, {
+      selectedOp: fileContext.selectedOp === opId ? null : opId
+    }));
+  }
+  useEffect8(() => {
+    if (!fileContext.selectedOp) return;
+    const clear = () => {
+      const cur = $fileContext.get() || {};
+      $fileContext.set(Object.assign({}, cur, { selectedOp: null }));
+    };
+    document.addEventListener("click", clear);
+    return () => document.removeEventListener("click", clear);
+  }, [fileContext.selectedOp]);
+  useEffect8(() => {
+    if (!drop.mode) return;
+    const clear = () => setDropMode(false);
+    document.addEventListener("click", clear);
+    return () => document.removeEventListener("click", clear);
+  }, [drop.mode]);
+  useLayoutEffect6(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const last = view.bricks[view.bricks.length - 1];
+    const signature = `${view.bricks.length}:${last && (last.tool_id || last.ts) || ""}`;
+    const listChanged = shownListRef.current !== signature;
+    shownListRef.current = signature;
+    const switched = shownSessionRef.current !== view.sessionId;
+    shownSessionRef.current = view.sessionId;
+    if (!switched && !listChanged) return;
+    const fromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (switched || fromBottom <= el.clientHeight) el.scrollTop = el.scrollHeight;
+    if (switched) {
+      setViewport({ top: el.scrollTop, height: el.clientHeight });
+    }
+  });
+  const ctxView = useMemo3(
+    () => buildContextView(liveContextOps(fileContext.ops)),
+    [fileContext.ops]
+  );
+  const mode = view.mode || "mirror";
+  const mirrorOn = mode === "mirror";
+  const paletteOn = mode === "palette";
+  const configOn = mode === "config";
+  function modeBtn(label, key, on, muted) {
+    return jsx36("button", {
+      onClick: () => {
+        $view.set(Object.assign({}, view, { mode: key }));
+      },
+      className: "px-2 py-0.5 rounded-full text-[0.55rem] font-medium cursor-pointer select-none transition-colors duration-150 ease-out hover:bg-(--ui-bg-tertiary) active:scale-95",
+      // `nowrap` (владелец, 2026-09-29): без него при сужении панели «◉ Operations» ломалось
+      // на две строки, и вся шапка становилась двухстрочной. Сжимается название слева.
+      style: Object.assign(
+        { border: "1px solid var(--ui-stroke-secondary)", userSelect: "none", whiteSpace: "nowrap" },
+        muted ? { color: "var(--ui-text-quaternary)" } : {}
+      ),
+      children: label
+    }, key);
+  }
+  function brandLabel() {
+    return jsxs35("span", { className: "flex items-baseline gap-1 min-w-0", children: [
+      jsx36("span", {
+        className: "font-semibold text-[color:hsl(var(--primary))] truncate",
+        title: "hermes-filetools plugin",
+        children: "File Ops"
+      }),
+      jsx36("span", {
+        className: "text-(--ui-text-quaternary) shrink-0",
+        style: { fontSize: "0.55rem" },
+        title: version ? "plugin version (both halves ship from one manifest)" : "version unknown \u2014 /config did not answer",
+        children: version ? `v${version}` : "v\u2014"
+      })
+    ] }, "brand");
+  }
+  function modeBtns() {
+    return jsxs35("div", { className: "flex items-center gap-1 shrink-0", children: [
+      modeBtn((mirrorOn ? "\u25C9" : "\u25CB") + " Mirror", "mirror", mirrorOn),
+      modeBtn((configOn ? "\u25C9" : "\u25CB") + " Config", "config", configOn),
+      // Operations — за Config и приглушённым текстом (владелец, 2026-09-30).
+      modeBtn((mode === "operations" ? "\u25C9" : "\u25CB") + " Operations", "operations", mode === "operations", true),
+      // Palette последней — инструмент разработки, временный (см. adapter.js: "плагин при запуске
+      // должен показывать то, ради чего он существует", не палитру).
+      modeBtn((paletteOn ? "\u25C9" : "\u25CB") + " Palette", "palette", paletteOn)
+    ] }, "modes");
+  }
+  if (mirrorOn) {
+    return jsxs35("div", {
+      className: "flex flex-col h-full w-full overflow-hidden bg-background",
+      style: CAPPED,
+      children: [
+        jsxs35("div", {
+          className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
+          style: { fontSize: "0.6rem", userSelect: "none" },
+          children: [
+            brandLabel(),
+            modeBtns()
+          ]
+        }),
+        // Зеркало в своей ячейке `flex-1`: его корень `h-full`, и без обёртки он вытеснил бы
+        // мини-панель токенов под край.
+        jsx36("div", { className: "flex-1 min-h-0", children: jsx36(PromptMirror, {}) }),
+        jsx36(TokenStrip, {})
+      ]
+    });
+  }
+  if (paletteOn) {
+    return jsxs35("div", {
+      className: "flex flex-col h-full w-full overflow-hidden bg-background",
+      style: CAPPED,
+      children: [
+        jsxs35("div", {
+          className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
+          style: { fontSize: "0.6rem", userSelect: "none" },
+          children: [
+            brandLabel(),
+            modeBtns()
+          ]
+        }),
+        jsx36(PalettePane, {})
+      ]
+    });
+  }
+  if (configOn) {
+    return jsxs35("div", {
+      className: "flex flex-col h-full w-full overflow-hidden bg-background",
+      style: CAPPED,
+      children: [
+        jsxs35("div", {
+          className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
+          style: { fontSize: "0.6rem", userSelect: "none" },
+          children: [
+            brandLabel(),
+            modeBtns()
+          ]
+        }),
+        jsx36(ConfigPane, {})
+      ]
+    });
+  }
+  if (!hasEvents()) {
+    return jsxs35("div", {
+      className: "flex flex-col h-full w-full overflow-hidden bg-background",
+      style: CAPPED,
+      children: [
+        jsx36("div", {
+          className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
+          style: { fontSize: "0.6rem", userSelect: "none" },
+          children: [brandLabel(), modeBtns()]
+        }),
+        sdkC(sdk8.EmptyState, "div", { title: "No tool events", description: "This Hermes build does not emit tool events, so no operations can appear here." })
+      ]
+    });
+  }
+  if (!view.sessionId) {
+    return jsxs35("div", {
+      className: "flex flex-col h-full w-full overflow-hidden bg-background",
+      style: CAPPED,
+      children: [
+        jsx36("div", {
+          className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
+          style: { fontSize: "0.6rem", userSelect: "none" },
+          children: [brandLabel(), modeBtns()]
+        }),
+        sdkC(sdk8.EmptyState, "div", { title: "No active chat", description: "Open a chat \u2014 operations appear as the file tools run." })
+      ]
+    });
+  }
+  if (view.bricks.length === 0) {
+    return jsxs35("div", {
+      className: "flex flex-col h-full w-full overflow-hidden bg-background",
+      style: CAPPED,
+      children: [
+        jsx36("div", {
+          className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
+          style: { fontSize: "0.6rem", userSelect: "none" },
+          children: [brandLabel(), modeBtns()]
+        }),
+        sdkC(sdk8.EmptyState, "div", {
+          title: "No operations yet",
+          description: view.note ? view.note : `Session ${view.sessionId}. Operations appear on read_file / write_file / patch / search_files calls.`
+        })
+      ]
+    });
+  }
+  const shown = visibleBricks(view.bricks, view.showErased);
+  const toolCol = toolColWidth(shown.bricks.map((b) => b.tool));
+  const win = renderWindow(shown.bricks, viewport.top, viewport.height);
+  bricksForWindowRef.current = shown.bricks;
+  winBoundsRef.current = { start: win.start, end: win.end };
+  const rows = [];
+  for (let i = win.start; i < win.end; i++) {
+    const b = shown.bricks[i];
+    if (b.note) {
+      rows.push(jsx36("div", {
+        key: `note-${b.tool_id || i}`,
+        // Появляется вместе со своей карточкой — той же анимацией, иначе подпись выскакивала бы
+        // мгновенно, а операция под ней всплывала следом.
+        //
+        // ПЕРЕНОС, а не truncate. `truncate` — это white-space:nowrap, то есть max-content ширина
+        // подписи = вся строка целиком (до CAPTION_MAX_CHARS=180). Список лежит внутри SDK
+        // ScrollArea, который сайзится ПО СОДЕРЖИМОМУ, — и эта одна длинная строка задавала ширину
+        // всему списку. Карточки, честно занимая 100%, растягивались вместе с ней и уезжали под
+        // правый срез панели. Ширину диктовать должна панель, а не текст модели.
+        className: "px-1 pt-2 pb-1 text-(--ui-text-secondary) animate-appear-once",
+        style: Object.assign({ fontSize: "0.7rem", whiteSpace: "normal", overflowWrap: "anywhere" }, CAPPED, SELECTABLE),
+        title: b.note,
+        children: b.note
+      }));
+    }
+    rows.push(renderCard(
+      b,
+      b.tool_id || `${b.ts}-${i}`,
+      toolCol,
+      selectOp,
+      ctxView.stale,
+      drop,
+      toggleDropPick
+    ));
+  }
+  if (view.note && win.start === 0) {
+    rows.unshift(jsx36("div", {
+      key: "route-note",
+      // Тоже с переносом, по той же причине — см. подпись операции выше.
+      className: "px-1 pb-1 text-(--ui-text-quaternary)",
+      style: Object.assign({ fontSize: "0.65rem", whiteSpace: "normal", overflowWrap: "anywhere" }, CAPPED, SELECTABLE),
+      title: view.note,
+      children: view.note
+    }));
+  }
+  const list = jsxs35("div", {
+    className: "flex flex-col items-stretch p-2 gap-0",
+    style: CAPPED,
+    children: rows
+  });
+  return jsxs35("div", {
+    className: "flex flex-col h-full w-full overflow-hidden bg-background",
+    style: CAPPED,
+    children: [
+      jsxs35("div", {
+        className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
+        style: { fontSize: "0.6rem", userSelect: "none" },
+        children: [
+          brandLabel(),
+          jsxs35("div", { className: "flex items-center gap-1.5 shrink-0", children: [
+            jsx36("span", { className: "text-(--ui-text-quaternary)", children: view.bricks.length + " ops" }),
+            modeBtns()
+          ] })
+        ]
+      }),
+      // Файловая субпанель (Plan12) — делит стакан операций, между заголовком и скроллером.
+      // `ops` сейчас всегда [] (см. adapter.js::$fileContext) — вебсокет-подписка на
+      // /context-state ещё не подключена (Plan11-Task06/07, отдельный шов, не мой). Панель
+      // существует и корректно рисует «данных нет», не выдаёт ложную картину.
+      jsx36(FileContextPanel, { view: ctxView, selectedOp: fileContext.selectedOp }),
+      // Полоса работы с контекстом — на одном уровне с файловой субпанелью, над стаканом.
+      jsx36(DropStrip, { bricks: view.bricks, drop }),
+      // СВОЙ скроллер, а НЕ sdk.ScrollArea — и это не вкусовщина. SDK-шный ScrollArea (Radix)
+      // оборачивает содержимое во внутренний контейнер с `display: table`, а таблица сайзится ПО
+      // СОДЕРЖИМОМУ. Этот контейнер не наш: ни className, ни style до него не доходят, поэтому
+      // цепочка width:100% обрывается там, сколько её ни прижимай снизу — карточки растягивались
+      // под самую длинную строку подписи модели и уезжали под правый срез панели (проверено
+      // ядерно-зелёным маркером: корень панели ширину имеет, разъезжается именно внутри).
+      // Обычный div с overflowY:auto полностью под нашим контролем; overflowX:hidden — гарантия,
+      // что горизонтали здесь не будет вообще: она живёт ВНУТРИ тела карточки (BodyPreview), где
+      // ей и место.
+      //
+      // `contain:'paint'` (гейт GPU-нагрузки, 2026-09-14) — изолирует перерисовку списка карточек
+      // от остального окна: без этого браузер перекомпоновывал наш неизменный список каждый раз,
+      // когда где-то ЕЩЁ на экране идёт анимация (индикатор набора в чате), хотя у нас самих
+      // ничего не менялось (подтверждено счётчиком рендеров — он стоял на месте). Именно поэтому
+      // тултипы карточек (`operation-card.js::HoverTip`) больше НЕ рисуют fixed-блок локально —
+      // contain делает этот div новым containing block для fixed-потомков, и локальный тултип
+      // улетел бы в его координаты вместо окна. `GlobalHoverTip` ниже — СНАРУЖИ этого div нарочно.
+      // Шире хит-зона скроллбара (владелец, 2026-09-15): у главного окна хоста есть своя полоса
+      // ресайза у самого края — она нам не подчиняется, только у неё же под мышкой. Chromium
+      // ловит клик/протаскивание в пределах ВСЕЙ рамки `::-webkit-scrollbar-thumb`, включая
+      // `border` — прозрачная рамка тут даёт бегунку узкий вид, но широкую (влево от него) зону
+      // попадания, не трогая при этом положение самого правого края контента.
+      // `.animate-appear-once` — REAL rule, not borrowed (owner, 2026-09-15): this class is used
+      // on every card (`renderCard` below) and the model's note caption, but its only CSS
+      // definition anywhere in the app lived inside the Palette demo page's own local `<style>`
+      // (`palette/loaders.js`, "#G1 Animation test") - not mounted during normal use, so cards
+      // have been appearing with NO animation at all in real usage, silently, since the day this
+      // className was added. Defined here instead, where it actually needs to work: `FileOpsPane`
+      // is mounted for the plugin's whole lifetime, so this rule is always present. Same
+      // keyframe/timing as the demo (`both` keeps the end state after the animation finishes;
+      // plays once on mount, not `infinite` - re-triggers per card because each card's `key` is
+      // its stable `tool_id`, so the DOM node the animation is attached to genuinely is a new
+      // mount, not a re-render of an old one).
+      jsx36("style", { children: `
+        @keyframes appear-once {
+          from { opacity: 0; transform: translateY(4px) scale(0.98); }
+          to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        .animate-appear-once {
+          animation: appear-once 220ms ease-out both;
+          will-change: opacity, transform;
+        }
+        .fops-scroll::-webkit-scrollbar { width: 14px; }
+        .fops-scroll::-webkit-scrollbar-track { background: transparent; }
+        .fops-scroll::-webkit-scrollbar-thumb {
+          background-color: var(--ui-stroke-secondary);
+          border-radius: 6px;
+          border-style: solid;
+          border-color: transparent;
+          border-width: 6px 6px 6px 0px;
+          background-clip: padding-box;
+        }
+        .fops-scroll::-webkit-scrollbar-thumb:hover { background-color: var(--ui-stroke-primary); }
+      ` }),
+      jsxs35("div", {
+        ref: scrollerRef,
+        className: "h-full w-full fops-scroll",
+        // `overflowAnchor:'none'` (2026-09-14, найдено по трейсу) — гасит браузерный scroll
+        // anchoring. Без него: высота распорок — ОЦЕНКА (ROW_PX), реальная высота карточки чуть
+        // отличается, якорь сам подправляет scrollTop компенсируя разницу, это стреляет 'scroll',
+        // наш onScroll пересчитывает окно, граница окна сдвигается на бричик — снова маленькое
+        // расхождение оценка/реальность — снова якорь. Цикл длиной в кадр, сам не останавливается
+        // (пойман в Performance-трейсе: RequestAnimationFrame из onScroll ровно раз в 33мс, без
+        // единого разрыва, 3+ секунды подряд). У нас уже есть СВОЙ явный «прокрутка к хвосту»
+        // (useLayoutEffect ниже) — эвристика браузера тут не нужна и только мешает.
+        // A/B 2026-09-14 (владелец сняла contain на живых данных): рост нагрузки НЕ исчез без
+        // contain — тот же порядок Layerize-стоимости что и с ним. Значит contain не виноват,
+        // возвращён; настоящая причина — ре-рендер на каждый кадр скролла (см. onScroll выше).
+        style: Object.assign({ overflowY: "auto", overflowX: "hidden", contain: "paint", overflowAnchor: "none" }, CAPPED),
+        onScroll,
+        children: [
+          // Распорки окна рендера — ПУСТЫЕ div'ы нужной оценочной высоты, замещающие то, что не
+          // смонтировано (см. renderWindow/core.js). Высота 0 — не рендерить вовсе, лишний узел
+          // в DOM ради нуля ничего не стоит, но и не даёт ничего измерить.
+          jsx36("div", { key: "top-spacer", style: { height: win.topSpacer, pointerEvents: "none" } }),
+          list,
+          jsx36("div", { key: "bottom-spacer", style: { height: win.bottomSpacer, pointerEvents: "none" } }),
+          // Распорка — ПРЯМОЙ ребёнок скроллера, не padding у списка: процент высоты считается от
+          // родителя с определённой высотой, а у списка она auto (по содержимому) и процент бы
+          // просто схлопнулся в ноль. У скроллера высота определённая (h-full), поэтому здесь он
+          // работает. flexShrink не нужен — блочная раскладка, не флекс.
+          jsx36("div", { key: "tail-space", style: { height: TAIL_SPACE2, pointerEvents: "none" } })
+        ]
+      }),
+      jsx36(GlobalHoverTip, {}),
+      // Фильтры — ПОД скроллером, последней строкой панели: они про то, что показывать, а не
+      // про то, что делать (действия живут в полосе сверху).
+      jsx36(FilterBar, { showErased: !!view.showErased, hidden: shown.hidden })
+    ]
+  });
+}
+var FileOpsPane = memo(FileOpsPaneImpl);
+
+// desktop/src/plugin.entry.js
+import { jsx as jsx37 } from "react/jsx-runtime";
+import * as sdk9 from "@hermes/plugin-sdk";
+var plugin_entry_default = {
+  id: "hermes-filetools",
+  name: "File Tools \u2014 file operations panel",
+  description: "Live stream of read_file / write_file / patch / search_files operations.",
+  register(ctx) {
+    const adapter2 = initAdapter(ctx);
+    const a = adapter2.state && adapter2.state[STORED_SESSION_ATOM];
+    if (a && typeof a.listen === "function") {
+      const off = a.listen(() => refresh());
+      adapter2.onDispose(typeof off === "function" ? off : () => {
+      });
+    }
+    refresh();
+    if (adapter2.hasEvents) {
+      const off = sdk9.host.onEvent("tool.complete", handleToolComplete);
+      adapter2.onDispose(typeof off === "function" ? off : () => {
+      });
+      const offInterim = sdk9.host.onEvent("message.interim", handleInterim);
+      adapter2.onDispose(typeof offInterim === "function" ? offInterim : () => {
+      });
+      const offDelta = sdk9.host.onEvent("message.delta", handleDelta);
+      adapter2.onDispose(typeof offDelta === "function" ? offDelta : () => {
+      });
+      const offStart = sdk9.host.onEvent("message.start", handleTurnStart);
+      adapter2.onDispose(typeof offStart === "function" ? offStart : () => {
+      });
+      const offEnd = sdk9.host.onEvent("message.complete", handleTurnEnd);
+      adapter2.onDispose(typeof offEnd === "function" ? offEnd : () => {
+      });
+      const offStatus = sdk9.host.onEvent("status.update", handleStatusUpdate);
+      adapter2.onDispose(typeof offStatus === "function" ? offStatus : () => {
+      });
+    }
+    adapter2.onDispose(closeEventSocket);
+    adapter2.onDispose(stopRevisionPoll);
+    adapter2.onDispose(stopMirrorReload);
+    if (typeof ctx.register !== "function") {
+      console.warn("[hermes-filetools] ctx.register \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D \u2014 \u043F\u0430\u043D\u0435\u043B\u044C \u043D\u0435 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043E\u0432\u0430\u043D\u0430");
+      return;
+    }
+    ctx.register({
+      id: "pane",
+      area: "panes",
+      title: "File Ops",
+      data: {
+        placement: "main",
+        dock: { pane: "workspace", pos: "right" },
+        width: "480px",
+        minWidth: "360px",
+        collapsible: true,
+        revealAliases: ["filetools"]
+      },
+      render: () => jsx37(FileOpsPane, {})
+    });
+    refresh();
+  }
+};
+export {
+  plugin_entry_default as default
+};

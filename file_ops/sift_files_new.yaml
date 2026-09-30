@@ -1,0 +1,46 @@
+# "new" path for search_files — see __HQ/vision/Vision01__search.md for the full
+# design rationale (telemetry, comparison with Grep/Glob, param merge). Plain-text
+# response, no JSON — old path (sift_files.yaml, target/output_mode enums) stays
+# untouched.
+name: search_files
+description: >
+  Search file contents (regex) and/or filter files by name (glob) — plain text,
+  not JSON. `pattern` searches INSIDE file contents; leave it "" to just list
+  the files matching flags="--glob ..." without reading their contents.
+  "--glob" always filters by filename (fnmatch, e.g. "--glob *.py") — NOT a
+  regex, unlike `pattern`. Results are grouped by file, one match per line as
+  "N|content" with the matched line marked "→N|content" — use read_file's
+  "--line N --count N" to see more of a file found here.
+required: [path, pattern, flags]
+properties:
+  path:
+    type: string
+    description: Directory or file to search in (absolute, relative, or ~/path)
+  pattern:
+    type: string
+    description: >
+      Regex to search for inside file contents. Required — send it EMPTY
+      (nothing between the quotes of the value; not a pair of quote
+      characters) to skip content search entirely and just list files matching
+      the glob (e.g. pattern="", flags="--glob *.py" lists every .py file
+      under `path`, nothing read).
+  flags:
+    type: string
+    description: >
+      Required — send it EMPTY (nothing between the quotes of the value) when
+      no modifier is needed; do not write quote characters as the value
+      itself. Space-separated
+      modifiers written like a terminal command, values after a space and
+      never with "=": "--glob *.py --context 2". "--glob PATTERN" filters by
+      FILENAME (fnmatch, e.g. "--glob *.py", "--glob test_*") — NOT a regex,
+      unlike `pattern`; "." is a literal dot here, so "--glob .*" matches
+      only names starting with a dot (hidden files), not "everything";
+      without it every file is searched. "--context N" shows N lines around
+      each match. "--limit N"/"--offset N" page through results (limit
+      default 50) — same accounting whether the response is showing full
+      matches, "--files-only", or "--tally"; a truncated response hands you
+      the exact flags string to continue with. "--files-only" lists just the
+      files that matched, no lines. "--tally" lists just each file with its
+      match count, no lines. An unrecognised flag is refused by name, never
+      ignored. "--help" lists every flag with full descriptions instead of
+      searching anything.

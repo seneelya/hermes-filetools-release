@@ -1,0 +1,9 @@
+{
+  "name": "hermes-filetools",
+  "label": "File Tools",
+  "description": "Backend namespace for the hermes-filetools desktop panel: read ledger and past-session file operations. No dashboard UI of its own.",
+  "icon": "FileText",
+  "version": "0.1.0",
+  "tab": { "hidden": true },
+  "api": "plugin_api.py"
+}

@@ -1,0 +1,98 @@
+# terminal — override of Hermes' own built-in `terminal` tool.  This YAML is
+# OUR OWN copy of their TERMINAL_SCHEMA/TERMINAL_TOOL_DESCRIPTION
+# (tools/terminal_tool.py in hermes-agent), taken deliberately so we can
+# diverge from upstream's wording without waiting on/tracking their changes
+# (Plan03 decision, 2026-09-01). The actual command execution is NOT
+# reimplemented here — terminal_core.py calls their live terminal_tool()
+# and reformats only the returned string. Wording below is edited from
+# upstream to describe OUR plain-text output instead of their JSON.
+name: terminal
+description: >
+  Execute shell commands on a Linux environment. Filesystem, current working
+  directory, and exported environment variables persist between calls.
+  Response is plain text, not JSON — labeled lines (Exit code:, Error:, Cwd:,
+  ...) above the command's own output.
+
+
+  Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use
+  search_files), sed/awk (use patch), or echo/heredoc file creation (use
+  write_file). Reserve terminal for: builds, installs, git, processes,
+  scripts, network, package managers, and anything that needs a shell.
+  NEVER pipe a build/test command through tail/head/cat to shorten output
+  (e.g. `cargo build | tail -20`): output is auto-truncated with the full
+  text saved to a file, and the pipe makes the exit code report the LAST
+  pipeline command's status (tail's 0), masking real failures. Run the
+  command bare; the same applies to `cmd || echo failed`, which also masks
+  the exit code.
+  Environment state persists: activate a virtualenv or export variables once
+  per session, not before every command.
+
+
+  Foreground (default): returns INSTANTLY when the command finishes, even
+  with a high timeout — set timeout generously for long builds.
+  Background: set background=true (returns a session_id). Pair with
+  notify_on_complete=true for bounded tasks; leave silent only for
+  servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use
+  background=true so Hermes tracks the process. After starting a server,
+  verify readiness with a health check, then act in a separate call; no
+  blind sleep loops. Manage with process(action="poll"/"wait").
+  Working directory: use 'workdir' for per-command cwd. When a command
+  changes the session cwd (cd, pushd), the response includes a "Cwd:" line —
+  trust it instead of prefixing every command with 'cd'.
+  PTY: set pty=true for interactive CLIs (they hang without it). Pipe git
+  output to cat if it might page.
+required: [command]
+properties:
+  command:
+    type: string
+    description: The command to execute on the VM
+  background:
+    type: boolean
+    description: >
+      Run in the background, returning a session_id. Pair with
+      notify_on_complete=true for anything with a defined end (tests,
+      builds, deploys) — without it the process runs silently. Only
+      servers/watchers/daemons that never exit should stay silent. Short
+      commands: prefer foreground with a generous timeout.
+    default: false
+  timeout:
+    type: integer
+    description: >
+      Max seconds to wait (default: 180). Returns INSTANTLY when command
+      finishes — set high for long tasks, you won't wait unnecessarily.
+      Long foreground timeouts may be rejected; use background=true for
+      longer commands.
+    minimum: 1
+  workdir:
+    type: string
+    description: >
+      Working directory for this command (absolute path). Defaults to the
+      session working directory.
+  pty:
+    type: boolean
+    description: >
+      Run in pseudo-terminal (PTY) mode for interactive CLI tools like
+      Codex, Claude Code, or Python REPL. Only works with local and SSH
+      backends. Default: false.
+    default: false
+  notify_on_complete:
+    type: boolean
+    description: >
+      With background=true: get exactly one notification when the process
+      exits. The right choice for nearly every bounded long task — set it
+      and keep working. MUTUALLY EXCLUSIVE with watch_patterns
+      (watch_patterns is dropped when both are set).
+    default: false
+  watch_patterns:
+    type: array
+    items:
+      type: string
+    description: >
+      Strings to watch for in background output. ONLY for rare one-shot
+      mid-process signals on processes that never exit (e.g.
+      ["Application startup complete"] on a server). NOT for end-of-run
+      markers (use notify_on_complete) and NOT for per-iteration patterns
+      like 'ERROR' in loops — rate-limited to 1 notification/15s, capped at
+      a small number of matches over the process's lifetime; over-firing
+      auto-disables it and falls back to notify-on-exit. When in doubt, use
+      notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete.

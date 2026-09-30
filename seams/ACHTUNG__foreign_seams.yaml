@@ -1,0 +1,1101 @@
+# ==========================================================================
+#  A C H T U N G  —  every place this plugin depends on FOREIGN code
+# ==========================================================================
+# Machine-readable. Read by `check_seams.py`; the prose lives in
+# ../HowTo__Verify_after_hermes_update.md (what to do when one breaks) and
+# HowTo__Verify_before_hermes_update.md (how to check BEFORE updating).
+#
+# THE RULE THIS FILE EXISTS FOR: almost nothing here fails loudly. A dead
+# monkeypatch logs a warning and skips; a renamed contextvar just drops a
+# field; a rebuilt schema silently reaches the model instead of ours. So a
+# seam is verified by asserting it is PRESENT, never by "nothing raised".
+#
+# `baseline_count` is OCCURRENCES (str.count), NOT lines. Do not re-measure
+# it with `grep -c`, which counts matching LINES - two hits on one line make
+# the two disagree, and the first version of this file was off by one on two
+# entries for exactly that reason. Re-measure with the checker itself.
+#
+# A `baseline_count` is INFORMATION, not a verdict: they may add a use of a
+# symbol without breaking anything. The verdict comes from `min_count` (the
+# symbol still exists at all) plus, where the count cannot prove it,
+# `asserted_by` — a test of ours that checks the SHAPE. An entry with
+# `kind: test_only` has no static check by nature; the checker prints it as
+# a reminder to run that test, and that is deliberate, not a gap.
+#
+# Adding a seam: any new dependency on a name, literal or behaviour that is
+# not ours. If you cannot name what breaks, you do not understand the seam
+# yet — write that down instead of a guess.
+
+meta:
+  # Rebased after the live update landed: prod moved 6e2b8e070 -> 1021a03256
+  # (1036-commit range). Checker was green on this range with the OLD
+  # baseline already (43 OK, 2 TEST-ONLY, zero DRIFT/FAIL) - no counts moved,
+  # so no `file:`/`baseline_count` edits were needed this round. Only the
+  # architectural finding was new, and it isn't a seam: upstream added its
+  # own message-identity columns (`display_order`/`display_identity`,
+  # `1c6683e8e0b`), unrelated to anything we read - see DECISIONS.md
+  # 2026-09-12 and ACHTUNG/HowTo__Verify_before_hermes_update.md journal.
+  #
+  # Prior rebase (2026-09-08): prod moved 1cb3ab617 -> 6e2b8e070
+  # (7123-commit range, the biggest jump so far - upstream ran a mass
+  # file-splitting refactor across most of the files this registry watches).
+  # Every count below was re-verified against prod at 6e2b8e070. Eight
+  # entries moved `file:` this round (bridge.terminal_blocked_params,
+  # dispatch.coerce_tool_args, dispatch.rpc_arg_forwarding,
+  # dispatch.observability_contextvars, backend.patch_result_has_no_counter,
+  # backend.resolve_path_for_task, plus schema.override_by_name's symbol
+  # itself renamed) - same behaviour, new module, confirmed by reading each
+  # one, not by the checker alone. One real break found and fixed:
+  # bridge.tool_stubs's tuple shape changed (name dropped, was redundant
+  # with the dict key) - file_ops/_execute_code_bridge.py now detects the
+  # shape instead of assuming it.
+  baseline_taken: "2026-09-12"
+  baseline_head: "1021a03256"
+  # Fallback only. The checker resolves the live checkout itself:
+  # HERMES_AGENT_ROOT, else <HERMES_HOME>/hermes-agent (installer layout).
+  prod_root: "Y:/Hermess/body/hermes-agent"
+  # Was a mirror of prod as of 2026-09-02; fetched and checked out to
+  # origin/main via `git worktree add --detach` at T:/htree-head for this
+  # rebase (worktree left in place, not removed) - see
+  # HowTo__Verify_before_hermes_update.md.
+  test_root: "Y:/Hermess/body/sandboxes/docker/default/workspace/SRC/hermes-agent-src"
+
+# level 1 = breaks silently and takes a whole tool with it
+# level 5 = we would notice from a test failure anyway
+seams:
+
+  # ---- level 1: we depend on the TEXT of their code, not its interface ----
+
+  - id: bridge.tool_stubs
+    level: 1
+    file: tools/code_execution_tool.py
+    kind: symbol
+    symbol: _TOOL_STUBS
+    baseline_count: 2
+    we_do: >-
+      Overwrite one entry per wrapped tool, value built from our own
+      registered schema. Shape changed at 6e2b8e070 (7123-commit jump from
+      1cb3ab617): was a 4-tuple (name, sig, doc, args_expr) with the name
+      redundantly repeated inside the tuple; core dropped it, value is now
+      a 3-tuple (sig, doc, args_expr), name only the dict key. Our bridge
+      (file_ops/_execute_code_bridge.py::patch_execute_code_bridge) no
+      longer assumes either shape - it samples a core-owned entry
+      ("web_search", which we never touch) and matches its arity.
+    breaks: >-
+      Renamed, or the tuple's shape/arity changes to something our sampling
+      doesn't anticipate -> the stub is not replaced and the model reads
+      core's stale signature for our tool. Second case of a green baseline
+      count hiding a changed shape; first was override.name_process.
+    asserted_by: tests/test_plugin_integration.py::test_e2b_execute_code_stubs_patched
+
+  - id: bridge.tool_doc_lines
+    level: 1
+    file: tools/code_execution_tool.py
+    kind: symbol
+    symbol: _TOOL_DOC_LINES
+    baseline_count: 2
+    we_do: >-
+      Rebuild the (name, doc) pair for each wrapped tool. This is the ONLY
+      place the model is told what our sandbox facade returns.
+    breaks: >-
+      Renamed or restructured -> the model is told our tools return core's
+      old per-tool dict keys, which no longer exist.
+    asserted_by: tests/test_plugin_integration.py::test_e2b_execute_code_stubs_patched
+
+  - id: bridge.uds_transport_header
+    level: 1
+    file: tools/code_execution_tool.py
+    kind: symbol
+    symbol: _UDS_TRANSPORT_HEADER
+    baseline_count: 2
+    we_do: Substring-replace the response-parsing tail inside this template.
+    breaks: Renamed -> no patch, see bridge.json_loads_literal for the worse half.
+    asserted_by: tests/test_plugin_integration.py::test_e2c_execute_code_bridge_seam_status
+
+  - id: bridge.file_transport_header
+    level: 1
+    file: tools/code_execution_tool.py
+    kind: symbol
+    symbol: _FILE_TRANSPORT_HEADER
+    baseline_count: 2
+    we_do: Same substring replacement as the UDS template.
+    breaks: >-
+      Renamed -> the file-transport template of execute_code is not patched
+      (same as bridge.uds_transport_header); see bridge.json_loads_literal for
+      the worse half.
+    asserted_by: tests/test_plugin_integration.py::test_e2c_execute_code_bridge_seam_status
+
+  - id: bridge.json_loads_literal
+    level: 1
+    file: tools/code_execution_tool.py
+    kind: our_literal
+    our_module: file_ops/_execute_code_bridge.py
+    our_attr: _JSON_LOADS_OLD_TAIL
+    min_count: 2
+    baseline_count: 2
+    we_do: >-
+      Replace this exact source text so the sandbox stub's json.loads() falls
+      back to the raw string instead of raising. The literal is read from OUR
+      module, so this checks precisely what the runtime will search for.
+    breaks: >-
+      ANY reformatting of that fragment on their side - even whitespace - and
+      the replacement finds nothing. The patch logs a warning and skips; the
+      first sandbox call that gets non-JSON then raises JSONDecodeError.
+      This is the single most fragile thing we own.
+    asserted_by: tests/test_plugin_integration.py::test_e2c_execute_code_bridge_seam_status
+
+  - id: bridge.terminal_blocked_params
+    level: 1
+    file: tools/code_execution_rpc.py
+    kind: symbol
+    symbol: _TERMINAL_BLOCKED_PARAMS
+    baseline_count: 2
+    we_do: >-
+      Read it to EXCLUDE those params from terminal's generated stub, since
+      the RPC server pops them before dispatch anyway.
+      WORKED EXACTLY AS INTENDED at afc3d9d34: the set grew from four entries
+      to five (`notify` added), the occurrence count stayed 3, and our stub
+      picked the new member up with no change on our side - because it reads
+      their constant instead of copying it. Second case that day of a green
+      count over a changed shape; the first was override.name_process.
+      MOVED at 6e2b8e070 (7123-commit jump from 1cb3ab617): out of
+      code_execution_tool.py into its own code_execution_rpc.py, alongside
+      `_rpc_server_loop` (the thing that actually pops these params) - same
+      set, same 5 members, new home. Our bridge's `_blocked_params` and the
+      test both now try code_execution_tool.py first, then fall back to
+      code_execution_rpc.py.
+    breaks: >-
+      Renamed or gone from BOTH modules -> we fall open and advertise every
+      schema param, so a script is offered
+      background/pty/notify_on_complete/watch_patterns that silently do
+      nothing. Degrades quietly by design; the warning is the only signal.
+    asserted_by: tests/test_plugin_integration.py::test_e2b_terminal_stub_patched_and_blocked_params_excluded
+
+  # ---- level 1: the context engine's ONE monkeypatch into core ------------
+  #
+  # Added 2026-09-08 with Plan13 (`context_ctl/`). Nine seams for ONE feature,
+  # and they are listed apart because each fails ALONE, silently, in a
+  # different way - which is the whole reason this file exists. Six are the
+  # bridge and the engine's own wiring; three (the gateway session registry,
+  # their row-replacement primitive, their token estimator) came with Task
+  # 3/4, when applying a selection ON DEMAND turned out to need the gateway's
+  # session dict rather than the agent — and then, after a live run, to need
+  # replace_messages rather than their compaction pipeline.
+  #
+  # The mechanism (Recon26, live-confirmed): `AIAgent.__init__` is wrapped so
+  # `self` sits in a threading.local while the original runs; nested inside
+  # that same synchronous call, `_inject_context_engine_tools(agent)` invokes
+  # our own official `on_session_start()`, which reads the thread-local and
+  # keeps a weakref. Zero business logic in the patch. WHY it exists at all:
+  # no official plugin door hands over the live agent, and without it there is
+  # no cache-parity side question to the model (Recon24).
+  #
+  # The patch installs ONLY when Hermes' own `context.engine` names `ctxctl`;
+  # not selected -> nothing in core is touched. So a green run of this section
+  # proves the seams are present, not that the patch is installed anywhere.
+
+  - id: ctxctl.init_is_a_thin_forwarder
+    level: 1
+    file: run_agent.py
+    kind: symbol
+    symbol: init_agent(self, **init_kwargs)
+    baseline_count: 1
+    we_do: >-
+      Wrap AIAgent.__init__ and call the original unchanged. This literal is
+      the whole body we rely on: a THIN forwarder means our wrapper needs no
+      argument reshaping and cannot drift out of sync with a growing signature
+      (60+ keyword parameters today).
+    breaks: >-
+      If __init__ stops being a forwarder (real logic moves in, or agents get
+      built through a factory/__new__ path that skips it), our wrapper either
+      misses those agents silently or has to know about their construction. A
+      signature drift itself is LOUD by design - it breaks construction on the
+      first session, which is exactly why this patch point was chosen over
+      self_delegate's _execute_tool_calls (Recon25/Recon26).
+    asserted_by: tests/test_context_ctl.py::test_bridge_hands_live_agent_to_on_session_start
+
+  - id: ctxctl.on_session_start_called_in_init
+    level: 1
+    file: agent/agent_init.py
+    kind: symbol
+    symbol: def _inject_context_engine_tools
+    baseline_count: 1
+    we_do: >-
+      Rely on this function being called from init_agent SYNCHRONOUSLY, on the
+      same thread, and on it calling
+      `agent.context_compressor.on_session_start(...)`. That nesting is the
+      entire bridge: it is what lets our own official hook read the
+      thread-local the wrapper has just set.
+    breaks: >-
+      Renamed, or the on_session_start call moves into a thread/executor/async
+      task -> the patch installs as usual, `capture()` returns None, and the
+      warm-cache channel silently stops existing. Nothing raises.
+    asserted_by: tests/test_context_ctl.py::test_inject_context_engine_tools_calls_on_session_start_synchronously
+
+  - id: ctxctl.engine_selected_by_config_key
+    level: 1
+    file: agent/agent_init.py
+    kind: symbol
+    symbol: get("engine", "compressor")
+    baseline_count: 1
+    we_do: >-
+      Read the SAME key ourselves (`context.engine` in their config.yaml) to
+      decide whether to install the patch at all - our footprint in core must
+      appear only after the owner selected us through their own switch. The
+      value is compared against `engine.name`, so our name string is part of
+      this seam too.
+    breaks: >-
+      The key moves, or the comparison stops being against `engine.name` -> we
+      either install the patch while their built-in compressor is the one
+      actually running (footprint with no engine), or refuse to install while
+      ours IS selected (engine with no bridge). Both silent.
+    asserted_by: tests/test_context_ctl.py::test_real_selection_path_deepcopies_us_and_the_copy_still_catches_the_agent
+
+  # 2026-09-25, test tree 27df3b8847: `_select_context_engine` no longer
+  # calls `copy.deepcopy(_candidate)`. It calls `_candidate.clone_for_agent()`,
+  # and `ContextEngine.clone_for_agent` defaults to `return copy.deepcopy(self)`
+  # (agent/context_engine.py). Our `__deepcopy__` is what that hits. We do not
+  # override `clone_for_agent`. Prod 1021a03256 still has the old line, so a
+  # check of prod_root fails this seam until the live tree moves.
+  - id: ctxctl.engine_is_deepcopied_per_agent
+    level: 1
+    file: agent/agent_init.py
+    kind: symbol
+    symbol: _candidate.clone_for_agent()
+    baseline_count: 1
+    we_do: >-
+      Inherit `ContextEngine.clone_for_agent` unchanged and implement
+      `__deepcopy__`. Every agent gets its own copy of the registered
+      singleton, and the COPY is the live engine that must catch that agent.
+      The copy itself is the default body `return copy.deepcopy(self)` in
+      `agent/context_engine.py`, not a call in `agent_init.py`. Consequence
+      we design around: nothing written to engine attributes is visible to
+      the panel route or the slash command — anything needed OUTSIDE the
+      session goes to a file (context_ctl/_state.py), the same rule the
+      ledger follows.
+    breaks: >-
+      If `_select_context_engine` stops calling `clone_for_agent`, sessions
+      share one engine instance and per-session state (agent ref, status)
+      silently crosses over. If `clone_for_agent` stops deep-copying, or the
+      copy raises, their code falls back to the built-in compressor with a
+      warning and our engine is simply absent.
+    asserted_by: tests/test_context_ctl.py::test_real_selection_path_deepcopies_us_and_the_copy_still_catches_the_agent
+
+  - id: ctxctl.forced_compress_entry
+    level: 1
+    file: agent/compression_facade.py
+    kind: symbol
+    symbol: def _compress_context
+    baseline_count: 1
+    we_do: >-
+      Call `agent._compress_context(messages, None, focus_topic=..., force=True)`
+      to apply a compaction ON DEMAND (panel button) instead of waiting for
+      their turn pipeline - the same entry their own /compress uses (Recon23).
+      Live-confirmed to reach our `compress()` in one call without touching
+      `prune_tool_results_only()`, which is why the manual mechanisms live in
+      `compress()` (Plan13 Task 0).
+    breaks: >-
+      Renamed, or the kwargs change -> the panel's "apply now" button has no
+      way to trigger anything, and automatic compaction (which we deliberately
+      do not implement yet) would be the only path left.
+    asserted_by: tests/test_context_ctl.py::test_forced_compress_from_the_host_reaches_our_compress
+
+  - id: ctxctl.gateway_session_registry
+    level: 1
+    file: tui_gateway/server.py
+    kind: symbol
+    symbol: "_sessions: dict[str, dict] = {}"
+    baseline_count: 1
+    we_do: >-
+      Walk it to find the session dict belonging to a captured agent (matched by
+      object IDENTITY, since the registry key is a gateway session key that
+      need not equal agent.session_id and their own
+      _sync_session_key_after_compress rewrites it). We need the dict because
+      the LIVE conversation history is NOT on the agent - it is
+      session["history"] under session["history_lock"] with a
+      session["history_version"] guard, and that is what their own compress
+      route reads and writes.
+
+      Since 2026-09-09 the DASHBOARD half reads the same registry, and that is
+      why the panel's apply button needs no monkeypatch: the route is served in
+      the SAME process as the gateway (web_server.py imports tui_gateway.server;
+      desktop chat runs agents in-process via server._make_agent), so
+      `_sessions[key]["agent"].context_compressor` IS our live engine, reached
+      exactly the way their own dispatcher reaches a session. There we look up
+      BY KEY first (what the dispatcher does), then by asking each live engine
+      for its own session id - the two differ whenever
+      _sync_session_key_after_compress has run.
+    breaks: >-
+      Renamed, moved, or turned into a class -> /ctx-drop cannot find the
+      session and says so, offering their own `/compress ctxdrop` as the way
+      around (which needs neither this seam nor the next). The panel's apply
+      button answers with the same refusal, naming the live sessions. Degrades
+      to a named workaround, never to a wrong write.
+    asserted_by: tests/test_context_stubs.py::test_c3b_a_missing_session_registry_is_reported_not_raised
+
+  - id: ctxctl.replace_messages
+    level: 1
+    file: hermes_state_messages.py
+    kind: symbol
+    symbol: def replace_messages
+    baseline_count: 1
+    we_do: >-
+      Commit a surgical rewrite with
+      `replace_messages(session_id, full_history, archive_dropped=True,
+      reject_active_turn_lease=True)` - their own primitive for /undo, /retry
+      and /compress. Replaced rows go to the rewind archive (active=0,
+      compacted=0: hidden from the display read, still searchable and
+      recoverable) and the new set stays the ONLY generation, so order is
+      correct in both the model's view and the human's.
+    breaks: >-
+      Renamed or the kwargs change -> /ctx-drop refuses and says so; the
+      context is left untouched. NOT a silent seam for once: nothing is
+      written if this call fails.
+      WHY THIS AND NOT archive_and_compact, which we used until 2026-09-08:
+      measured on a real SQLite (__HQ/recon/subjects/ctxdrop-row-order/), the
+      same edit through archive_and_compact gave the model a CORRECT prompt
+      and the human a SCRAMBLED transcript - 14 rows (whole conversation
+      twice) with no timestamps, 9 (the rewritten pair at the end) with them,
+      vs 7 and 7 here. Cause is structural: their display dedupe
+      (_dedupe_display_generations) keys on
+      (role, content, timestamp, tool_call_id, tool_calls, tool_name) and
+      orders by the FIRST row id of that key, so anything whose content we
+      rewrite is a NEW logical message sorted to the end while its archived
+      predecessor still renders in place. archive_and_compact is built to
+      collapse a range into a summary, not to rewrite a field in place.
+    asserted_by: tests/test_context_stubs.py::test_c9_commit_writes_the_db_before_the_gateway_memory
+
+  - id: ctxctl.turn_lease_error_name
+    level: 1
+    file: hermes_state_errors.py
+    kind: symbol
+    symbol: class SessionTurnLeaseLostError
+    baseline_count: 1
+    we_do: >-
+      Tell "a turn is running" from a real failure by the exception CLASS NAME
+      raised by `replace_messages(..., reject_active_turn_lease=True)`
+      (`_apply._TURN_BUSY_ERRORS`: this and SessionCompressionInProgressError).
+      Manual compaction then WAITS for the turn to end and rebuilds over the
+      fresh tape instead of throwing the paid interrogation away (2026-09-30).
+    breaks: >-
+      Renamed -> the refusal is no longer recognised as "busy": manual compaction
+      refuses as it did before 2026-09-30 (context untouched, summary kept in the
+      run report). Degrades to a refusal, never to a wrong write. The other
+      retry signal (rows appended by the turn, `BUSY_MOVED`) is ours and stays.
+    asserted_by: tests/test_context_compact.py::test_e4_write_waits_for_the_turn_and_takes_the_fresh_tail
+
+  - id: ctxctl.agent_route_fields
+    level: 1
+    file: agent/turn_context.py
+    kind: symbol
+    symbol: '"requested_provider", "base_url", "api_key", "api_mode", "auth_mode", "session_id"'
+    baseline_count: 1
+    we_do: >-
+      Our compaction talks to the session's model DIRECTLY (`_llm.route_of`):
+      `agent.base_url`, `agent.model`, `agent.api_key`, `agent.api_mode` of the
+      live agent - the same attributes their turn_context binds into the
+      auxiliary route on every turn. Not ctx.llm: outside a turn their `auto`
+      guessed a provider and sent a whole session to Gemini (2026-09-30).
+    breaks: >-
+      Attributes renamed -> `route_of` finds no base_url/model and refuses in
+      words; compaction does not run and nothing is sent anywhere else. Their
+      binding list changing here is the early warning to re-check the names.
+    asserted_by: tests/test_context_llm.py::test_l1_no_route_no_model
+
+  - id: ctxctl.get_messages_is_the_write_source
+    level: 1
+    file: hermes_state_messages.py
+    kind: symbol
+    symbol: "def get_messages(self, session_id: str, include_inactive"
+    baseline_count: 1
+    we_do: >-
+      Read the list we are about to rewrite with `get_messages(session_id)` -
+      defaults are exactly what we need: active rows only, ORDER BY id ASC
+      ("never timestamp: clocks regress"), content/tool_calls decoded. The
+      dicts it returns are fed straight back into replace_messages, and every
+      key _message_row_params binds (timestamp, tool_call_id, tool_name,
+      reasoning columns, api_content, display_kind, display_metadata,
+      platform_message_id) is a key of those dicts - the round trip through
+      the DB loses nothing.
+    breaks: >-
+      Renamed or the defaults change (include_inactive/include_compacted
+      flipped, a limit introduced) -> /ctx-drop reports it and touches
+      nothing; a silently PARTIAL read would be caught by our own
+      _unaccounted_active_rows guard before any write.
+      WHY THE DB AND NOT session["history"], which we used until 2026-09-09:
+      the gateway snapshot is neither complete nor as rich. It cost real data
+      once - a 36,066-char read (op 001f, row 63006) was in the DB, absent
+      from the snapshot, and archive_dropped=True pushed it into the rewind
+      archive though the human never selected it. Quieter second loss: the
+      snapshot has no display_kind/display_metadata/api_content/reasoning
+      columns at all, so writing FROM it blanked those on EVERY row of the
+      session, not just the ones we meant to touch.
+    asserted_by: tests/test_context_stubs.py::test_c12_a_row_absent_from_gateway_memory_is_not_lost
+
+  - id: ctxctl.usage_less_response_hook
+    level: 3
+    file: agent/turn_usage.py
+    kind: symbol
+    symbol: note_usage_less_response
+    baseline_count: 1
+    we_do: >-
+      Implement `note_usage_less_response()` so a response that carried no
+      `usage` still tells us the model answered. `update_from_response` is
+      called ONLY when `response.usage` is present (record_response_usage), and
+      local OpenAI-compatible servers routinely omit it - measured live on the
+      owner's `custom`/Qwen setup: update_from_response 0 calls across a full
+      conversation, so our token counters and activity stamp stayed at zero.
+      Their own compressor treats this as a first-class case
+      (`_provider_omits_usage`).
+    breaks: >-
+      Gone -> our activity stamp goes cold again on providers without usage,
+      and the session-picking FALLBACK (not the primary path, see the entry
+      above) loses its only signal. Token counters stay zero either way and are
+      reported as `provider_reports_usage: false` rather than as a plausible
+      guess: /ctx-drop's own numbers come from their estimator, not from these.
+    asserted_by: tests/test_context_ctl.py::test_a_response_without_usage_still_marks_the_session_alive
+
+  - id: ctxctl.api_content_is_a_user_row_sidecar
+    level: 3
+    file: hermes_state_messages.py
+    kind: symbol
+    symbol: def set_latest_user_api_content
+    baseline_count: 1
+    we_do: >-
+      Strip `api_content` from any row whose content we rewrote
+      (context_ctl/_apply.py::drop_stale_api_content). Today the sidecar is
+      backfilled onto the newest ACTIVE user row only, so tool answers never
+      carry one and there is nothing to strip - we do it anyway, in advance.
+    breaks: >-
+      If the sidecar ever lands on tool rows and we stopped stripping it,
+      replay would take the VERBATIM bytes ("api_content VERBATIM (no
+      sanitize/strip) so replay keeps the provider prompt cache byte-stable")
+      and what the human dropped would return to the prompt silently, past
+      every mechanism we built. The symbol disappearing is the signal that the
+      sidecar's rules changed - re-read them, do not assume it got simpler.
+    asserted_by: tests/test_context_stubs.py::test_c13_a_rewritten_row_loses_its_api_content_sidecar
+
+  - id: ctxctl.text_token_estimator
+    level: 4
+    file: agent/model_metadata.py
+    kind: symbol
+    symbol: def estimate_tokens_rough
+    baseline_count: 1
+    we_do: >-
+      Price ONE operation for the checkbox next to it (dashboard/plugin_api.py
+      ::_tokens_of): the weight of its own two halves, answer plus call
+      arguments. Deliberately the same function the totals go through, so the
+      number under a checkbox and the number in the apply report cannot
+      disagree - a panel that prices an operation differently from the command
+      that removes it would make the human distrust both.
+    breaks: >-
+      Renamed -> we fall back to their documented non-CJK rule (ceil(UTF-8
+      bytes / 4)) in the same function, so a number is still shown; it may
+      drift from their totals if they recalibrate the estimator. NOT
+      chars-over-4: for Cyrillic that halves the figure, and under-pricing what
+      the human is weighing is the wrong way to be wrong.
+    asserted_by: tests/test_ops_route.py::test_o8c_the_estimate_falls_back_when_upstream_is_missing
+
+  - id: ctxctl.request_token_estimator
+    level: 4
+    file: agent/model_metadata.py
+    kind: symbol
+    symbol: def estimate_request_tokens_rough
+    baseline_count: 1
+    we_do: >-
+      Report "we will drop ~N tokens, ~M will remain" with THEIR estimator and
+      their own summands (transcript + system prompt + tool schemas), the same
+      way _compress_live_with_feedback does. A transcript-only number would
+      understate real request pressure and flatter us.
+    breaks: >-
+      Renamed -> the numbers become 0 and the answer says nothing about size;
+      the drop itself still works. Lowest-consequence seam of this group, but
+      silent: a confident-looking 0 is worse than an absent figure, which is
+      why the estimator returning 0 is treated as "unknown" everywhere it is
+      printed.
+    asserted_by: tests/test_context_stubs.py::test_c1b_no_arguments_shows_the_price_of_applying
+
+  - id: data.hermes_home
+    level: 2
+    file: hermes_constants.py
+    kind: symbol
+    symbol: "def get_hermes_home() -> Path:"
+    baseline_count: 1
+    we_do: >-
+      `_home.plugin_home()` = get_hermes_home() / "filetools" - the ONE place
+      every data dir of ours hangs from (ledger, ctxctl state/select/signal/
+      compact_state, tokens, export) and the user's settings.yaml. Imported
+      lazily on every call (context-local, overridable by profiles and tests).
+    breaks: >-
+      Renamed -> `_home.hermes_home()` falls back to the HERMES_HOME env var
+      (set by their launcher); without it every data path raises "Hermes home
+      unknown" - the journal, the engine state and the user's settings stop
+      being read or written. Loud, not silent.
+    asserted_by: tests/test_home.py::test_h2_every_data_dir_is_under_home
+
+  - id: data.hermes_yaml
+    level: 2
+    file: hermes_yaml.py
+    kind: symbol
+    symbol: "def safe_load("
+    baseline_count: 1
+    we_do: >-
+      Read plugin.yaml (defaults) and the user's settings.yaml, write
+      settings.yaml (`safe_dump`, width unlimited - their emitter folds long
+      strings after an escaped backslash) - `_home.py`; `__init__.py` loaders,
+      `dashboard/plugin_api.py` /config and `seams/check.py` read through it.
+      PyYAML is not in their venv, this is the YAML we have.
+    breaks: >-
+      Renamed or moved -> `_home.effective()` raises: the plugin loads tools
+      with code fallbacks only (loaders return empty), /config answers an
+      error, the seam check cannot read its registry. The user's settings are
+      ignored until fixed.
+    asserted_by: tests/test_home.py::test_h4_settings_round_trip_and_broken_file
+
+  - id: ctxctl.alternation_repair_count
+    level: 3
+    file: agent/agent_runtime_helpers.py
+    kind: symbol
+    symbol: "def repair_message_sequence(agent, messages"
+    baseline_count: 1
+    we_do: >-
+      Count how many role-alternation repairs THEIR loader would make on a
+      copy of the tape (`_alternation.their_repairs`), before and after our
+      edit - compaction AND erase refuse to write when the edit makes it worse
+      (their loader would merge same-role neighbours and write the merge back,
+      moving our addresses). Imported lazily, called on a deepcopy with
+      agent=None.
+    breaks: >-
+      Renamed or signature changed -> `their_repairs` returns None and the
+      before/after check is SKIPPED silently: compaction and erase still write,
+      bridges are still inserted by our own rule, but nothing verifies them
+      against their loader any more. No crash, lost safety net.
+    asserted_by: tests/test_erase_alternation.py::test_e8_their_check_is_not_worse_with_bridges
+
+  - id: ctxctl.live_config_threshold_cap
+    level: 4
+    file: tui_gateway/session_compression.py
+    kind: symbol
+    symbol: cc._coerce_threshold_tokens_cap(
+    baseline_count: 1
+    we_do: >-
+      REVERSE seam - they call US. `_apply_live_compression_config` copies
+      their `compression.*` keys into `agent.context_compressor` (our engine)
+      at turn start (always on a session's first turn) and calls
+      `_coerce_threshold_tokens_cap`, a private method of THEIR compressor.
+      Our engine carries a no-op of that one name returning None ("no cap"):
+      we never read the cap, `should_compress` decides by our own threshold.
+      One name only - a catch-all __getattr__ would turn their
+      `getattr(cc, "_x", None) is not None` checks true and silently change
+      their branches.
+    breaks: >-
+      They rename or drop the call -> our no-op is dead code (delete it) or the
+      old warning "Could not apply live compression config ... no attribute"
+      returns in gui.log. Nothing else: their keys land on our engine unread.
+      If they add ANOTHER private call in that function, the same warning
+      names it - extend by one name, never by a catch-all.
+    asserted_by: tests/test_live_config_seam.py::test_w2_they_still_call_it
+
+  - id: ctxctl.cached_system_prompt
+    level: 1
+    file: agent/chat_completion_helpers.py
+    kind: symbol
+    symbol: agent._cached_system_prompt = sp
+    baseline_count: 1
+    we_do: >-
+      Read `agent._cached_system_prompt` off the captured agent - the one thing
+      the whole bridge is for. A cache-parity side question has to reuse the
+      SAME prefix the provider already cached, and this attribute is where that
+      prefix lives (their own background_review.py copies it verbatim for the
+      same reason).
+    breaks: >-
+      Renamed or no longer populated -> the warm channel degrades to a cold
+      call: still correct, but the economics of asking the model about its own
+      context disappear (Vision03). Silent - we would only see an empty prompt
+      field in the status file.
+    asserted_by: null
+
+  # ---- level 1: the NAMES we take over -----------------------------------
+  #
+  # The foundation of the whole plugin, and the hole this registry had on the
+  # day it was written: the first real run (afc3d9d34, 1770 commits) reported
+  # "no broken seams" while upstream had renamed `process` to `process_manage`.
+  # Our `def _handle_process` check stayed green because the FUNCTION was
+  # untouched - only the registered NAME moved, and nothing was watching that.
+  #
+  # Why a rename is worse than a break: `override=True` is a no-op when no
+  # name collides, so our tool registers as a NEW plugin tool. And per
+  # `tools/tool_search.py::is_deferrable_tool_name`, a plugin tool that is
+  # neither core nor a GUI toolset IS deferrable - so it goes behind the
+  # tool_search bridge, invisible until searched. Silently, with no error.
+  #
+  # Each entry looks for `name="<ours>"` in the file that registers it. A
+  # count of 0 means the name moved and OUR registration must follow it.
+
+  - id: override.name_read_file
+    level: 1
+    file: tools/file_tools.py
+    kind: symbol
+    symbol: 'name="read_file"'
+    baseline_count: 1
+    we_do: Register under this exact name with override=True.
+    breaks: Renamed upstream -> ours becomes a parallel plugin tool and gets deferred.
+    asserted_by: tests/test_plugin_integration.py
+
+  - id: override.name_write_file
+    level: 1
+    file: tools/file_tools.py
+    kind: symbol
+    symbol: 'name="write_file"'
+    baseline_count: 1
+    we_do: Register under this exact name with override=True.
+    breaks: Same as override.name_read_file.
+    asserted_by: tests/test_plugin_integration.py
+
+  - id: override.name_patch
+    level: 1
+    file: tools/file_tools.py
+    kind: symbol
+    symbol: 'name="patch"'
+    baseline_count: 1
+    we_do: Register under this exact name with override=True.
+    breaks: Same as override.name_read_file.
+    asserted_by: tests/test_plugin_integration.py
+
+  - id: override.name_search_files
+    level: 1
+    file: tools/file_tools.py
+    kind: symbol
+    symbol: 'name="search_files"'
+    baseline_count: 1
+    we_do: Register under this exact name with override=True.
+    breaks: Same as override.name_read_file.
+    asserted_by: tests/test_plugin_integration.py
+
+  - id: override.name_terminal
+    level: 1
+    file: tools/terminal_tool.py
+    kind: symbol
+    symbol: 'name="terminal"'
+    baseline_count: 1
+    we_do: Register under this exact name with override=True.
+    breaks: Same as override.name_read_file.
+    asserted_by: tests/test_plugin_integration.py
+
+  - id: override.name_execute_code
+    level: 1
+    file: tools/code_execution_tool.py
+    kind: symbol
+    symbol: 'name="execute_code"'
+    baseline_count: 1
+    we_do: Register under this exact name with override=True, under THEIR toolset.
+    breaks: Same as override.name_read_file.
+    asserted_by: tests/test_plugin_integration.py::test_e2d_execute_code_is_ours_under_their_toolset
+
+  - id: override.name_process
+    level: 1
+    file: tools/process_registry.py
+    kind: test_only
+    symbol: 'name="process_manage" (was name="process")'
+    we_do: >-
+      This is the one slot that does NOT hardcode the name: register() reads
+      it from their live registry (`__init__.py::_upstream_name`, candidates
+      newest-first) and registers under whichever spelling this Hermes
+      actually has.
+    breaks: >-
+      BROKE FOR REAL at afc3d9d34 (commit e16ad33a9): `process` became
+      `process_manage`, and the new name is ALSO in _DEFAULT_DEFERRED_TOOLS,
+      so the model would have got no eager process tool at all plus two
+      catalog stubs - theirs and our orphan. Fixed 2026-09-02 by resolving
+      the name instead of writing it down.
+      Now `test_only` rather than a count, deliberately: the dependency is
+      "we register under whatever they call it", which no single grep can
+      express - a count on either spelling would go red on the version that
+      uses the other one. A rename to a THIRD name is still a break, and
+      what catches it is the test, not this file.
+    asserted_by: tests/test_plugin_integration.py::test_e2d_process_is_ours_under_their_toolset
+
+  - id: override.name_vision_analyze
+    level: 1
+    file: tools/vision_tools.py
+    kind: symbol
+    symbol: 'name="vision_analyze"'
+    baseline_count: 1
+    we_do: Register under this exact name with override=True, under THEIR toolset `vision`.
+    breaks: Same as override.name_read_file.
+    asserted_by: tests/test_plugin_integration.py::test_e2d_vision_analyze_is_ours_and_async
+
+  - id: override.deferral_rule
+    level: 1
+    file: tools/tool_search.py
+    kind: symbol
+    symbol: def is_deferrable_tool_name
+    baseline_count: 1
+    we_do: >-
+      Depend on its rule, which is the ONLY reason this plugin steals core
+      names: a plugin tool that is neither in _HERMES_CORE_TOOLS nor a
+      session-gated GUI toolset IS deferrable, i.e. would be hidden behind
+      the tool_search bridge. Taking the core name is the exemption.
+    breaks: >-
+      Moved once already - it used to live in tools/toolsets.py, which no
+      longer exists at afc3d9d34; the plugin's own module docstring still
+      cites that path. If the exemption stops being name-based, the
+      name-stealing strategy stops working and the whole plugin needs
+      rethinking, not patching.
+    asserted_by: null
+
+  # ---- level 2: how the model learns what our tools are ----
+
+  - id: schema.build_execute_code_schema
+    level: 2
+    file: tools/code_execution_tool.py
+    kind: symbol
+    symbol: def build_execute_code_schema
+    baseline_count: 1
+    we_do: >-
+      Register OUR execute_code with THEIR live-built schema, because a copy
+      of ours could never reach the model (see schema.override_by_name).
+    breaks: Renamed/removed -> our registration prints "schema build failed" and skips.
+    asserted_by: tests/test_plugin_integration.py::test_e2d_execute_code_is_ours_under_their_toolset
+
+  - id: schema.override_by_name
+    level: 2
+    file: model_tools.py
+    kind: symbol
+    symbol: _rewrite_execute_code
+    # Was tracked via the local variable `available_tool_names` through
+    # 1cb3ab617; renamed to `_last_resolved_tool_names`/local `available` by
+    # 6e2b8e070 (7123-commit jump) - a plain rename, not a break, but a local
+    # variable name is a worse anchor than the substitution mechanism itself.
+    # Now tracks `_rewrite_execute_code`, the by-NAME dict entry
+    # (`"execute_code": _rewrite_execute_code`, model_tools.py:412) that
+    # actually performs the swap - one def + one dict-key use.
+    baseline_count: 2
+    we_do: >-
+      Nothing - we ACCOMMODATE it. They swap execute_code's schema by name
+      regardless of registrant, which is why we keep no YAML copy of it.
+    breaks: >-
+      If this stops happening, our own wording could reach the model again
+      and a copy would become worth having. That is a chance to simplify,
+      not a failure.
+    asserted_by: null
+
+  - id: schema.sandbox_allowed_tools
+    level: 2
+    file: tools/code_execution_tool.py
+    kind: symbol
+    symbol: SANDBOX_ALLOWED_TOOLS
+    # Count drifted 12 -> 9 at 6e2b8e070 from the same file-wide refactor as
+    # bridge.tool_stubs, not from the list itself: the 7 members (web_search,
+    # web_extract, read_file, write_file, search_files, patch, terminal) are
+    # byte-identical, just reformatted one-per-line instead of inline (grep -c
+    # undercounts here - it's LINES, this registry counts str.count).
+    baseline_count: 9
+    we_do: >-
+      Rely on the intersection with available_tool_names being by NAME, which
+      is what keeps our same-name overrides inside the sandbox tool list.
+    breaks: >-
+      If membership stopped being name-based, our tools would vanish from
+      execute_code's description while still being dispatchable.
+    asserted_by: null
+
+  # ---- level 3: the dispatch contract ----
+
+  - id: dispatch.coerce_tool_args
+    level: 3
+    file: tools/arg_coercion.py
+    # Moved out of model_tools.py at 6e2b8e070 (7123-commit jump from
+    # 1cb3ab617) into its own module; still imported back into
+    # model_tools.py and called the same way. Behaviour (see we_do) unchanged.
+    kind: symbol
+    symbol: def coerce_tool_args
+    baseline_count: 1
+    we_do: >-
+      Depend on its behaviour, not its name: a key absent from the schema is
+      `continue`d, not stripped. That is what lets the sandbox facade marker
+      reach our handler.
+    breaks: >-
+      If it starts DROPPING unknown keys, every sandboxed call silently gets
+      plain text again instead of a dict. Nothing raises.
+    asserted_by: tests/test_plugin_integration.py::test_e2b_facade_marker_round_trips_through_dispatch
+
+  - id: dispatch.rpc_arg_forwarding
+    level: 3
+    file: tools/code_execution_rpc.py
+    # Moved out of code_execution_tool.py at 6e2b8e070 (7123-commit jump from
+    # 1cb3ab617), alongside _TERMINAL_BLOCKED_PARAMS (bridge.terminal_blocked_params).
+    kind: test_only
+    symbol: def _rpc_server_loop
+    we_do: >-
+      Depend on `args` being forwarded verbatim, with the only removals being
+      the terminal-blocked set. Our facade marker rides in that dict.
+    breaks: >-
+      Any whitelist/validation added there drops the marker, and the facade
+      degrades to text silently.
+    asserted_by: tests/test_plugin_integration.py::test_e2b_facade_marker_round_trips_through_dispatch
+
+  - id: dispatch.result_must_be_str
+    level: 3
+    file: tools/registry.py
+    kind: symbol
+    symbol: def _normalize_handler_result
+    baseline_count: 1
+    we_do: >-
+      Return either a str or the {"_multimodal": true, ...} envelope (vision's
+      native path). The sandbox transport additionally requires a str.
+    breaks: >-
+      Narrowing the accepted shapes -> our answers stop passing at all. This
+      one at least fails loudly.
+    asserted_by: tests/test_plugin_integration.py
+
+  - id: dispatch.observability_contextvars
+    level: 3
+    file: tools/approval_context.py
+    # Moved out of tools/approval.py at 6e2b8e070 (7123-commit jump from
+    # 1cb3ab617) into its own module, together with
+    # set_current_observability_context - same private ContextVar objects,
+    # same lack of getters, new home.
+    kind: symbol
+    symbol: _approval_tool_call_id
+    baseline_count: 4
+    we_do: >-
+      Read three PRIVATE contextvars (_approval_session_id / _approval_tool_call_id
+      / _approval_turn_id) - they have no getters, only
+      set_current_observability_context. `_observability_context` tries
+      tools.approval_context FIRST, then tools.approval (older Hermes).
+    breaks: >-
+      Renamed -> the read ledger keeps writing entries, just without
+      tool_call_id, and /reads starts reporting `unknown` instead of the real
+      state. No error anywhere above debug level. Functional probe: step 3b of
+      HowTo__Verify_after_hermes_update.md.
+      IT ALREADY HAPPENED, 2026-09-08, AND THIS ENTRY DID NOT SAVE US - read
+      this before trusting a green run. Upstream moved the vars into
+      approval_context.py with no re-export; this entry was dutifully updated
+      to name the NEW file, the checker greps THEIR side and went green, and
+      OUR side kept reading tools.approval, caught AttributeError and wrote
+      entries with no tool_call_id for a whole day. Found from live data (25 of
+      52 entries had an id in the morning session, 0 of 30 in the evening one),
+      not from any check. THE GENERAL LESSON: a seam entry that records their
+      move is only half the work - the other half is re-pointing our import and
+      asserting OUR side. Hence the extra test below.
+    asserted_by: tests/test_ledger.py::test_observability_contextvars_are_reachable
+
+  # ---- level 4: the live functions our wrappers call ----
+
+  - id: wrapped.terminal_tool
+    level: 4
+    file: tools/terminal_tool.py
+    kind: symbol
+    symbol: def terminal_tool
+    baseline_count: 1
+    we_do: Call it unmodified and reformat only its JSON return.
+    breaks: Renamed -> our terminal cannot run at all (loud).
+    asserted_by: tests/test_terminal_core.py
+
+  - id: wrapped.process_handler
+    level: 4
+    file: tools/process_registry.py
+    kind: symbol
+    symbol: def _handle_process
+    baseline_count: 1
+    we_do: Call THEIR handler (not the function under it) so action dispatch stays theirs.
+    breaks: Renamed -> process registration prints "not importable" and skips.
+    asserted_by: tests/test_process_core.py
+
+  - id: wrapped.vision_handler
+    level: 4
+    file: tools/vision_tools.py
+    kind: symbol
+    symbol: def _handle_vision_analyze
+    baseline_count: 1
+    we_do: >-
+      Call it with a data: URL we built. NOTE it can return a DICT
+      (_multimodal envelope) on the native-vision path, which we must pass
+      through untouched.
+    breaks: >-
+      If a NEW branch returns something else again, rendering it would destroy
+      vision. Check the return type on ALL branches, not just the visible one.
+    asserted_by: tests/test_vision_analyze_core.py
+
+  - id: wrapped.check_fns
+    level: 4
+    file: tools/vision_tools.py
+    kind: symbol
+    symbol: def check_vision_requirements
+    baseline_count: 1
+    we_do: >-
+      Forward it as our check_fn rather than reimplementing, so our entry is
+      invisible for exactly the reason theirs is.
+    breaks: Renamed -> vision_analyze registration skips (printed).
+    asserted_by: tests/test_plugin_integration.py::test_e2d_vision_analyze_is_ours_and_async
+
+  - id: wrapped.get_max_bytes
+    level: 4
+    file: tools/tool_output_limits.py
+    kind: symbol
+    symbol: def get_max_bytes
+    baseline_count: 1
+    we_do: Read the operator's tool_output.max_bytes through it instead of inventing a cap.
+    breaks: Gone -> we fail open to 0 (no cap of ours); their own 50k stdout cap still applies.
+    asserted_by: tests/test_execute_code_core.py
+
+  # ---- level 5: the file backend under all four file tools ----
+
+  - id: backend.shell_file_operations
+    level: 5
+    file: tools/file_operations.py
+    kind: symbol
+    symbol: class ShellFileOperations
+    baseline_count: 1
+    we_do: >-
+      Use it for every write instead of touching bytes ourselves - atomicity,
+      JSON/YAML gate, lint delta, LSP, sha256 are all theirs.
+    breaks: Restructured -> writes lose those guarantees.
+    asserted_by: tests/test_plugin_integration.py
+
+  - id: backend.read_file_bytes
+    level: 5
+    file: tools/file_operations.py
+    kind: symbol
+    symbol: def read_file_bytes
+    # Count drifted 2 -> 1 at 6e2b8e070 (7123-commit jump from 1cb3ab617):
+    # a second in-file mention (not the def itself) was consolidated away by
+    # the same refactor pass; the definition and its signature are unchanged.
+    baseline_count: 1
+    we_do: Read raw bytes through it (patch's exact-string resolver, and vision's image read).
+    breaks: Signature change -> patch's resolver and the vision path both fail.
+    asserted_by: tests/test_vision_analyze_core.py
+
+  - id: backend.patch_result_has_no_counter
+    level: 5
+    file: tools/file_operations_common.py
+    # Moved out of tools/file_operations.py at 6e2b8e070 (7123-commit jump
+    # from 1cb3ab617). Fields re-checked in the new location: still no
+    # replacement-count field.
+    kind: symbol
+    symbol: class PatchResult
+    baseline_count: 1
+    we_do: >-
+      Count replacements ourselves BECAUSE this class has no counter
+      (CONTRACT.md §17).
+    breaks: >-
+      If they add one, ours becomes dead code worth DELETING - an update can
+      remove our code, not only break it.
+    asserted_by: null
+
+  - id: backend.resolve_path_for_task
+    level: 5
+    file: tools/file_tools_paths.py
+    # Moved out of tools/file_tools.py at 6e2b8e070 (7123-commit jump from
+    # 1cb3ab617), still imported back and used identically there. Signature
+    # unchanged: def _resolve_path_for_task(filepath: str, task_id: str =
+    # "default") -> Path | PurePosixPath.
+    kind: symbol
+    symbol: def _resolve_path_for_task
+    baseline_count: 1
+    we_do: >-
+      Resolve container paths through it (via file_ops/file_backend.py) - it
+      checks _uses_container_paths and returns a PurePosixPath, which is the
+      fix tools/image_source.py is missing.
+    breaks: Renamed -> the vision container-path workaround stops working.
+    asserted_by: tests/test_vision_analyze_core.py
+
+  # ---- Plan16: компакция. Официальные двери + одна КОПИЯ их текста ----
+
+  - id: compact.aux_task_registration
+    level: 3
+    file: hermes_cli/plugins.py
+    kind: symbol
+    symbol: "    def register_auxiliary_task("
+    baseline_count: 1
+    we_do: >-
+      Register our own auxiliary slot `filetools_compact` (context_ctl/_llm.py
+      ::register) so the summarizer routes through `auxiliary.filetools_compact.*`
+      in the user's config instead of inheriting THEIR `auxiliary.compression.*`.
+      Public plugin API, not a private seam - found 2026-09-16, and it is the
+      reason Plan16 does NOT call `agent.auxiliary_client.call_llm` at all.
+    breaks: >-
+      Gone or renamed -> our slot is never registered, `ctx.llm.complete(task=...)`
+      falls back to whatever routing the host picks, and the summary may silently
+      go to a model the owner did not choose. Loud: `register()` returns the
+      failure as a string that is printed in the plugin load line.
+    asserted_by: null
+
+  - id: compact.plugin_llm_door
+    level: 3
+    file: agent/plugin_llm.py
+    kind: symbol
+    symbol: "    def complete("
+    baseline_count: 1
+    we_do: >-
+      The ONLY way our code calls a model. Two modes, one API: `task=TASK_KEY`
+      routes to our registered slot (summarizer, may be any model), `task=None`
+      goes to the ACTIVE MAIN model - that second mode is the future channel for
+      asking the agent which tool calls it still needs (Recon28). Result fields
+      read: `.text`, `.provider`, `.model`, `.usage.total_tokens`.
+    breaks: >-
+      Renamed or the result dataclass loses `.text` -> compaction refuses with a
+      named error (`context_ctl/_llm.py::ask` catches and reports), it does not
+      crash. Nothing else in the plugin depends on it.
+    asserted_by: null
+
+  - id: compact.summary_helpers_import
+    level: 2
+    file: agent/context_compressor.py
+    kind: symbol
+    symbol: "def _redact_compaction_text"
+    baseline_count: 1
+    we_do: >-
+      Import `_redact_compaction_text` rather than copying it
+      (context_ctl/_render.py). Deliberate: copying secret-redaction logic would
+      let OUR copy fall behind THEIR rules, and a distillate persists into every
+      later prompt.
+      HISTORY 2026-09-22: three more leaf helpers (`_summary_part_text`,
+      `_memory_provider_section`, `_today_for_prompt`) used to be imported by
+      `context_ctl/_compact_prompt.py`. That file served THEIR summary path,
+      which we no longer support; it now sits in `__HQ/attic/` as text. Only the
+      redaction import is live, and it is the one that mattered.
+    breaks: >-
+      Renamed -> `IMPORT_PROBLEM` is set at import time and the data block refuses
+      by name. That is the point: a silent fallback here would mean we quietly
+      stopped redacting secrets.
+    asserted_by: tests/test_context_md.py
+
+  - id: compact.summary_prompt_copy
+    level: 2
+    file: agent/context_compressor.py
+    kind: symbol
+    symbol: "SUMMARY_PREFIX = ("
+    baseline_count: 1
+    we_do: >-
+      COPY, not an import - the only entry of this kind in this file. 15 byte-exact
+      ranges of their prompt machinery live in context_ctl/_compact_prompt.py,
+      taken 2026-09-16 at 1021a0325 by script (see that file's docstring for the
+      line ranges). Copied because these are METHODS of `ContextCompressor`, which
+      cannot be built without a live agent, and because the wording is theirs -
+      paid for by their incidents, whose ticket numbers are still in the comments.
+    breaks: >-
+      Nothing breaks at runtime - that is exactly the risk. Their edit does not
+      touch our copy, so we keep sending an older prompt and never notice. The
+      check is a DIFF, not a count: re-read those ranges after a big upstream
+      jump and decide whether to re-take them. `take_summary_prompt.py` (the
+      extraction script) re-runs in one command.
+    asserted_by: null
+
+  # ---- level 6: watch for a FIX upstream, so our patch can be DELETED ----
+
+  - id: removal.image_source_host_pathlib
+    level: 6
+    file: tools/image_source.py
+    kind: symbol
+    symbol: Path(os.path.expanduser(candidate))
+    baseline_count: 1
+    we_do: >-
+      Work around it: a container path parsed by the HOST's pathlib becomes
+      \workspace\... on Windows. We hand their handler a data: URL instead.
+    breaks: >-
+      INVERTED entry - a count of 0 is GOOD NEWS, not a failure: they fixed
+      it (e.g. switched to PurePosixPath) and our workaround can go. Verify by
+      reading the branch, then delete rather than keep.
+    asserted_by: null
+    good_when_missing: true

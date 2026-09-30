@@ -1,0 +1,62 @@
+# patch — "new" path. Design: __HQ/vision/Vision01__patch.md.
+# The old JSON path keeps its own schema in modify_file.yaml, untouched.
+#
+# Every field is REQUIRED with no default, deliberately (Vision §3): real
+# telemetry shows models drop OPTIONAL fields under reasoning load - 2.7% of
+# 2769 real patch calls arrived without old_string - while required ones
+# survive. `line` and `flags` therefore take an explicit "I have nothing to
+# say" value (0 / "") rather than being omittable.
+name: patch
+description: >
+  Replace text in one file. You do NOT need to make old_string unique -
+  give the line where you believe the text is and the tool resolves the
+  exact site itself, then echoes the edited region back so you can see
+  what actually changed.
+
+  `line` is how this tool navigates: it is what tells apart several places
+  that look the same, so a roughly right line is far more useful than a
+  perfect old_string. Line numbers come from read_file (the "Line N" marks
+  in a normal read, or numbered=true) and from search_files results.
+
+  REQUIRED PARAMETERS: path, line, old_string, new_string, flags.
+required: [path, line, old_string, new_string, flags]
+properties:
+  path:
+    type: string
+    description: File path to edit.
+  line:
+    type: integer
+    description: >
+      Roughly which line the text is on - an orientation hint, not an
+      address; being off by a few lines is fine, and being off by more only
+      costs you a note saying so. This is the tool's main way to navigate:
+      it decides which of several identical-looking places you meant, so
+      pass it whenever you have any idea. Numbers come from a read_file
+      response or from search_files results. Pass 0 to say "I don't know where
+      this is": then the whole file is searched, and if the text occurs more
+      than once the tool asks you rather than guessing. Don't count lines by
+      hand - a rough number is enough, and flags="--dry-run" reports the exact
+      one without changing anything.
+  old_string:
+    type: string
+    description: >
+      The text to replace, as it appears in the file. Differences in
+      indentation or spacing are tolerated. It does NOT have to be unique -
+      `line` disambiguates. Never include the "N|" line-number column from
+      numbered output; send the code itself. An automatic "⚓ Line: N" signpost inside a
+      copied excerpt needs no attention - it is recognised and becomes the
+      blank line it marked.
+  new_string:
+    type: string
+    description: >
+      Replacement text; must differ from old_string. Pass an empty string
+      '' to delete the matched text.
+  flags:
+    type: string
+    description: >
+      Space-separated modifiers; send it EMPTY when none are needed (do not
+      write quote characters as the value itself). --dry-run (show exactly what
+      would change, write nothing), --replace-all (every occurrence in the
+      file; `line` is then ignored), --exact (no whitespace tolerance),
+      --context N (lines of context in the echo, default 3), --numbered
+      (echo with line numbers), --help (list the flags, change nothing).

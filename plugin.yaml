@@ -1,0 +1,512 @@
+name: hermes-filetools
+version: "0.37.0"
+# THIS FILE IS THE DEFAULTS (since 2026-09-30). A plugin update / our deploy overwrites it.
+# YOUR changes live in <HERMES_HOME>/filetools/settings.yaml - the Config panel writes only the
+# differences from the values below there; delete a key in that file to get the default back.
+# Shown in the operator's toolset table, so it has to describe THIS toolset
+# rather than list everything the plugin touches. Reworded 2026-09-02: the old
+# text named all eight overridden tools, but only five of them live in this
+# toolset - execute_code / process_manage / vision_analyze are registered under
+# THEIR toolsets on purpose, so the operator's existing switches keep working.
+# The old wording read as a claim on tools that are not in this row, next to
+# twelve suppression placeholders that are not ours to provide either.
+# No emoji in this string on purpose: the plugin already had to swap its slot
+# emoji for glyphs without a variation selector because some consoles render
+# neither (see _SLOT_EMOJI in __init__.py), and a description lands in exactly
+# those consoles. The crossed-out entries are marked by their own emoji field.
+description: "JSON-free file tools v2 — read_file, write_file, patch, search_files and terminal answer the model in plain text instead of a JSON blob. Also wraps execute_code, process_manage and vision_analyze, each registered inside THEIR own toolset so the operator's existing switches keep working. Crossed-out entries listed here are foreign tools this plugin HIDES, not tools it provides."
+author: "Seneelya"
+kind: standalone
+# The last three register CONDITIONALLY (execute_code behind upstream's own
+# check_sandbox_requirements, vision_analyze behind check_vision_requirements,
+# all three only when upstream is importable): this field declares what the
+# plugin CAN provide, and the override capability below has to cover it.
+# `process_manage` is upstream's name since afc3d9d34 (was `process`); both are
+# listed because register() takes whichever one their live registry actually
+# has, so either can be the name we end up overriding.
+provides_tools: [read_file, write_file, patch, search_files, terminal, execute_code, process, process_manage, vision_analyze]
+
+# The trust gate this plugin CANNOT work without: each of the four tools above
+# registers with override=True to take a built-in tool's exact name, which is
+# the only way out of tool_search's progressive-disclosure deferral (see
+# __init__.py's module docstring). Declared so the MODERN capability path is
+# the one in force (#64228, hermes_cli/plugin_capabilities.py): the permission
+# previously rode only on the DEPRECATED plugins.entries.<id>.
+# allow_tool_override key, and when that stops being honored the override
+# fails silently — no error, the model simply gets the built-in tools back and
+# we become invisible. The user's grant lives in their config as
+# granted_capabilities: [tools.override] (+ capabilities_consent); the gate
+# opens on granted OR legacy, granted checked first.
+# After a Hermes update: __HQ/HowTo__Verify_after_hermes_update.md level 4 —
+# the audit line must read evidence=granted_capabilities.
+capabilities: [tools.override]
+
+# Packages the Hermes process needs. PM installs this list into the shared
+# venv when the plugin is admitted (a fresh install, or disable then enable
+# of an already-enabled plugin). Hermes does not read requirements.txt;
+# that file is the same list for humans.
+pip_dependencies:
+  - python-docx>=1.1
+  - openpyxl>=3.1
+  - python-pptx>=1.0
+  - charset-normalizer>=3.3
+  - filetype>=1.2
+  - pytest>=9.1
+
+# Per-tool DEFAULTS - actual values, not just a type description. This is
+# what a fresh install runs with, no profile config.yaml edits needed.
+# register(ctx) in __init__.py reads this section directly (core's own
+# manifest parser doesn't recognize a "tools" field - it isn't one of its
+# known fields - so it logs a harmless "unknown manifest field ignored"
+# warning and drops it from its own PluginManifest object; we bypass that
+# parser and read this raw YAML file ourselves instead, since this file's
+# own settings are exactly what we want to read).
+#
+# A running profile can still override any of this per-slot via
+# plugins.entries.hermes-filetools.settings.tools.<slot> in the profile's
+# config.yaml (see config_schema below) - profile settings always win over
+# what's declared here. All four slots are listed here as of 2026-08-26;
+# _FALLBACK_SLOT_DEFAULTS in __init__.py is now only a safety net for a
+# slot accidentally dropped from this section.
+tools:
+  read_file:
+    enabled: true
+    # help/params_help below: UI-facing one-liners (Plan17's Config panel reads these).
+    # Neither is read by register() itself - unrecognized keys inside a slot's own
+    # mapping are silently ignored (confirmed: cfg = {**fallback, **manifest_cfg,
+    # **profile_cfg}, then cfg.get(<known key>) - anything else in cfg just sits unused).
+    help: "Plain-text answer instead of JSON."
+    path: new               # old | new - which handler implementation runs
+                             # this slot. "new" (view_file_new_core.py /
+                             # Vision01__read.md) rolled out 2026-08-25.
+    # schema: not set here on purpose - __init__.py auto-derives it from
+    # `path` (view_file.yaml for old, view_file_new.yaml for new). Set an
+    # explicit `schema:` only to point this slot at a DIFFERENT file
+    # entirely (registers a second, parallel, non-overriding tool instead).
+    params:
+      mtime: true
+      anchors: true
+      anchor_gap: 25
+    # anchors/anchor_gap are config-level ON PURPOSE, not model-facing flags: the
+    # marks are passive, and a switch the model can flip stops being passive
+    # (CONTRACT.md §18 - live 2026-08-26, an agent that saw such a flag spent its
+    # reasoning deciding about it). anchors is skipped automatically when a call
+    # asks for numbered output.
+    params_help:
+      mtime: "\"new\" path only: appends a \"Modified: ...\" line. No effect on \"old\"."
+      anchors: "\"new\" path only: sparse line-number marks in already-blank lines - a precondition for patch's line hint."
+      anchor_gap: "Minimum lines between two anchor marks. Higher = rarer/quieter, lower = denser."
+  write_file:
+    enabled: true
+    help: "Plain-text answer instead of JSON."
+    path: new                # rolled out 2026-08-25, same as read_file above.
+    # schema: same auto-derivation as read_file above (create_file.yaml /
+    # create_file_new.yaml).
+    params:
+      mtime: true
+      ui_json: "min"
+    # ui_json: same switch and same reason as patch's below (CONTRACT.md §19) -
+    # the desktop app treats write_file as a file-edit tool too, so its calls are
+    # just as invisible without this. For a full overwrite `diff` behaves like
+    # `min`: showing the "before" would mean dumping the whole old file.
+    params_help:
+      mtime: "\"new\" path only: appends a \"Modified: ...\" line."
+      ui_json: "Whether a small JSON block is placed above the text for a UI to read: min = small JSON (default), off = text only, diff/wrap for other UI needs."
+    # Structured, not just prose in params_help above: Plan17's Config panel renders
+    # params generically by TYPE (bool/number/enum), never hardcoded by param name, and
+    # a fixed-choice param needs its option list to come from data, not from the frontend
+    # guessing at the string in params_help.
+    params_options:
+      ui_json: ["min", "off", "diff", "wrap"]
+  search_files:
+    enabled: true
+    help: "Plain-text answer instead of JSON. No params - same old|new switch as the other three file tools."
+    path: new                # implemented 2026-08-26 (sift_files_new_core.py /
+                              # Vision01__search.md), flipped here for live-agent
+                              # verification - same rollout sequence read_file/
+                              # write_file went through above (implement, flip
+                              # this default, live-test, THEN it's "confirmed").
+    # schema: same auto-derivation (sift_files.yaml for old, sift_files_new.yaml
+    # for new).
+  patch:
+    enabled: true
+    help: "Plain-text answer instead of JSON."
+    path: new                # implemented 2026-08-26 (modify_file_new_core.py /
+                              # Vision01__patch.md) - the last of the four slots
+                              # to leave the JSON path. Same rollout sequence as
+                              # the three above (implement, flip this default,
+                              # live-test, THEN it's "confirmed").
+    # schema: same auto-derivation (modify_file.yaml for old,
+    # modify_file_new.yaml for new).
+    params:
+      ui_json: "min"
+    # ui_json, "new" path only: our plain-text answer is the reference form,
+    # this only decides whether a short JSON block is placed ABOVE it for a UI
+    # to read (CONTRACT.md §19). min has been the default since 2026-08-26. wrap
+    # is the only mode the desktop app itself can parse (strict JSON.parse over
+    # the whole payload), and also the only one that escapes our text.
+    params_help:
+      ui_json: "min = small JSON, no code (default). off = text only, nothing for a client to render. diff = plus a copy of the changed lines, marked as a copy. wrap = everything inside the JSON message."
+    params_options:
+      ui_json: ["min", "off", "diff", "wrap"]
+  terminal:
+    enabled: true
+    help: "Calls hermes-agent's own terminal_tool() unmodified (approval/sudo/docker/sandbox logic stays theirs) and reformats its JSON return into plain text."
+    # Single implementation (Plan03, 2026-09-01).
+    #
+    # `path` means something DIFFERENT here than for the four file tools
+    # above, and the difference is worth reading once. There, old|new picks
+    # between two implementations WE wrote. Here - and for the three wrapped
+    # slots below - we only ever wrote one, so:
+    #     new = our wrapper is registered (plain text)
+    #     old = it is NOT registered; Hermes' own JSON-returning tool stays
+    # i.e. `old` is an alias for `enabled: false` for these four. It exists
+    # anyway because register() collects the path:new slots into ONE list and
+    # feeds it to patch_execute_code_bridge() - so this key is what makes a
+    # wrapped tool tell the truth on the execute_code Python facade too
+    # (__HQ/docs/Doc__execute_code_bridge.md). Was `old` until 2026-09-02,
+    # which was doubly untrue: the wrapper registered either way, just
+    # without `symbols`, and the facade kept advertising a dict.
+    path: new
+    # schema: file_ops/terminal.yaml (this repo's OWN copy of their
+    # TERMINAL_SCHEMA, not a live import - see terminal.yaml's header comment
+    # for why: we want the freedom to diverge from upstream's wording).
+  execute_code:
+    enabled: true
+    help: "Wraps hermes-agent's own sandboxed execute_code handler (sandbox/RPC/approval - all theirs), reformats only the JSON return."
+    # Plan04 task 4, 2026-09-02. tools.code_execution_tool._execute_code_handler()
+    # (RPC loop, misdirected-argument recovery - all theirs).
+    #
+    # NOT registered under the `filetools` toolset like the five slots above,
+    # and NOT registered at all unless upstream's own
+    # check_sandbox_requirements passes: this tool has a real availability
+    # check and lives in a separately disableable toolset, so it is meant to
+    # be absent sometimes. Ours must never be the reason it comes back.
+    #
+    # `schema`/`params` are unused here. The schema is built LIVE from
+    # theirs on purpose: model_tools.py:522-529 overwrites the model-facing
+    # execute_code schema by name no matter who registered it, so a copy of
+    # ours could never reach the model anyway - and theirs carries which
+    # sandbox tools are actually enabled this session. `enabled: false` falls
+    # back to Hermes' own JSON-returning execute_code.
+    #
+    # `path` carries the same new|old meaning as terminal above (new = our
+    # wrapper registered, old = upstream's own version stays). Note this tool
+    # has NO Python facade of its own inside the sandbox - _TOOL_STUBS lists
+    # seven tools and execute_code is not one of them - so it can never appear
+    # in the bridge list; the key is here for one uniform switch, not for that.
+    path: new
+  process:
+    enabled: true
+    help: "Wraps hermes-agent's own process_registry handler (start/stop/kill/stdin - all theirs), reformats only the JSON return."
+    # Plan04 task 5, 2026-09-02. tools.process_registry._handle_process()
+    # (action dispatch, session lookup, kill escalation, secret redaction - all
+    # theirs).
+    #
+    # Registered under THEIR toolset `terminal`, not `filetools`, so the
+    # operator's existing switch still turns it off. No check_fn - upstream
+    # declares none, the tool is always available. Unlike execute_code this
+    # slot DOES use our own schema copy (file_ops/process.yaml): nothing in
+    # model_tools.py rebuilds this one per session, so our wording actually
+    # reaches the model. `enabled: false` falls back to Hermes' own
+    # JSON-returning process.
+    #
+    # `path`: same new|old meaning as terminal above. Like execute_code, this
+    # tool has no Python facade in the sandbox, so the key is a switch only.
+    path: new
+  vision_analyze:
+    enabled: true
+    help: "Fixes one upstream bug (Windows host pathlib mangling a container path) and reformats the answer."
+    # Plan05, 2026-09-02.
+    #
+    # The bug: tools/image_source.py:123 parses the model's path with the
+    # HOST's pathlib, so on a Windows host `/workspace/x.jpg` becomes
+    # `\workspace\x.jpg` and the command run INSIDE the Linux container finds
+    # nothing - then reports it as "sandbox returned non-image data", which is
+    # what drove the model into hand-rolling base64. Our wrapper reads the
+    # bytes through this plugin's own file backend (which uses hermes-agent's
+    # container-aware _resolve_path_for_task) and hands their live handler a
+    # data: URL, the one input shape with no pathlib in its branch.
+    #
+    # Registered under THEIR toolset `vision`, with their own
+    # check_vision_requirements forwarded as check_fn and is_async=True (their
+    # handler is a coroutine). `enabled: false` falls back to Hermes' own
+    # version, container-path bug included.
+    #
+    # `path`: same new|old meaning as terminal above. No Python facade in the
+    # sandbox either, so the key is a switch only. Confirmed working live
+    # 2026-09-02: the model really does see images from a container path.
+    path: new
+
+# Shared visual vocabulary for the "new" paths' plain-text output
+# (Vision01__read.md §2). One place so read_file/write_file/future tools
+# can't drift apart on what these mean. write_file's "new" path has no file
+# body to wrap so it doesn't emit any of these itself - it only shares this
+# section's existence and the mtime line's format.
+formatting:
+  block_symbol: "■"      # ■BLOCK : a-b / ■END : b - always OUTSIDE the file body
+  anchor_symbol: "⚓"     # sparse in-body orientation marks - reserved, not emitted yet (v2 pass)
+  separator_symbol: "○"  # header/body divider, printed x3 as "○○○"
+  # The FOURTH symbol, added 2026-09-23 (owner: "нет ромба в конфиге, а он у нас везде
+  # используется"). Every header line we print is wrapped in the comment syntax of whatever
+  # file was opened - `#`, `//`, `<!-- -->`; this is what we use when the file has none of its
+  # own (json, csv, no extension). It lived as a module constant and was the only named symbol
+  # of our output a human could not change - while `_tool_text.py` already described it as
+  # configurable. Now it really is.
+  comment_fallback: "◆"  # ◆Operation ID: ... / ◆○○○ - for files with no comment syntax
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ДВИЖОК КОНТРОЛЯ КОНТЕКСТА (`context_ctl/`, Plan13, этап B `Vision04`).
+#
+# Здесь ТОЛЬКО стоп-кран. Выбор движка — не наш ключ, а их: `context.engine` в
+# config.yaml Хермеса, значение сравнивается с `ContextCtlEngine.ENGINE_NAME`
+# (`ctxctl`). Пока там стоит не наше имя, движок не регистрируется и — главное —
+# НЕ СТАВИТ монкипатч `AIAgent.__init__`: след в чужом ядре появляется только
+# после осознанного выбора владельца ИХ ключом. Наш ключ нужен, чтобы выключить
+# движок, не редактируя чужой конфиг и не теряя из него наше имя.
+#
+# ЧЕСТНОЕ ПРЕДУПРЕЖДЕНИЕ на текущем шаге (Task 1, скелет): пока движок выбран,
+# встроенный ContextCompressor заменён нами, а мы НЕ СЖИМАЕМ НИЧЕГО —
+# `should_compress()` всегда False, `compress()` возвращает вход как есть.
+# Контекст будет расти до предела окна модели. Это режим ПРОВЕРКИ: включить →
+# убедиться слеш-командой `/filetools-context-status`, что движок жив и видит
+# живого агента → выключить.
+# ─────────────────────────────────────────────────────────────────────────────
+context_ctl:
+  enabled: true
+  # Four knobs for the panel's compaction button (Plan16-Task03). All optional —
+  # absent falls back to the code's own default (see `dashboard/plugin_api.py::read_config`).
+  # WARNING on the third one: THEIR config stores a TARGET (shrink down to this much).
+  # OURS stores the OPPOSITE — how much to CUT. Same shape of number, opposite meaning;
+  # copying their semantics here would silently invert the button's behavior.
+  compact_head_keep: 2      # messages at the START never pre-ticked — the session's own
+                             # opening ask, a decision left to the hot path, not this button
+  compact_auto_percent: 95  # context-fill percent at which auto-compaction fires — the marker on
+                             # the token bar; `should_compress` decides by it (Plan24-Task07)
+  compact_auto_enabled: true   # OUR switch for the automaton: false = the decision is only SHOWN
+                             # (token bar window, engine status), `should_compress` answers "no".
+                             # Their `compression.enabled` in config.yaml must ALSO be true for
+                             # them to ask at all (Recon31 F2). Compaction on "yes" — Plan16 item 1.
+  compact_auto_pause_minutes: 3   # after 2 automaton failures in a row — no new attempt for this
+                             # long (besides: one automatic attempt per turn, never while a
+                             # compaction of ours is running)
+  compact_wait_turn_minutes: 10  # manual compaction finished while a turn runs -> wait up to this
+                             # long for the turn to end, then write over the fresh tape; 0 = don't wait
+  compact_silence_minutes: 5   # no step of a running compaction for this long -> the progress
+                             # line in the panel turns yellow ("may be hung"); the run is NOT killed
+  compact_server: auto         # which server the interrogation talks to: auto (by address; local =
+                             # llamacpp) | llamacpp | vllm | gemini | openai | openrouter | plain.
+                             # Picks the "don't think" request fields; a 400 steps down to none
+  compact_route: session       # which model answers the interrogation: session (the live agent's
+                             # model) | own (the three keys below). own + broken -> refusal, never
+                             # a silent fallback to the session model (Doc__interrogation-route.md)
+  compact_route_base_url: ""   # own route: OpenAI-compatible base, e.g.
+                             # https://generativelanguage.googleapis.com/v1beta/openai
+  compact_route_model: ""      # own route: model name, e.g. gemini-2.5-flash
+  compact_route_key_env: ""    # own route: NAME of the env var holding the key (Hermes loads its
+                             # .env into the gateway env); empty = no key (local server)
+  compact_cut_percent: 50   # percent of the eligible middle to pre-tick for cutting — OUR share,
+                             # not their "shrink to" target (see warning above)
+  compact_tail_keep: 10     # messages at the END never pre-ticked — what the conversation is
+                             # about right now
+  # Whose turn the distillate is written as. `auto` keeps the old behaviour: the role is
+  # picked so the inserted row never collides with a neighbour. `user`/`assistant` pin it.
+  # A SETTING ON PURPOSE (owner, 2026-09-22): the distillate is a briefing about the past,
+  # and whether the model reads it as its own earlier work or as something the human said
+  # changes how it treats it. Which is better cannot be settled from the armchair — it has
+  # to be measured on live runs, and a floating role would make those runs incomparable.
+  # NOT covered by this knob: the closing bracket. That one is machinery talking, and it is
+  # always `assistant` — a live run put it in as a HUMAN turn, i.e. words the owner never said.
+  compact_distillate_role: assistant   # auto | user | assistant
+  # Where the panel saves messages and whole sessions as .md (Vision09, export half).
+  # Empty = the plugin's own home, `<hermes home>/filetools/export/`. A folder per session,
+  # a file per message, named `<message time>__<address>__<role>.md`.
+  #
+  # DELIBERATELY NOT under `ctxctl/` (owner saw the path live, 2026-09-23: too much nesting).
+  # Its neighbours there are machinery files nobody opens by hand; this one is FOR the human.
+  #
+  # LIVE since 2026-09-23 (Plan16-Task05): `POST /context-export` writes here, and the `save`
+  # button in the Mirror's message popup is what calls it. Read on EVERY save, so a path
+  # changed in this panel takes effect at once, not after a restart.
+  compact_export_root: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMP PARAMS — a deliberate junk drawer for numbers we don't measure yet and a human enters
+# by hand instead. Each one is meant to LEAVE once the real measurement exists — hence its own
+# section, kept visually apart from real settings on the Config panel, not folded into
+# `context_ctl:` above.
+# ─────────────────────────────────────────────────────────────────────────────
+# Empty since 2026-09-29: `system_prompt_tokens` (a human's estimate) left once the token counter
+# measured the system prompt and tool schemas itself (Plan24, `context_ctl/_tokcount.py`).
+temp_params: {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEDGER — the operation store behind the panel (Plan11). SERVICE-level rather
+# than per-slot on purpose: ONE store is shared by every tool, so a threshold
+# has no business under any single slot's `params`. Read once at register()
+# (__init__.py -> _ledger.configure), which is also where the sidecar sweep
+# runs; a profile can override the same keys via its own `ledger:` section.
+# Every key is optional — absent means the code's own default.
+# ─────────────────────────────────────────────────────────────────────────────
+ledger:
+  cmd_head_chars: 200        # How much of the call is kept INSIDE the entry.
+                             # Enough to be meaningful on a card without the
+                             # entry turning into the body itself.
+  cmd_sidecar_min_chars: 400 # Above this the full body also goes to a file of
+                             # its own. Deliberately larger than the head:
+                             # between the two the head IS the whole command,
+                             # so a file would be pure overhead.
+  sidecar_keep_days: 50      # Age budget for those files.
+  sidecar_max_mb: 200        # Size budget, checked ALONGSIDE age — age alone
+                             # would let a burst inside the retention window
+                             # fill the disk. Oldest are deleted first.
+                             #
+                             # Both budgets are enforced ONLY at registration,
+                             # i.e. once per process. Honest consequence: a
+                             # long-lived Hermes will not sweep until restart.
+                             # Acceptable because the cost is disk, not
+                             # correctness — "no sidecar" is a legal state by
+                             # contract and no consumer depends on one being
+                             # there (Plan11-Task03).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ЗОНА ОТКЛЮЧЁННЫХ ТУЛОВ — не наши, чужие. Тулы, перечисленные здесь, при
+# загрузке плагина затеняются нашей записью с `check_fn`, который всегда
+# отвечает «недоступен» (__init__.py::_suppress_disabled_tools). Реестр отдаёт
+# схемы ТОЛЬКО тех тулов, чей check_fn прошёл (model_tools.py:509), поэтому в
+# список, уходящий модели, они не попадают вовсе. Это не заглушка, отвечающая
+# ошибкой: модель не узнаёт, что тул существует.
+#
+# Почему затенение, а не снятие из реестра: `registry.deregister()` плагину
+# структурно запрещён — его registry-scope это профиль, поэтому caller_scope
+# никогда не None, и API отказывает («cannot deregister process-global tool …;
+# register a scoped override instead»). Проверено вживую 2026-09-02: все 16
+# имён отказ. Никакой флаг в конфиге этого не выдаёт, `allow_tool_override`
+# проверяется уже ПОСЛЕ отказа.
+#
+# ПОЧЕМУ ЭТО ЗДЕСЬ, А НЕ В config.yaml ХЕРМЕСА. Тулсеты `desktop_ui` и `project`
+# намеренно держат ВНЕ `_HERMES_CORE_TOOLS`, и подмешивает их ровно одна функция
+# `_gui_surface_toolsets()` (tui_gateway/server.py) — по признаку «источник
+# сессии = десктопное приложение». Это объединение выполняется ПОСЛЕ любого
+# вычитания из конфига, на обоих путях резолвера:
+#     tui_gateway/server.py:5281   return sorted({*selection, *_gui_surface_toolsets(...)})
+#     tui_gateway/server.py:5398   return sorted(enabled | _gui_surface_toolsets(...))
+# Поэтому их не может выключить НИЧЕГО из конфига: ни `platform_toolsets`, ни
+# `agent.disabled_toolsets` (его `_get_platform_tools` честно применяет — чтобы
+# объединение тут же вернуло тулсет назад), ни родной UI приложения, чей
+# `setToolsetEnabled()` пишет тот же самый проигрывающий `platform_toolsets`.
+# Проверено вживую 2026-09-02: `project` лежал в `agent.disabled_toolsets`, а его
+# тулы всё равно предлагались модели.
+#
+# ЧТО ЭТО ЛОМАЕТ, ЧЕСТНО. Это тулы, которыми МОДЕЛЬ управляет панелями десктопа
+# (внутри они зовут `desktop_ui.emit`). Сами панели рисует клиент и они
+# продолжают работать: пропадает «модель может открыть превью», а не «превью
+# сломано».
+#
+# ПОЛНЫЙ СОСТАВ ПАКА — снято из ЖИВОГО реестра (registry после
+# discover_builtin_tools(), 2026-09-02), а не из статических списков toolsets.py:
+# те неполны — `apply_layout` зарегистрирован с toolset="desktop_ui", но в
+# списке этого тулсета в toolsets.py отсутствует. По тулу и по имени тулсета —
+# `disabled_tools_help` ниже (той же командой снято, UI-факинг однострочники).
+#
+# ЧТОБЫ ВЕРНУТЬ один тул для пробы — закомментируй его строку ниже и перезагрузи
+# плагин (/filetools-reload). Профиль может заменить весь список целиком через
+# plugins.entries.hermes-filetools.settings.disabled_tools — он ЗАМЕНЯЕТ, а не
+# дополняет: это денилист, и при слиянии имя было бы невозможно из него убрать.
+disabled_tools:
+  - annotate_preview
+  - apply_layout
+  - close_terminal
+  - drive_preview
+  - focus_pane
+  - react_to_message
+  - read_terminal
+  - read_window_below
+  - setup_mcp
+  - desktop_preview
+  - gui_tour
+  - desktop_project
+  - open_preview
+  - close_preview
+  - read_preview
+  - tour
+  - project_create
+  - project_list
+  - project_switch
+  # The Config panel does NOT edit this list any more (2026-09-30): toggling a box writes the
+  # WHOLE list into the user's settings.yaml, which then replaces this one. Comments stay below
+  # the items anyway (was needed while the panel round-tripped this file).
+  #
+  # This list hides tools BY NAME, so an upstream rename un-hides them without
+  # any error - found 2026-09-02 checking afc3d9d34, where seven of the
+  # sixteen names above had already moved. Both spellings are kept on purpose:
+  # `_suppress_disabled_tools` is fail-open per name and a name that isn't
+  # registered is a printed no-op, so carrying the old ones costs nothing and
+  # keeps this list working on either Hermes version. Renamed at afc3d9d34
+  # (commit e16ad33a9): open_preview / close_preview / read_preview ->
+  # desktop_preview, tour -> gui_tour, project_create / project_list /
+  # project_switch -> desktop_project.
+
+# UI-facing text for Plan17's Config panel (Disabled Hermes tools zone) - not read by
+# _load_manifest_disabled_tools or _suppress_disabled_tools, which only ever look at the
+# plain list above. Canonical names only (the pre-rename legacy spellings in the list
+# above are a compatibility shim, not a second set of tools needing their own text).
+disabled_tools_zone_help: >
+  Foreign tools, not ours - the model loses the ability to drive desktop panels
+  (open a preview, focus a pane, ...), the panels themselves keep working.
+  Shadowed at load, not removed from the registry: the model never learns these
+  tools exist.
+disabled_tools_help:
+  annotate_preview: "Draw markup over the embedded preview."
+  apply_layout: "Switch the desktop panel layout to a preset."
+  close_terminal: "Close the terminal panel."
+  drive_preview: "Drive the preview page (clicks / typing)."
+  focus_pane: "Show / focus a panel."
+  react_to_message: "Tapback reaction on a message."
+  read_terminal: "Read the terminal panel's output."
+  read_window_below: "Read the window underneath the current one."
+  setup_mcp: "MCP server connection wizard."
+  desktop_preview: "Open / close / read the embedded preview (merges the old open_preview, close_preview, read_preview)."
+  gui_tour: "Guided tour of the app (was \"tour\")."
+  desktop_project: "Create / list / switch a workspace (merges the old project_create, project_list, project_switch)."
+
+config_schema:
+  # Hermes' `config_schema` is NOT JSON Schema. hermes_cli/plugins.py
+  # (_parse_manifest_v2_fields) reads a FLAT mapping of
+  #     <settings key> -> {type?, default?, description?, required?}
+  # and validate_config_schema() checks only the TOP-LEVEL keys of
+  # `plugins.entries.hermes-filetools.settings`, without recursing. Declaring
+  # a JSON Schema here (`type: object` + `properties:`) made the loader warn
+  # "config_schema entry 'type' must be a mapping; skipping" on every load and
+  # then register a phantom settings key literally named `properties` - so
+  # nothing we actually accept was ever validated. Types allowed:
+  # str/string, int/integer, float/number, bool/boolean, list/array,
+  # dict/object.
+  #
+  # The per-slot detail this section used to spell out is NOT lost: it lives
+  # in the `tools:` section above (the defaults, field by field, with the same
+  # comments) and in file_ops/CONTRACT.md. Only the machine-checkable part
+  # belongs here, and the machine can check exactly two keys.
+  tools:
+    type: object
+    description: >
+      Per-slot overrides of the `tools:` defaults declared above in this same
+      file. Slot keys: read_file, write_file, patch, search_files; per-slot
+      fields: enabled (bool), path (old|new), schema (filename in file_ops/),
+      params (mtime, anchors, anchor_gap, ui_json). A missing slot or field
+      falls back to this manifest's own default. Hermes validates only that
+      this key is a mapping - the nested shape is enforced by __init__.py,
+      which treats anything it does not recognize as absent.
+  context_ctl:
+    type: object
+    description: >
+      Kill switch for the context engine: `enabled` (bool, default true).
+      Which engine RUNS is Hermes' own `context.engine` key, not this one -
+      this only lets a profile turn ours off without editing their config.
+  formatting:
+    type: object
+    description: >
+      Overrides the block_symbol / anchor_symbol / separator_symbol declared
+      in this file's own `formatting:` section above. Used by read_file's
+      "new" path; write_file's "new" path has no file body to wrap, so it
+      emits none of these itself but shares the section.

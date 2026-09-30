@@ -1,0 +1,54 @@
+# "new" path for write_file — see __HQ/vision/Vision01__write.md for the full
+# design rationale. Plain-text response (never JSON): one of "Created new
+# file (N lines)." / "Overwritten (N lines)." / "Appended N lines (file now
+# X lines total)." / "Inserted N lines at start/at line K (file now X lines
+# total)." / "ERROR: ...". insert_line adds targeted insertion instead of
+# only ever overwriting the whole file.
+name: write_file
+description: >
+  Write a file's full content, or splice lines into an existing file at a
+  specific position — creates the file (and any missing parent
+  directories) if it doesn't exist. Full write: write_file(path, content,
+  flags=""). Insert: flags="--insert-line N" — 0=start of file, 1..N=at line
+  N (pushes it down), -1=append. Use 'patch' instead for targeted
+  find/replace edits.
+required: [path, content, flags]
+properties:
+  path:
+    type: string
+    description: Path to the file to write (created if missing, along with parent directories)
+  content:
+    type: string
+    description: >
+      Text to write. Without "--insert-line": this is the file's ENTIRE new
+      content (full overwrite). With "--insert-line": this is just the chunk
+      being inserted — NOT the whole file. A newline is the literal 0x0A
+      character, never the two characters backslash+n. Written verbatim,
+      including any leading/trailing blank lines it contains. Tool-written
+      lines PASTED FROM A read_file RESPONSE are dropped before writing, so
+      there is no need to strip them by hand — that means lines exactly as
+      that response showed them, carrying the comment prefix of this file's
+      type (e.g. "#File:", "#FileTag:", "#■BLOCK", "#■END", "#⚓ Line: N" in a
+      .py file). A line with the same words but WITHOUT that prefix is not
+      recognised as tool-written and is written into the file as ordinary
+      content — deliberately, since a file may legitimately contain such a
+      line and deleting it silently would be worse. Call flags="--help" for
+      the exact rule.
+  flags:
+    type: string
+    description: >
+      Required — send it EMPTY (nothing between the quotes of the value) when
+      no modifier is needed; do not write quote characters as the value
+      itself. Space-separated,
+      like a terminal command, values after a space and never with "=":
+      "--insert-line 40". "--insert-line N" adds `content` INTO the file at
+      that position instead of overwriting the whole file (use it to add to
+      a file without reading it first): 0 = start of file (valid even for a
+      new/empty file), 1..N = insert AT that existing line number, pushing
+      that line and everything after it down, -1 = append at the end. Leave
+      the flag out for a full overwrite. "--force" skips this tool's default
+      content-safety checks and writes exactly what was given. An
+      unrecognised flag is refused by name and NOTHING is written, never
+      silently ignored. Call flags="--help" to list every flag with full
+      descriptions — you'll also see contextual hints in the tool's own
+      response during normal use.

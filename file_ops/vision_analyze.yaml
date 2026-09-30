@@ -1,0 +1,54 @@
+# vision_analyze — override of Hermes' own built-in `vision_analyze` tool.
+# This YAML is OUR OWN copy of their VISION_ANALYZE_SCHEMA
+# (tools/vision_tools.py:1726 in hermes-agent), taken deliberately so we can
+# diverge from upstream's wording without waiting on/tracking their changes
+# (Plan03 decision, applied here by Plan05).
+#
+# A copy is worth having: nothing in model_tools.py rebuilds this schema per
+# session (verified 2026-09-02 - only execute_code and the two discord tools
+# get that treatment), so our wording actually reaches the model.
+#
+# The vision work itself is NOT reimplemented - vision_analyze_core.py reads
+# the image bytes through our own file backend (the part upstream gets wrong on
+# a Windows host, see that file's docstring), hands their live handler a data
+# URL, and reformats only the string answer.
+name: vision_analyze
+description: >
+  Load an image into the conversation so you can see it. Accepts a plain file
+  path, a URL, or a data URL. When your active model has native vision, the
+  image is attached to your context directly and you read the pixels yourself
+  on the next turn — call this any time the user references an image (filepath
+  in their message, URL in tool output, screenshot from the browser, etc.).
+  For non-vision models, falls back to an auxiliary vision model that returns
+  a text description.
+
+
+  A plain path is enough — the same path your other file tools take, and it is
+  read from the same filesystem they see. Do NOT convert an image to base64
+  yourself and do NOT build a data: URL by hand; if a path cannot be read you
+  get a path error saying so, which is a different problem from a file that
+  is not an image.
+required: [image_url, question]
+properties:
+  image_url:
+    type: string
+    description: >
+      Image file path (the same form your other file tools accept), an
+      http/https URL, or a data: URL.
+  question:
+    type: string
+    description: >
+      Your specific question or request about the image. Optional context the
+      model uses on the next turn after seeing the image.
+  region:
+    type: array
+    items:
+      type: integer
+    minItems: 4
+    maxItems: 4
+    description: >
+      Optional [x1, y1, x2, y2] crop region in pixel coordinates of the
+      ORIGINAL image, applied before any downscaling so the region keeps full
+      resolution. Intended flow: load the full image first, then call again
+      with a region to zoom into a detail (small text, UI element, fine
+      print). Coordinates are clamped to the image bounds.
