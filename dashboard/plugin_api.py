@@ -2991,6 +2991,17 @@ def _compact_int(value, default: int) -> int:
         return int(default)
 
 
+def _hermes_verified() -> dict:
+    """`{"commit", "date"}` of the Hermes this plugin version was last checked against — the seam
+    registry's `meta`. Empty strings when the registry is missing or unreadable (shown as a dash)."""
+    core = _load_seams_check()
+    try:
+        meta = (core.load() if core is not None else {}).get("meta") or {}
+    except Exception:  # noqa: BLE001 - a broken registry must not break the Config panel
+        meta = {}
+    return {"commit": str(meta.get("baseline_head") or ""), "date": str(meta.get("baseline_taken") or "")}
+
+
 def read_config() -> dict:
     """The Config panel's read side: the EFFECTIVE settings (defaults + the user's
     `settings.yaml`) plus the `help` / `params_help` / `disabled_tools_help` text the
@@ -3045,6 +3056,15 @@ def read_config() -> dict:
         # (владелец, 2026-09-23). Пустая строка означает «манифест прочитан, а поля в нём нет»;
         # панель покажет прочерк, а не выдуманное число.
         "version": str(data.get("version") or ""),
+        # НА КАКОМ HERMES ЭТА ВЕРСИЯ ПРОВЕРЕНА (владелец, 2026-10-02): многое у нас держится за
+        # непубличный код Hermes, и человек должен видеть, с каким их коммитом всё сходилось.
+        # Источник — реестр швов, который едет с плагином (`meta.baseline_head` /
+        # `baseline_taken`); его же подставляет в README сборка релиза.
+        "hermes_verified": _hermes_verified(),
+        # DEV-РЕЖИМ (владелец, 2026-10-02): вкладки разработки (Operations, Palette) панель
+        # показывает только при `dev: true` в settings.yaml пользователя. Строго `True`: строка
+        # «true» из руками правленого файла YAML и так разберёт как bool.
+        "dev": data.get("dev") is True,
         # Дом плагина и файл настроек пользователя (2026-09-30) — панель показывает их как есть.
         "data_root": data_root,
         "settings_file": settings_file,

@@ -66,16 +66,20 @@ str)`», и вызов в `gateway/run_inbound.py::_hm_dispatch_quick_and_plugin
    `display_metadata`, `api_content`, reasoning-колонки, `timestamp`), — запись из
    снимка обнуляла их у КАЖДОЙ строки сессии, а не только у тронутых.
 
-   Поэтому у правки две половины с разными списками и одним набором адресов:
+   Поэтому правка идёт по базе, а память гейтвея после записи ПЕРЕЧИТЫВАЕТСЯ из неё:
 
        база     ← get_messages(session_id) → заглушки → replace_messages
-       гейтвей  ← session["history"]       → заглушки → правка НА МЕСТЕ
+       гейтвей  ← get_messages_as_conversation(..., include_row_ids=True)
+                  → canonicalize_replay_history → на место (`history[:] = …`)
 
    `get_messages` (по умолчанию только активные, `ORDER BY id ASC`) отдаёт словари, чьи
    ключи `_insert_message_rows` читает обратно один в один, включая `timestamp` — то есть
-   круговой оборот через базу ничего не теряет. Память гейтвея НЕ перезаписывается нашим
-   списком: у неё своя форма, и подменять её строками базы значило бы менять то, чего мы
-   не собирались менять. Ей мы правим ровно те же сообщения по тем же `tool_call_id`.
+   круговой оборот через базу ничего не теряет. Память гейтвея мы НЕ собираем сами
+   (`Plan26`, 2026-10-02): у неё своя форма со служебными метками (`_row_id`,
+   `_db_persisted`), и прежняя правка памяти «теми же сообщениями по тем же `tool_call_id`»
+   оставляла у перевставленных строк старые `_row_id` — их сверка перед ходом дописывала
+   наши строки второй раз (`Recon33`). Форму держит их загрузчик — тот же рецепт, что у
+   их резюма (`_memory_loader`).
 
 ДЕГРАДАЦИЯ, А НЕ ПАДЕНИЕ. Оба шва приватные. Если любой пропал после обновления Hermes,
 команда честно скажет об этом и НЕ тронет контекст.
@@ -359,13 +363,13 @@ def drop_stale_api_content(old_rows, new_rows) -> list:
     return out
 
 
-def commit_replacement(session, agent, db_messages, gateway_messages=None, **kwargs) -> tuple:
+def commit_replacement(session, agent, db_messages, **kwargs) -> tuple:
     """Записать новую ленту — ЕДИНСТВЕННЫЙ путь наших правок базы (compact / drop / erase / edit /
     import). После успешной записи сообщаем движку сессии: реальное число последнего ответа
     сервера (якорь счётчика токенов) описывает СТАРУЮ ленту и больше не годится
     (`Plan16` п.1, задача B: иначе автомат видит прежнюю длину и сжимает снова и снова).
     """
-    ok, why = _commit_replacement(session, agent, db_messages, gateway_messages, **kwargs)
+    ok, why = _commit_replacement(session, agent, db_messages, **kwargs)
     if ok:
         engine = getattr(agent, "context_compressor", None)
         note = getattr(engine, "note_rewrite", None)
@@ -392,14 +396,40 @@ def should_retry(why: str) -> bool:
     return str(why or "").startswith((BUSY_TURN, BUSY_MOVED))
 
 
-def _commit_replacement(session, agent, db_messages, gateway_messages=None,
-                       removed=()) -> tuple:
-    """Записать переписанную историю: сначала в базу, потом в память гейтвея.
+def _memory_loader(session_db):
+    """`(читатель, "")` или `(None, причина)`: память гейтвея из базы — ИХ загрузчиком (`Plan26`).
 
-    `(ok, пояснение)`. Два списка, потому что это две разные истории одной сессии:
-    `db_messages` — переписанные строки БАЗЫ (полный активный набор), `gateway_messages` —
-    переписанный снимок `session["history"]`. Не передан второй — правим память тем же
-    списком, что и базу (так живут тесты и путь без гейтвея).
+    Ровно так память наполняет их резюм десктопа (`tui_gateway/server.py::_load_resume_transcript`):
+    `get_messages_as_conversation(..., repair_alternation=True, include_row_ids=True)`, затем
+    `canonicalize_replay_history`. Загрузчик ставит на каждое сообщение `_row_id` и `_db_persisted`;
+    по первой метке их сверка перед ходом решает, что в базе новее памяти, по второй — их сохранение
+    решает, что не писать. Наша прежняя сборка памяти из старых словарей оставляла у перевставленных
+    строк СТАРЫЕ `_row_id`, и следующий ход дописывал наши же строки второй раз (`Recon33`, сессия
+    `20261001_225039_9d612f`). Форму сообщения держит Hermes — мы её больше не угадываем.
+    """
+    load = getattr(session_db, "get_messages_as_conversation", None)
+    if not callable(load):
+        return None, "session_db.get_messages_as_conversation пропал — перечитать память из базы нечем"
+    try:
+        from agent.replay_cleanup import canonicalize_replay_history
+    except Exception as exc:  # noqa: BLE001 - их модуль переехал/переименован
+        return None, ("agent.replay_cleanup.canonicalize_replay_history недоступен "
+                      f"({type(exc).__name__}: {exc})")
+
+    def read(session_id):
+        rows = load(session_id, repair_alternation=True, include_row_ids=True)
+        if not isinstance(rows, list):
+            raise TypeError(f"загрузчик вернул {type(rows).__name__}, а не список")
+        return canonicalize_replay_history(rows)
+    return read, ""
+
+
+def _commit_replacement(session, agent, db_messages, removed=()) -> tuple:
+    """Записать переписанную историю: сначала в базу, потом перечитать память гейтвея ИЗ БАЗЫ.
+
+    `(ok, пояснение)`. `db_messages` — переписанные строки БАЗЫ (полный активный набор). Память
+    (`session["history"]`) мы больше не собираем: после записи её наполняет их загрузчик
+    (`_memory_loader`, `Plan26`). Его наличие проверяется ДО записи: без него отказ, база не тронута.
 
     Порядок именно такой: база — источник, из которого интерфейс и следующая сессия читают
     историю, а память гейтвея — то, из чего собирается следующий запрос. Упасть между ними
@@ -422,6 +452,10 @@ def _commit_replacement(session, agent, db_messages, gateway_messages=None,
     if not callable(getattr(session_db, "replace_messages", None)):
         return False, ("session_db.replace_messages пропал — примитив замены строк "
                        "недоступен, применять нечем")
+    read_memory, no_loader = _memory_loader(session_db)
+    if read_memory is None:
+        return False, (f"{no_loader}. Без него память после записи пришлось бы собирать самим, "
+                       "а это и задваивало хвост (`Recon33`). Контекст не тронут")
 
     unaccounted = _unaccounted_active_rows(session_db, session_id, db_messages, removed)
     if unaccounted:
@@ -442,7 +476,14 @@ def _commit_replacement(session, agent, db_messages, gateway_messages=None,
         return False, (f"{type(exc).__name__}: {exc} — вероятнее всего в сессии идёт ход; "
                        "дождись ответа модели и повтори. Контекст не тронут")
 
-    memory = db_messages if gateway_messages is None else gateway_messages
+    try:
+        memory = read_memory(session_id)
+    except Exception as exc:  # noqa: BLE001 - база уже записана, откатывать нечем
+        # Прежнюю память НЕ оставляем молча: в ней старые `_row_id`, на следующем ходу их сверка
+        # задвоит хвост. Собрать её сами тоже не можем — значит, только громко.
+        return True, (f"применено в БАЗЕ, но память гейтвея НЕ перечитана ({type(exc).__name__}: "
+                      f"{exc}) — переоткрой сессию (или перезапусти шлюз) ДО следующего сообщения, "
+                      "иначе следующий ход может задвоить хвост")
     lock = session.get("history_lock")
     if lock is None:
         _write_history(session, memory, version)

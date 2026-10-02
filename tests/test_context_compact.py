@@ -501,7 +501,7 @@ def _wait_setup(monkeypatch, commits):
                                           "provider": "p", "model": "m", "tokens": 1})
     monkeypatch.setattr(_compact, "WAIT_TURN_POLL_S", 0)
 
-    def commit(session_, agent, new_rows, new_history, **kw):
+    def commit(session_, agent, new_rows, **kw):
         written.append([str(r.get("content")) for r in new_rows])
         answer = commits.pop(0)
         if callable(answer):

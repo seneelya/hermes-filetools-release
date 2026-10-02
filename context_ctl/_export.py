@@ -74,10 +74,11 @@
 относительный импорт невозможен в принципе. Отсюда осознанная копия со своим тестом-сверкой:
 `_safe_session` (из `file_ops/_ledger.py`).
 
-Исключение — `_addresses.py` (Plan16-Task06): правило владения копировать нельзя, это ровно
-та вторая ветка одного функционала, которой мы избегаем. Он сам написан без относительных
-импортов, и мы берём его ОБОИМИ способами: пакетом, когда нас импортируют пакетом (агент,
-тесты), и по пути соседнего файла, когда нас самих загрузили по пути (дашборд).
+Исключения — два файла, которые копировать нельзя. `_addresses.py` (Plan16-Task06): правило
+владения — ровно та вторая ветка одного функционала, которой мы избегаем. `_home.py`: дом
+плагина — одно правило на все пути данных. Оба берём ОБОИМИ способами: пакетом, когда нас
+импортируют пакетом (агент, тесты), и по пути файла, когда нас самих загрузили по пути
+(дашборд). Голый `from ..` на втором пути падает: пакета нет.
 """
 from __future__ import annotations
 
@@ -127,6 +128,28 @@ def _safe_session(session: str | None) -> str:
 calls_of = _addresses.calls_of
 
 
+def _home_module():
+    """`<корень плагина>/_home.py` — одно правило дома плагина.
+
+    Пакетом — относительный импорт. Панель грузит этот файл по пути (пакета нет) — тогда
+    тот же `_home.py` по пути, один на процесс. Тот же приём, что у `_select.py`.
+    """
+    try:
+        from .. import _home
+        return _home
+    except ImportError:
+        import importlib.util
+        import sys
+        mod = sys.modules.get("hermes_filetools_home")
+        if mod is None:
+            path = Path(__file__).resolve().parents[1] / "_home.py"
+            spec = importlib.util.spec_from_file_location("hermes_filetools_home", path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["hermes_filetools_home"] = mod
+            spec.loader.exec_module(mod)
+        return mod
+
+
 def split_halves(text) -> list:
     """Файл → половины, по разделителю версии 2. Пустые строки вокруг — не в счёт.
 
@@ -146,12 +169,11 @@ def export_dir(root: str | None = "") -> Path:
     configured = str(root or "").strip()
     if configured:
         return Path(configured).expanduser()
-    from .. import _home
     # НЕ внутри `ctxctl/` (владелец увидела путь живьём, 2026-09-23: «слишком большая
     # вложенность лишняя»). Соседи по `ctxctl/` — служебные файлы механизма (`select`,
     # `applied`, `compact_state`), которые человек не открывает никогда; выгрузка наоборот,
     # она ДЛЯ человека, и лежать ей в подвале нашего движка незачем.
-    return _home.plugin_home() / "export"
+    return _home_module().plugin_home() / "export"
 
 
 def session_dir(session: str | None, root: str | None = "") -> Path:

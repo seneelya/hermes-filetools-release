@@ -92,12 +92,17 @@ def setup(ctx, *, plugin_version: str = "", enabled: bool = True,
     # молча оставалась `auto`, и живой прогон выдал дистиллят репликой ЧЕЛОВЕКА при
     # `compact_distillate_role: assistant` в конфиге. Настройка, которая молча не
     # применяется, хуже отсутствующей: она создаёт уверенность, что выбор сделан.
-    from . import _compact
+    from . import _compact, _settings
     role_why = _compact.set_distillate_role((config or {}).get("compact_distillate_role"))
 
-    return ("ctxctl: АКТИВЕН (Plan13 Task 1, скелет). ВНИМАНИЕ: автоматической компакции "
-            "нет вовсе — контекст растёт до предела окна. Включать для проверки, "
-            "выключать после. | " + llm_why + " | " + role_why)
+    # Действующие пределы: plugin.yaml + settings.yaml. Секция `config` этого вызова — только
+    # то, что Hermes отдал при загрузке, без правок панели.
+    cfg = _settings.compaction()
+    auto = "on" if cfg.get("compact_auto_enabled") else "off"
+    limits = (f"auto-compaction {auto}, threshold {cfg['compact_auto_percent']}% full"
+              f" | head keep {cfg['compact_head_keep']}, tail keep {cfg['compact_tail_keep']},"
+              f" cut {cfg['compact_cut_percent']}%")
+    return "ctxctl: ACTIVE | " + limits + " | " + llm_why + " | " + role_why
 
 
 def format_status(_raw_args: str = "") -> str:

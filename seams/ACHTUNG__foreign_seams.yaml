@@ -27,7 +27,23 @@
 # yet — write that down instead of a guess.
 
 meta:
-  # Rebased after the live update landed: prod moved 6e2b8e070 -> 1021a03256
+  # Rebased 2026-10-02 (evening) to 54bc5e509c after the live update from
+  # f42f579cf8 (900 commits). Prepared by HowTo__PrepareForUpdate.md (agent in
+  # the container, code compare): no risks, 4 ATTENTION; 27 commits landed
+  # after that audit (desktop/icons + provider tool-id normalization in
+  # validate_tool_calls - before dispatch, so the ledger records the final id).
+  # Full check green on the live tree: 59 OK + 2 TEST-OK, 178 tests; no count
+  # moved. Plan26 re-checked live (edit mid-session, next turn, no doubles).
+  #
+  # Earlier the same day: rebased to f42f579cf8 (live since the 2026-09-30 update,
+  # 377-commit range from 1021a03256). Full check green on it: 59 OK +
+  # 2 TEST-OK, 178 seam tests, no count moved. Ten seams were ADDED on this
+  # head (data.*, ctxctl.live_config_threshold_cap,
+  # ctxctl.alternation_repair_count, six Plan26 memory seams) - their
+  # baselines were taken here. NOT done for this range: the commit-by-commit
+  # upstream analysis by a local agent (ACHTUNG/HowTo__Analyze_upstream_update.md).
+  #
+  # Previous rebase, after the live update landed: prod moved 6e2b8e070 -> 1021a03256
   # (1036-commit range). Checker was green on this range with the OLD
   # baseline already (43 OK, 2 TEST-ONLY, zero DRIFT/FAIL) - no counts moved,
   # so no `file:`/`baseline_count` edits were needed this round. Only the
@@ -49,8 +65,8 @@ meta:
   # bridge.tool_stubs's tuple shape changed (name dropped, was redundant
   # with the dict key) - file_ops/_execute_code_bridge.py now detects the
   # shape instead of assuming it.
-  baseline_taken: "2026-09-12"
-  baseline_head: "1021a03256"
+  baseline_taken: "2026-10-02"
+  baseline_head: "54bc5e509c"
   # Fallback only. The checker resolves the live checkout itself:
   # HERMES_AGENT_ROOT, else <HERMES_HOME>/hermes-agent (installer layout).
   prod_root: "Y:/Hermess/body/hermes-agent"
@@ -562,8 +578,9 @@ seams:
       Count how many role-alternation repairs THEIR loader would make on a
       copy of the tape (`_alternation.their_repairs`), before and after our
       edit - compaction AND erase refuse to write when the edit makes it worse
-      (their loader would merge same-role neighbours and write the merge back,
-      moving our addresses). Imported lazily, called on a deepcopy with
+      (their loader merges same-role neighbours in the loaded list; a later
+      rewrite from memory - their rewind - stores the merge, moving our
+      addresses; Recon33). Imported lazily, called on a deepcopy with
       agent=None.
     breaks: >-
       Renamed or signature changed -> `their_repairs` returns None and the
@@ -571,6 +588,108 @@ seams:
       bridges are still inserted by our own rule, but nothing verifies them
       against their loader any more. No crash, lost safety net.
     asserted_by: tests/test_erase_alternation.py::test_e8_their_check_is_not_worse_with_bridges
+
+  # ---- Plan26 (2026-10-02): gateway memory after OUR write = THEIR loader ----
+  # Recon33: memory we built ourselves kept stale `_row_id`s; their pre-turn
+  # check adopted our re-inserted rows as foreign and the tail doubled.
+
+  - id: ctxctl.memory_loader
+    level: 3
+    file: hermes_state_messages.py
+    kind: symbol
+    symbol: "def get_messages_as_conversation("
+    baseline_count: 1
+    we_do: >-
+      After every write of ours (`_apply._commit_replacement`: compact, drop,
+      erase, edit, import) refill `session["history"]` with
+      get_messages_as_conversation(agent.session_id, repair_alternation=True,
+      include_row_ids=True) - the call their desktop resume makes. Looked up
+      by name on `agent._session_db` BEFORE the write.
+    breaks: >-
+      Gone or renamed -> every compact/drop/erase/edit/import REFUSES before
+      touching the database ("get_messages_as_conversation пропал"). Keyword
+      `include_row_ids` or `repair_alternation` dropped -> the write lands,
+      the reload raises, the report says memory was NOT re-read and the
+      session must be reopened before the next message (else the tail may
+      double).
+    asserted_by: tests/test_memory_reload_real_db.py::test_m1_memory_row_ids_follow_the_database_after_an_edit_in_the_middle
+
+  - id: ctxctl.memory_loader_row_ids
+    level: 2
+    file: hermes_state_messages.py
+    kind: symbol
+    symbol: 'msg["_row_id"] = row["id"]'
+    baseline_count: 1
+    we_do: >-
+      Rely on the loader stamping every message with its row id when
+      include_row_ids=True. Their pre-turn check keys on the highest `_row_id`
+      in memory.
+    breaks: >-
+      SILENT. Without fresh ids in memory their pre-turn check takes rows of
+      ours as foreign (or falls back to matching by content) - the tail
+      doubles in memory and their next rewrite stores the double (Recon33,
+      session 20261001_225039_9d612f).
+    asserted_by: tests/test_memory_reload_real_db.py::test_m1_memory_row_ids_follow_the_database_after_an_edit_in_the_middle
+
+  - id: ctxctl.memory_loader_durable_mark
+    level: 2
+    file: hermes_state_messages.py
+    kind: symbol
+    symbol: "_DB_PERSISTED_MARKER_KEY: True}"
+    baseline_count: 1
+    we_do: >-
+      Rely on the loader marking every message durable ("born durable",
+      their #92231). Their end-of-turn flush skips marked dicts.
+    breaks: >-
+      SILENT. Unmarked dicts that do not arrive as the turn's history get
+      flushed again - duplicate rows in the database.
+    asserted_by: tests/test_memory_reload_real_db.py::test_m2_memory_is_their_shape_marked_durable
+
+  - id: ctxctl.replay_canonicalize
+    level: 3
+    file: agent/replay_cleanup.py
+    kind: symbol
+    symbol: "def canonicalize_replay_history("
+    baseline_count: 1
+    we_do: >-
+      Pass the loaded list through canonicalize_replay_history (imported from
+      agent.replay_cleanup) before it becomes memory - the same cleanup their
+      resume applies, so our memory serializes to the same bytes.
+    breaks: >-
+      Gone or moved -> every compact/drop/erase/edit/import REFUSES before
+      touching the database ("canonicalize_replay_history недоступен").
+    asserted_by: tests/test_memory_reload_real_db.py::test_m2_memory_is_their_shape_marked_durable
+
+  - id: ctxctl.resume_fills_memory_reference
+    level: 2
+    file: tui_gateway/server.py
+    kind: symbol
+    symbol: "get_messages_as_conversation(stored_id, repair_alternation=True, include_row_ids=True)"
+    baseline_count: 1
+    we_do: >-
+      REFERENCE, not called: our reload copies how their desktop resume fills
+      memory (`_load_resume_transcript` -> `canonicalize_replay_history` ->
+      session["history"]). If they change the recipe, ours must follow.
+    breaks: >-
+      Nothing breaks at once. A changed count means their resume now fills
+      memory differently (new flag, new cleanup step) - read it and update
+      `_apply._memory_loader`, or our memory drifts from what a restart gives.
+    asserted_by: null
+
+  - id: ctxctl.pre_turn_adoption_reference
+    level: 2
+    file: tui_gateway/prompt_turn.py
+    kind: symbol
+    symbol: "def _adopt_out_of_band_turns(session: dict)"
+    baseline_count: 1
+    we_do: >-
+      REFERENCE, not called: the pre-turn check that compares memory with the
+      store by the highest `_row_id`. It is why memory after our write must
+      carry fresh row ids.
+    breaks: >-
+      Renamed/reworked -> re-read it: if it keys on something other than
+      `_row_id`, our reload may need that mark too.
+    asserted_by: null
 
   - id: ctxctl.live_config_threshold_cap
     level: 4

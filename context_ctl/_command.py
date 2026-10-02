@@ -276,7 +276,7 @@ def _apply_items(session_id, engine, agent, session, history, rows, items, mode,
     _select.write_selection(session_id, [{**item, "mode": mode} for item in items])
     # `removed` — то, что механизм удалил нарочно. Берём из отчёта ПО БАЗЕ: именно её
     # строки сверяет предохранитель, и отчёт памяти гейтвея тут не при чём.
-    ok, applied_why = _apply.commit_replacement(session, agent, new_rows, new_history,
+    ok, applied_why = _apply.commit_replacement(session, agent, new_rows,
                                                 removed=report.get("removed") or [])
     if not ok:
         lines.append(f"ИТОГ: НЕ применено — {applied_why}")
@@ -466,7 +466,7 @@ def run_import(session_id: str, engine, folder: str) -> dict:
     after = _apply._estimate(agent, new_rows)
     # `removed` — ВСЯ прежняя лента: её уход и есть операция, предохранитель коммита иначе
     # принял бы его за потерю данных.
-    ok, applied_why = _apply.commit_replacement(session, agent, new_rows, new_rows,
+    ok, applied_why = _apply.commit_replacement(session, agent, new_rows,
                                                 removed=list(rows))
     if not ok:
         lines.append(f"ИТОГ: НЕ применено — {applied_why}")
@@ -475,7 +475,8 @@ def run_import(session_id: str, engine, folder: str) -> dict:
     _signal.bump(session_id, [])
     lines.append(f"было строк: {len(rows)}, стало: {len(new_rows)}")
     lines.append(f"токены: было ~{before}, стало ~{after}")
-    lines.append("ИТОГ: применено")
+    lines.append("ИТОГ: применено"
+                 + ("" if applied_why.strip() == "применено" else f" — {applied_why}"))
     _note(engine, applied_why, imported=len(new_rows), folder=str(folder))
     facts.update({"ok": True, "rows_before": len(rows), "rows_after": len(new_rows),
                   "tokens_before": before, "tokens_after": after,
@@ -544,7 +545,7 @@ def run_edit(session_id: str, engine, addr: str, content: str) -> dict:
 
     before = _apply._estimate(agent, history)
     after = _apply._estimate(agent, new_history)
-    ok, applied_why = _apply.commit_replacement(session, agent, new_rows, new_history,
+    ok, applied_why = _apply.commit_replacement(session, agent, new_rows,
                                                 removed=[row])
     lines = [f"{addr}: {len(old_text)} → {len(text)} символов"]
     if not ok:
@@ -560,12 +561,13 @@ def run_edit(session_id: str, engine, addr: str, content: str) -> dict:
     _signal.bump(session_id, [])
     lines.append(f"новый адрес: {now or '—'}")
     lines.append(f"токены: было ~{before}, стало ~{after}")
-    lines.append("ИТОГ: применено")
+    lines.append("ИТОГ: применено"
+                 + ("" if applied_why.strip() == "применено" else f" — {applied_why}"))
     _note(engine, applied_why, was=addr, now=now)
     facts.update({"ok": True, "applied": [addr], "now": now,
                   "tokens_before": before, "tokens_after": after,
                   "revision": _signal.read_signal(session_id).get("revision", 0)})
-    return _facts(facts, lines, f"{addr} replaced from the clipboard" + (f" → {now}" if now else ""))
+    return _facts(facts, lines, f"{addr} edited" + (f" → {now}" if now else ""))
 
 
 def _erase_places(session_id, engine, agent, session, history, rows, places, facts, lines,
@@ -609,7 +611,7 @@ def _erase_places(session_id, engine, agent, session, history, rows, places, fac
 
     before = _apply._estimate(agent, history)
     after = _apply._estimate(agent, new_history)
-    ok, applied_why = _apply.commit_replacement(session, agent, new_rows, new_history,
+    ok, applied_why = _apply.commit_replacement(session, agent, new_rows,
                                                 removed=eaten_rows + replaced)
     if not ok:
         lines.append(f"ИТОГ: НЕ применено — {applied_why}")
@@ -632,7 +634,8 @@ def _erase_places(session_id, engine, agent, session, history, rows, places, fac
     lines.append(f"стёрто сообщений: {len(eaten_rows)} (из них названо {len(erased)}), "
                  f"правлено строк: {len(replaced)}")
     lines.append(f"токены: было ~{before}, стало ~{after} (освободилось ~{max(0, before - after)})")
-    lines.append("ИТОГ: применено")
+    lines.append("ИТОГ: применено"
+                 + ("" if applied_why.strip() == "применено" else f" — {applied_why}"))
     _note(engine, applied_why, erased=erased, tokens_before=before, tokens_after=after)
     facts.update({"ok": True, "applied": erased, "ops": ops,
                   "rows_before": len(rows), "rows_after": len(new_rows),

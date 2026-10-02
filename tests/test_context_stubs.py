@@ -22,6 +22,7 @@ import pytest
 
 from hermes_filetools.context_ctl import _alternation, _apply, _command, _select, _stubs
 from hermes_filetools.context_ctl.engine import ContextCtlEngine
+from conftest import their_loader   # their get_messages_as_conversation (Plan26)
 
 
 # Тело реалистичного размера. Фикстуры были игрушечными (три десятка символов), и после
@@ -271,9 +272,19 @@ class _FakeDB:
     def get_messages(self, session_id, **kw):
         return [dict(row) for row in self.rows]
 
+    def get_messages_as_conversation(self, session_id, **kw):
+        return their_loader(self.rows)
+
     def replace_messages(self, session_id, messages, **kw):
+        """Как у них: строка со своим `id` остаётся с ним, новая получает следующий id."""
         self.written = [dict(m) for m in messages]
-        self.rows = [dict(m) for m in messages]
+        next_id = max([r.get("id") or 0 for r in self.rows] + [9000]) + 1
+        self.rows = []
+        for m in messages:
+            row = dict(m)
+            if row.get("id") is None:
+                row["id"], next_id = next_id, next_id + 1
+            self.rows.append(row)
 
 
 def db_rows(call_id="call_1", content=None):
@@ -518,6 +529,9 @@ def test_c9_commit_writes_the_db_before_the_gateway_memory(monkeypatch, one_live
     order = []
 
     class _DB:
+        def get_messages_as_conversation(self, session_id, **kw):
+            return their_loader(self.get_messages(session_id))
+
         rows = [{"role": "user", "content": "новое", "tool_call_id": None}]
 
         def get_messages(self, session_id, **kw):
@@ -541,7 +555,7 @@ def test_c9_commit_writes_the_db_before_the_gateway_memory(monkeypatch, one_live
         "объекта (активный ход, коллбэки гейтвея) дописывать в него, и наша правка "
         "превращается в замороженный снимок — живьём 2026-09-08 после первого применения "
         "команда перестала находить операции, видимые в стакане")
-    assert held == [{"role": "user", "content": "новое"}]
+    assert held == their_loader(_DB.rows), "память = ответ ИХ загрузчика по базе (Plan26)"
 
 
 def test_c9b_commit_refuses_without_a_session_db(one_live_session):
@@ -731,6 +745,9 @@ def test_c10_a_list_that_would_lose_active_rows_is_refused(one_live_session):
     written = []
 
     class _DB:
+        def get_messages_as_conversation(self, session_id, **kw):
+            return their_loader(self.get_messages(session_id))
+
         def get_messages(self, session_id, **kw):
             return [
                 {"role": "user", "content": "первое", "tool_call_id": None},
@@ -761,6 +778,9 @@ def test_c10b_a_complete_list_still_commits(one_live_session):
     ]
 
     class _DB:
+        def get_messages_as_conversation(self, session_id, **kw):
+            return their_loader(self.get_messages(session_id))
+
         def get_messages(self, session_id, **kw):
             # В базе тот же набор, но у тул-строки ещё ДОСЛОВНОЕ содержимое: сверка идёт по
             # адресу, поэтому изменение текста не должно выглядеть как потеря строки.
@@ -792,6 +812,9 @@ def test_c10c_a_deliberately_erased_row_is_not_a_loss(one_live_session):
     stays = {"role": "user", "content": "первое", "tool_call_id": None}
 
     class _DB:
+        def get_messages_as_conversation(self, session_id, **kw):
+            return their_loader(self.get_messages(session_id))
+
         def get_messages(self, session_id, **kw):
             return [dict(stays), dict(erased)]
 
@@ -820,6 +843,9 @@ def test_c10d_the_guard_does_not_go_blind_when_something_is_erased(one_live_sess
     lost = {"role": "tool", "content": "ответ 2", "tool_call_id": "call_2"}
 
     class _DB:
+        def get_messages_as_conversation(self, session_id, **kw):
+            return their_loader(self.get_messages(session_id))
+
         def get_messages(self, session_id, **kw):
             return [dict(erased), dict(lost)]
 
@@ -1430,6 +1456,76 @@ def test_w1_paste_replaces_only_the_text_in_place(one_live_session, by_address):
     assert edited["content"] == "читаю внимательно"
     assert edited.get("tool_calls"), "вызовы реплики переносятся байт в байт"
     assert "api_content" not in edited and "id" not in edited
+
+
+def test_w1c_memory_after_an_edit_is_their_loader_answer(one_live_session, by_address):
+    """Plan26: память после правки — ответ ИХ загрузчика по базе, а не наш словарь строки.
+
+    Раньше память собиралась из строки `get_messages`, и пустой `tool_call_id` ассистента уезжал в
+    запрос как JSON null → llama.cpp 500 (сессия `20261001_225039_9d612f`). Теперь колонки базы в
+    память не попадают потому, что форму сообщения держит их загрузчик.
+    """
+    engine, session = one_live_session
+    db = engine._agent._session_db
+    db.rows[1].update({"session_id": "s-cmd", "tool_call_id": None, "token_count": None,
+                       "observed": 0, "active": 1, "compacted": 0,
+                       "reasoning_content": "думал"})
+    report = _command.run_edit(engine._session_id, engine, "m0002", "читаю внимательно")
+    assert report["ok"] is True, report["text"]
+    assert session["history"] == their_loader(db.rows)
+    live = session["history"][1]
+    assert live["content"] == "читаю внимательно" and live.get("tool_calls")
+    assert live["reasoning_content"] == "думал"
+    for key in ("tool_call_id", "session_id", "active", "compacted", "observed", "token_count"):
+        assert key not in live, key
+    stored = db.written[1]
+    assert stored["session_id"] == "s-cmd" and stored.get("tool_calls")
+
+
+def test_w1d_memory_row_ids_are_fresh_after_an_edit_in_the_middle(one_live_session, by_address):
+    """Recon33: после правки в середине у КАЖДОГО сообщения памяти `_row_id` активной строки.
+
+    Со старыми `_row_id` их сверка перед ходом (`_adopt_out_of_band_turns`: строки базы новее
+    наибольшего `_row_id` памяти — «чужие») дописывала наши же перевставленные строки второй раз.
+    """
+    engine, session = one_live_session
+    db = engine._agent._session_db
+    before = max(r["id"] for r in db.rows)
+    report = _command.run_edit(engine._session_id, engine, "m0002", "читаю внимательно")
+    assert report["ok"] is True, report["text"]
+    ids = [m.get("_row_id") for m in session["history"]]
+    assert ids == [r["id"] for r in db.rows], "метки памяти = id активных строк, по порядку"
+    assert ids[1] > before, "правленая строка — новая строка базы с новым id"
+    seen = max(ids)
+    assert not [r for r in db.rows if r["id"] > seen], "их сверке нечего дописать"
+    assert all(m.get("_db_persisted") for m in session["history"])
+    tool_ids = [m["tool_call_id"] for m in session["history"] if m.get("role") == "tool"]
+    assert len(tool_ids) == len(set(tool_ids)), "ни один результат тула не задвоен"
+
+
+def test_w1e_no_loader_refuses_before_the_write_and_a_failed_reload_is_loud(one_live_session, by_address):
+    """Загрузчика нет → отказ ДО записи. Загрузчик упал ПОСЛЕ записи → громко, память не наша."""
+    engine, session = one_live_session
+    db = engine._agent._session_db
+    original = [dict(m) for m in session["history"]]
+
+    loader = type(db).get_messages_as_conversation
+    try:
+        type(db).get_messages_as_conversation = None
+        report = _command.run_edit(engine._session_id, engine, "m0002", "читаю внимательно")
+        assert report["ok"] is False and db.written is None, report["text"]
+        assert "get_messages_as_conversation" in report["text"]
+        assert session["history"] == original
+
+        def boom(self, session_id, **kw):
+            raise RuntimeError("их база закрыта")
+        type(db).get_messages_as_conversation = boom
+        report = _command.run_edit(engine._session_id, engine, "m0002", "читаю внимательно")
+    finally:
+        type(db).get_messages_as_conversation = loader
+    assert db.written is not None, "база записана"
+    assert "НЕ перечитана" in report["text"], report["text"]
+    assert session["history"] == original, "свою память мы не собираем даже при сбое"
 
 
 def test_w1b_paste_gives_the_row_a_new_time_so_its_address_changes(one_live_session, by_address):

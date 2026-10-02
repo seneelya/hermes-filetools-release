@@ -378,9 +378,9 @@ def test_setup_registers_when_selected(monkeypatch, bridge):
     report = context_ctl.setup(ctx, plugin_version="test")
     assert len(ctx.engines) == 1
     assert isinstance(ctx.engines[0], ContextCtlEngine)
-    assert "АКТИВЕН" in report
-    # Отчёт обязан называть цену включения: движок заменяет их компрессор и не сжимает.
-    assert "автоматической компакции" in report
+    assert "ACTIVE" in report
+    assert "auto-compaction" in report and "threshold" in report
+    assert "автоматической компакции нет" not in report
 
 
 def test_setup_refuses_when_the_bridge_cannot_be_installed(monkeypatch):

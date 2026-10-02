@@ -1,5 +1,5 @@
 name: hermes-filetools
-version: "0.37.0"
+version: "0.38.0"
 # THIS FILE IS THE DEFAULTS (since 2026-09-30). A plugin update / our deploy overwrites it.
 # YOUR changes live in <HERMES_HOME>/filetools/settings.yaml - the Config panel writes only the
 # differences from the values below there; delete a key in that file to get the default back.
@@ -17,6 +17,9 @@ version: "0.37.0"
 description: "JSON-free file tools v2 — read_file, write_file, patch, search_files and terminal answer the model in plain text instead of a JSON blob. Also wraps execute_code, process_manage and vision_analyze, each registered inside THEIR own toolset so the operator's existing switches keep working. Crossed-out entries listed here are foreign tools this plugin HIDES, not tools it provides."
 author: "Seneelya"
 kind: standalone
+# DEV MODE (2026-10-02): the panel's development tabs (Operations, Palette) are shown only with
+# `dev: true` - put it in YOUR settings.yaml, not here. Clients never see those tabs.
+dev: false
 # The last three register CONDITIONALLY (execute_code behind upstream's own
 # check_sandbox_requirements, vision_analyze behind check_vision_requirements,
 # all three only when upstream is importable): this field declares what the
@@ -104,14 +107,14 @@ tools:
     # create_file_new.yaml).
     params:
       mtime: true
-      ui_json: "min"
+      ui_json: "off"
     # ui_json: same switch and same reason as patch's below (CONTRACT.md §19) -
     # the desktop app treats write_file as a file-edit tool too, so its calls are
     # just as invisible without this. For a full overwrite `diff` behaves like
     # `min`: showing the "before" would mean dumping the whole old file.
     params_help:
       mtime: "\"new\" path only: appends a \"Modified: ...\" line."
-      ui_json: "Whether a small JSON block is placed above the text for a UI to read: min = small JSON (default), off = text only, diff/wrap for other UI needs."
+      ui_json: "Whether a small JSON block is placed above the text for a UI to read: off = text only (default), min = small JSON, diff/wrap for other UI needs."
     # Structured, not just prose in params_help above: Plan17's Config panel renders
     # params generically by TYPE (bool/number/enum), never hardcoded by param name, and
     # a fixed-choice param needs its option list to come from data, not from the frontend
@@ -139,14 +142,18 @@ tools:
     # schema: same auto-derivation (modify_file.yaml for old,
     # modify_file_new.yaml for new).
     params:
-      ui_json: "min"
+      ui_json: "off"
     # ui_json, "new" path only: our plain-text answer is the reference form,
     # this only decides whether a short JSON block is placed ABOVE it for a UI
-    # to read (CONTRACT.md §19). min has been the default since 2026-08-26. wrap
-    # is the only mode the desktop app itself can parse (strict JSON.parse over
-    # the whole payload), and also the only one that escapes our text.
+    # to read (CONTRACT.md §19). wrap is the only mode the desktop app itself can
+    # parse (strict JSON.parse over the whole payload), and also the only one that
+    # escapes our text.
+    # Default `off` since 2026-10-02 (owner; was `min` from 2026-08-26, for both
+    # patch and write_file): with `min` the desktop app rendered the error of a
+    # failed call several times over (owner's feedback, 2026-10-02).
+    # Our panel does not need the JSON block - it reads the ledger and the text.
     params_help:
-      ui_json: "min = small JSON, no code (default). off = text only, nothing for a client to render. diff = plus a copy of the changed lines, marked as a copy. wrap = everything inside the JSON message."
+      ui_json: "off = text only, nothing for a client to render (default). min = small JSON, no code. diff = plus a copy of the changed lines, marked as a copy. wrap = everything inside the JSON message."
     params_options:
       ui_json: ["min", "off", "diff", "wrap"]
   terminal:
@@ -256,32 +263,35 @@ formatting:
   comment_fallback: "◆"  # ◆Operation ID: ... / ◆○○○ - for files with no comment syntax
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ДВИЖОК КОНТРОЛЯ КОНТЕКСТА (`context_ctl/`, Plan13, этап B `Vision04`).
+# CONTEXT ENGINE (`context_ctl/`, engine name `ctxctl`) — our replacement for Hermes'
+# built-in ContextCompressor. How it works: `__HQ/docs/Doc__compaction.md`.
 #
-# Здесь ТОЛЬКО стоп-кран. Выбор движка — не наш ключ, а их: `context.engine` в
-# config.yaml Хермеса, значение сравнивается с `ContextCtlEngine.ENGINE_NAME`
-# (`ctxctl`). Пока там стоит не наше имя, движок не регистрируется и — главное —
-# НЕ СТАВИТ монкипатч `AIAgent.__init__`: след в чужом ядре появляется только
-# после осознанного выбора владельца ИХ ключом. Наш ключ нужен, чтобы выключить
-# движок, не редактируя чужой конфиг и не теряя из него наше имя.
+# SELECTING it is THEIR key, not ours: `context.engine: ctxctl` in Hermes' config.yaml
+# (REQUIRED - see release/README.md). With any other value the engine is not registered and
+# puts no patch into their core. `enabled` below is only OUR stop switch: it turns the engine
+# off without editing their config and without losing our name from it.
 #
-# ЧЕСТНОЕ ПРЕДУПРЕЖДЕНИЕ на текущем шаге (Task 1, скелет): пока движок выбран,
-# встроенный ContextCompressor заменён нами, а мы НЕ СЖИМАЕМ НИЧЕГО —
-# `should_compress()` всегда False, `compress()` возвращает вход как есть.
-# Контекст будет расти до предела окна модели. Это режим ПРОВЕРКИ: включить →
-# убедиться слеш-командой `/filetools-context-status`, что движок жив и видит
-# живого агента → выключить.
+# What it does when selected (all live since 2026-09-29):
+#   - manual compaction from the panel (Mirror -> compact) and the slash commands: the picked
+#     messages are interrogated by a model and replaced with a distillate;
+#   - AUTO-compaction: their loop asks `should_compress`, we answer by `compact_auto_percent`;
+#     their `compression.enabled` must also be true for them to ask at all;
+#   - drop / erase / edit / import of messages from the panel.
+# Every write of ours goes through `replace_messages`, and since 2026-10-02 (Plan26) the
+# gateway memory is re-read after it by THEIR loader (`get_messages_as_conversation`), the way
+# their own resume fills it. Auto-compaction is the exception: there THEY write the tape we hand
+# them (`compress()`), through their own pipeline.
 # ─────────────────────────────────────────────────────────────────────────────
 context_ctl:
   enabled: true
-  # Four knobs for the panel's compaction button (Plan16-Task03). All optional —
-  # absent falls back to the code's own default (see `dashboard/plugin_api.py::read_config`).
-  # WARNING on the third one: THEIR config stores a TARGET (shrink down to this much).
+  # Compaction settings: the panel button, the automaton and the interrogation route. All
+  # optional — absent falls back to the code's own default (`context_ctl/_settings.py::DEFAULTS`).
+  # WARNING on `compact_cut_percent`: THEIR config stores a TARGET (shrink down to this much).
   # OURS stores the OPPOSITE — how much to CUT. Same shape of number, opposite meaning;
   # copying their semantics here would silently invert the button's behavior.
-  compact_head_keep: 2      # messages at the START never pre-ticked — the session's own
+  compact_head_keep: 3      # messages at the START never pre-ticked — the session's own
                              # opening ask, a decision left to the hot path, not this button
-  compact_auto_percent: 95  # context-fill percent at which auto-compaction fires — the marker on
+  compact_auto_percent: 92  # context-fill percent at which auto-compaction fires — the marker on
                              # the token bar; `should_compress` decides by it (Plan24-Task07)
   compact_auto_enabled: true   # OUR switch for the automaton: false = the decision is only SHOWN
                              # (token bar window, engine status), `should_compress` answers "no".
@@ -290,9 +300,9 @@ context_ctl:
   compact_auto_pause_minutes: 3   # after 2 automaton failures in a row — no new attempt for this
                              # long (besides: one automatic attempt per turn, never while a
                              # compaction of ours is running)
-  compact_wait_turn_minutes: 10  # manual compaction finished while a turn runs -> wait up to this
+  compact_wait_turn_minutes: 6  # manual compaction finished while a turn runs -> wait up to this
                              # long for the turn to end, then write over the fresh tape; 0 = don't wait
-  compact_silence_minutes: 5   # no step of a running compaction for this long -> the progress
+  compact_silence_minutes: 4   # no step of a running compaction for this long -> the progress
                              # line in the panel turns yellow ("may be hung"); the run is NOT killed
   compact_server: auto         # which server the interrogation talks to: auto (by address; local =
                              # llamacpp) | llamacpp | vllm | gemini | openai | openrouter | plain.
@@ -305,9 +315,9 @@ context_ctl:
   compact_route_model: ""      # own route: model name, e.g. gemini-2.5-flash
   compact_route_key_env: ""    # own route: NAME of the env var holding the key (Hermes loads its
                              # .env into the gateway env); empty = no key (local server)
-  compact_cut_percent: 50   # percent of the eligible middle to pre-tick for cutting — OUR share,
+  compact_cut_percent: 60   # percent of the eligible middle to pre-tick for cutting — OUR share,
                              # not their "shrink to" target (see warning above)
-  compact_tail_keep: 10     # messages at the END never pre-ticked — what the conversation is
+  compact_tail_keep: 5     # messages at the END never pre-ticked — what the conversation is
                              # about right now
   # Whose turn the distillate is written as. `auto` keeps the old behaviour: the role is
   # picked so the inserted row never collides with a neighbour. `user`/`assistant` pin it.

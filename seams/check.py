@@ -31,8 +31,20 @@ SHOW_BREAKS = (FAIL, DRIFT, GONE_GOOD)
 
 
 def load(path: str = REGISTRY) -> dict:
-    """Реестр словарём. YAML разбирает их `hermes_yaml` (PyYAML в их венве нет)."""
-    from hermes_yaml import safe_load
+    """Реестр словарём. YAML разбирает их `hermes_yaml` (PyYAML в их венве нет).
+
+    Вне их венва (агент в контейнере над голыми исходниками, `HowTo__PrepareForUpdate.md`) —
+    `ruamel.yaml` напрямую, затем PyYAML. Ничего нет — ImportError, как и раньше."""
+    try:
+        from hermes_yaml import safe_load
+    except ImportError:
+        try:
+            from ruamel.yaml import YAML
+
+            def safe_load(fh):
+                return YAML(typ="safe").load(fh)
+        except ImportError:
+            from yaml import safe_load
     with open(path, "r", encoding="utf-8") as fh:
         return safe_load(fh) or {}
 

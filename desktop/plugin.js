@@ -989,24 +989,44 @@ function useMessages() {
   return hook($messages) || MESSAGES_INITIAL;
 }
 var _fullText = /* @__PURE__ */ new Map();
+var _fullInflight = /* @__PURE__ */ new Map();
+var _fullEpoch = 0;
 function forgetFullText(sid) {
+  _fullEpoch += 1;
   const prefix = sid + "|";
   for (const key of Array.from(_fullText.keys())) if (key.startsWith(prefix)) _fullText.delete(key);
+  for (const key of Array.from(_fullInflight.keys())) if (key.startsWith(prefix)) _fullInflight.delete(key);
 }
-function loadMessageText(address) {
+var EMPTY_FULL = { text: "", call: null };
+function loadFullMessage(address) {
   const key = String(address || "");
   const sid = viewKey();
-  if (!key || !isPersistableKey(sid) || !adapter.hasRest) return Promise.resolve("");
+  if (!key || !isPersistableKey(sid) || !adapter.hasRest) return Promise.resolve(EMPTY_FULL);
   const cacheKey = sid + "|" + key;
   if (_fullText.has(cacheKey)) return Promise.resolve(_fullText.get(cacheKey));
-  return adapter.rest(`/messages?session=${encodeURIComponent(sid)}&preview=1&full=${encodeURIComponent(key)}`).then((res) => {
+  const pending = _fullInflight.get(cacheKey);
+  if (pending) return pending;
+  const epoch = _fullEpoch;
+  const request = adapter.rest(`/messages?session=${encodeURIComponent(sid)}&preview=1&full=${encodeURIComponent(key)}`).then((res) => {
     const r = asRecord(res);
     const list = Array.isArray(r.messages) ? r.messages : [];
-    const hit = list.find((m) => asRecord(m).msg === key);
-    const text = String(asRecord(hit).text || "");
-    if (text) _fullText.set(cacheKey, text);
-    return text;
-  }).catch(() => "");
+    const hit = asRecord(list.find((m) => asRecord(m).msg === key));
+    const text = String(hit.text || "");
+    const call = hit.call && typeof hit.call === "object" ? hit.call : null;
+    const packed = { text, call };
+    if (epoch === _fullEpoch && (text || call)) _fullText.set(cacheKey, packed);
+    return packed;
+  }).catch(() => EMPTY_FULL).finally(() => {
+    if (_fullInflight.get(cacheKey) === request) _fullInflight.delete(cacheKey);
+  });
+  _fullInflight.set(cacheKey, request);
+  return request;
+}
+function loadMessageText(address) {
+  return loadFullMessage(address).then((hit) => String(hit && hit.text || ""));
+}
+function loadMessageCall(address) {
+  return loadFullMessage(address).then((hit) => hit && hit.call || null);
 }
 function exportMessage(address) {
   const key = String(address || "");
@@ -1056,7 +1076,19 @@ function catchNextPaste(onText) {
   window.addEventListener("paste", handler, true);
   return () => window.removeEventListener("paste", handler, true);
 }
-function pasteMessage(address, text) {
+var editNotes = /* @__PURE__ */ new Map();
+function takeEditNote(address) {
+  const key = String(address || "");
+  const note = editNotes.get(key) || "";
+  editNotes.delete(key);
+  return note;
+}
+function editWarning(lines) {
+  const last = (Array.isArray(lines) ? lines : []).map(String).reverse().find((line) => line.startsWith("\u0418\u0422\u041E\u0413: \u043F\u0440\u0438\u043C\u0435\u043D\u0435\u043D\u043E"));
+  const tail = last ? last.slice("\u0418\u0422\u041E\u0413: \u043F\u0440\u0438\u043C\u0435\u043D\u0435\u043D\u043E".length).replace(/^\s*—\s*/, "").trim() : "";
+  return tail && !tail.startsWith("(\u0431\u0435\u0437 \u043B\u043E\u043A\u0430") ? tail : "";
+}
+function editMessage(address, text) {
   const key = String(address || "");
   const sid = viewKey();
   if (!key) return Promise.resolve({ ok: false, note: "no address" });
@@ -1065,9 +1097,13 @@ function pasteMessage(address, text) {
   }
   return adapter.rest("/context-edit", { method: "POST", body: { session: sid, msg: key, content: String(text || "") } }).then((res) => {
     const r = asRecord(res) || {};
-    if (r.ok !== true) return { ok: false, note: String(r.summary && r.summary !== "not applied" ? r.summary : r.error || "not replaced") };
+    if (r.ok !== true) return { ok: false, note: String(r.summary && r.summary !== "not applied" ? r.summary : r.error || "not saved") };
+    const now = String(r.now || "");
+    const warning = editWarning(r.lines);
+    const note = `saved: ${key} \u2192 ${now || "?"}` + (warning ? ` \u2014 ${warning}` : "");
+    if (now) editNotes.set(now, note);
     loadMessages();
-    return { ok: true, note: String(r.summary || "replaced") };
+    return { ok: true, now, note };
   }).catch((err) => ({ ok: false, note: `request failed: ${err && err.message || err}` }));
 }
 var EXPORT_INITIAL = { mode: false, picked: {}, busy: false, note: "", ok: null, dir: "" };
@@ -4595,11 +4631,12 @@ function BrickRow({ tokens, chip, rest }) {
 var PANE_MIN_LINES = 5;
 var PANE_WHOLE_MAX_SHARE = 60;
 var PANE_LINE_REM = 0.94;
+var PANE_PAD_REM = 0.5;
 var PANE_CHARS_PER_LINE = 70;
 function paneMinRem(chars) {
   const size = Math.max(0, Number(chars) || 0);
   const lines = Math.max(1, Math.ceil(size / PANE_CHARS_PER_LINE));
-  return Math.min(PANE_MIN_LINES, lines) * PANE_LINE_REM;
+  return Math.min(PANE_MIN_LINES, lines) * PANE_LINE_REM + PANE_PAD_REM;
 }
 function paneSplit(topChars, bottomChars) {
   const top = Math.max(0, Number(topChars) || 0);
@@ -4612,7 +4649,13 @@ function paneSplit(topChars, bottomChars) {
 function Pane({ minRem, whole, children }) {
   return jsx21("div", {
     className: "mirror-pane-scroll overflow-auto px-2 py-1",
-    style: whole ? { flexGrow: 0, flexShrink: 0, flexBasis: "auto", maxHeight: `${PANE_WHOLE_MAX_SHARE}%` } : { flexGrow: 0, flexShrink: 1, flexBasis: "auto", minHeight: `${minRem}rem` },
+    style: whole ? {
+      flexGrow: 0,
+      flexShrink: 1,
+      flexBasis: "auto",
+      minHeight: `${minRem}rem`,
+      maxHeight: `${PANE_WHOLE_MAX_SHARE}%`
+    } : { flexGrow: 0, flexShrink: 1, flexBasis: "auto", minHeight: `${minRem}rem` },
     children
   });
 }
@@ -4627,10 +4670,11 @@ function TwoPanes({ top, bottom, topChars, bottomChars, topWhole }) {
     }, "split"));
   }
   parts.push(topWhole ? jsx21("div", {
-    className: "mirror-pane-scroll overflow-auto px-2 py-1 grow min-h-0",
+    className: "mirror-pane-scroll overflow-auto px-2 py-1 grow",
+    style: { minHeight: `${split.bottom.minRem}rem` },
     children: bottom
   }, "result") : jsx21(Pane, { minRem: split.bottom.minRem, children: bottom }, "result"));
-  return jsxs20("div", { className: "flex flex-col min-h-0", children: parts }, "panes");
+  return jsxs20("div", { className: "flex flex-col min-h-0 grow", children: parts }, "panes");
 }
 var HOVER_DELAY_MS = 200;
 var FLYOUT_GAP_PX = 6;
@@ -4702,6 +4746,7 @@ function hiddenBelow(el) {
   }
   return short;
 }
+var MESSAGE_DETAIL = "message_detail";
 function ChipTrigger({ id, popup, setPopup, tone, label, tip, border, flushLeft, renderPopup }) {
   const open = !!popup && popup.id === id;
   const tier = open ? popup.tier : "summary";
@@ -4860,20 +4905,34 @@ function ChipTrigger({ id, popup, setPopup, tone, label, tip, border, flushLeft,
             if (tier === "summary") setPopup({ id, tier: "full" });
             expandLater(TALL_TRIES);
           };
-          const grip = (edge) => jsx21("div", {
-            className: "shrink-0",
-            title: grown ? "collapse back to the chip" : "expand upward",
-            // Курсор — ИНЛАЙНОМ. Классом `cursor-n-resize` он не работает: наш бандл в
-            // сканирование Tailwind не попадает, и класс, которого нет в их исходниках,
-            // молча выбрасывается (правило в шапке `core.js`). Без курсора кромка
-            // кликабельна, но об этом никто не узнает.
-            style: {
-              height: "6px",
-              cursor: edge === "bottom" ? "s-resize" : "n-resize",
-              backgroundColor: grown ? "var(--ui-stroke-secondary)" : "transparent"
-            },
-            onClick: onGrip
-          }, edge);
+          const grip = (edge) => {
+            const named = edge === "top" && grown;
+            return jsx21("div", {
+              className: "shrink-0",
+              title: grown ? "collapse back to the chip" : "expand upward",
+              // Курсор — ИНЛАЙНОМ. Классом `cursor-n-resize` он не работает: наш бандл в
+              // сканирование Tailwind не попадает, и класс, которого нет в их исходниках,
+              // молча выбрасывается (правило в шапке `core.js`). Без курсора кромка
+              // кликабельна, но об этом никто не узнает.
+              style: {
+                height: "6px",
+                cursor: edge === "bottom" ? "s-resize" : "n-resize",
+                backgroundColor: grown ? "var(--ui-stroke-secondary)" : "transparent",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                overflow: "hidden",
+                fontSize: "0.45rem",
+                fontWeight: 300,
+                letterSpacing: "0.06em",
+                lineHeight: 1,
+                color: "var(--ui-text-primary)",
+                userSelect: "none"
+              },
+              onClick: onGrip,
+              children: named ? jsx21("span", { style: { transform: "translateY(-1px)" }, children: MESSAGE_DETAIL }, "name") : null
+            }, edge);
+          };
           return [
             // ВЕРХНЯЯ КРОМКА — ручка разворота (владелец, 2026-09-23: «можно на верхней
             // границе окна невидимую, просто утолщив границу чуток»). Кнопкой в шапке это
@@ -5242,6 +5301,25 @@ function FullText({ address, fallback, cut, raw }) {
   const shown = text || (cut ? fallback + " \u2026" : fallback);
   return raw ? shown : jsx24(ResultView, { text: shown });
 }
+function FullCall({ address, fallback, raw }) {
+  const [call, setCall] = useState8(null);
+  useEffect3(() => {
+    let alive = true;
+    loadMessageCall(address).then((value) => {
+      if (alive && value) setCall(value);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [address]);
+  const shown = call || fallback;
+  if (!shown) return null;
+  const callText = String(shown.raw || "");
+  return raw ? jsx24("div", {
+    style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
+    children: callText
+  }) : jsx24(CallView, { name: shown.name, args: shown.args, limit: 0 });
+}
 var REPLY_PREVIEW_CHARS = 64;
 var POPUP_PREVIEW_CHARS = 240;
 function isEmptyLeadIn(row) {
@@ -5270,21 +5348,10 @@ function EyeButton({ raw, onToggle }) {
     children: raw ? "\u25C9" : "\u25CE"
   }, "eye");
 }
-function PopupHead({ tone, title, canPaste, address, fallback, raw, onToggleRaw }) {
-  const [note, setNote] = useState8("");
+function PopupHead({ tone, title, address, fallback, raw, onToggleRaw, edit }) {
+  const [note, setNote] = useState8(() => takeEditNote(address));
   const [busy, setBusy] = useState8(false);
-  const [pending, setPending] = useState8(null);
-  const pasteWait = useRef4(null);
-  const stopWaiting = () => {
-    if (pasteWait.current) {
-      pasteWait.current();
-      pasteWait.current = null;
-    }
-  };
-  useEffect3(() => stopWaiting, []);
   const run = (work) => {
-    stopWaiting();
-    setPending(null);
     setBusy(true);
     setNote("\u2026");
     Promise.resolve(work()).then((res) => setNote(String(res && res.note || ""))).catch((err) => setNote(String(err && err.message || err))).then(() => setBusy(false));
@@ -5329,51 +5396,41 @@ function PopupHead({ tone, title, canPaste, address, fallback, raw, onToggleRaw 
       onPress: () => run(() => exportMessage(address))
     })
   ] }, "read");
-  const pressPaste = () => {
-    if (pending !== null) {
-      const text = pending;
-      run(() => pasteMessage(address, text));
-      return;
-    }
-    const take = (text) => {
-      if (!String(text || "").trim()) {
-        setNote("clipboard is empty");
-        return;
+  const editing = !!(edit && edit.editing);
+  const writing = !edit ? null : jsx24("span", { className: "flex items-center gap-1", children: editing ? [
+    btn2("save", {
+      disabled: busy || !edit.dirty,
+      tone: "var(--ui-orange)",
+      hint: edit.dirty ? "REPLACE this message with the edited text (irreversible; role and tool calls stay)" : "nothing changed yet",
+      onPress: () => run(edit.onSave)
+    }),
+    btn2("discard", {
+      disabled: busy,
+      hint: "leave the editor, keep the message as it is",
+      onPress: () => {
+        edit.onDiscard();
+        setNote("");
       }
-      const head = text.replace(/\s+/g, " ").trim().slice(0, 60);
-      setPending(text);
-      setNote(`clipboard: ${text.length} chars \u2014 \u201C${head}${text.length > 60 ? "\u2026" : ""}\u201D \u2014 press paste again to replace`);
-    };
-    setBusy(true);
-    readClipboard().then((text) => {
-      setBusy(false);
-      if (text.trim()) {
-        take(text);
-        return;
-      }
-      stopWaiting();
-      setNote("press Ctrl+V to take the clipboard");
-      pasteWait.current = catchNextPaste((pasted) => {
-        pasteWait.current = null;
-        take(pasted);
-      });
-    });
-  };
-  const writing = canPaste ? jsx24("span", { className: "flex items-center", children: btn2(pending !== null ? "paste!" : "paste", {
-    disabled: busy,
-    tone: "var(--ui-orange)",
-    hint: pending !== null ? "press again: REPLACE this message with the clipboard text (irreversible; role and tool calls stay)" : "replace this message with the clipboard text \u2014 first press shows what will be pasted",
-    onPress: pressPaste
-  }) }, "write") : null;
+    })
+  ] : [
+    btn2("edit", {
+      disabled: busy,
+      tone: "var(--ui-orange)",
+      hint: "edit the text of this message in place \u2014 Save writes it, Discard drops it",
+      onPress: () => run(edit.onEdit)
+    })
+  ] }, "write");
   const buttons = jsxs23("span", {
     className: "flex items-center gap-4 shrink-0",
-    children: [reading, writing]
+    children: editing ? [writing] : [reading, writing]
   }, "buttons");
   const line = jsxs23("div", {
     className: "flex items-baseline gap-2",
     style: Object.assign({ fontSize: "0.6rem", color: tone }, SELECTABLE),
     children: [
-      onToggleRaw ? jsx24(EyeButton, { raw, onToggle: onToggleRaw }, "eye") : null,
+      // В правке глазика нет (владелец, 2026-10-02): поле ввода показывает сырой текст всегда,
+      // переключатель «rendered / raw» ни на что бы не влиял.
+      onToggleRaw && !editing ? jsx24(EyeButton, { raw, onToggle: onToggleRaw }, "eye") : null,
       // Подсказка с ПОЛНЫМ заголовком — по той же причине, что у строки сохранения: имя
       // тула с именем файла и адресом в узкое окно не влезает, а `truncate` съедает как раз
       // конец, где стоят адрес и размер (владелец, 2026-09-23).
@@ -5408,11 +5465,72 @@ function ReplyBrick({ row, popup, setPopup }) {
   const text = String(fact.text || "");
   const chars = Number(fact.chars || 0);
   const calls = Array.isArray(fact.calls) ? fact.calls : [];
-  if (isEmptyLeadIn(row)) return null;
   const cut = chars > text.length;
   const emptyLabel = calls.length ? "no text \u2014 this row only calls tools" : "empty";
   const tone = rowTone(fact);
   const preview = briefPreview(text, REPLY_PREVIEW_CHARS);
+  const open = !!popup && popup.id === row.key;
+  const [edit, setEdit] = useState8(null);
+  useEffect3(() => {
+    if (!open) setEdit(null);
+  }, [open]);
+  const editControl = {
+    editing: !!edit,
+    dirty: !!edit && edit.text !== edit.base,
+    // Править можно только ПОЛНЫЙ текст: в ленте он обрезан, и запись обрезка вместо
+    // сообщения молча укоротила бы его. Не приехал полный — отказ, а не правка превью.
+    onEdit: () => {
+      setPopup({ id: row.key, tier: "full" });
+      return loadMessageText(row.address).then((full) => {
+        const base = full ? String(full) : cut ? null : text;
+        if (base === null) return { note: "could not load the full text \u2014 editing refused" };
+        setEdit({ text: base, base });
+        return { note: "editing \u2014 save writes it, discard drops it" };
+      });
+    },
+    onSave: () => editMessage(row.address, edit ? edit.text : "").then((res) => {
+      if (res && res.ok) {
+        setEdit(null);
+        if (res.now) setPopup({ id: `msg-${res.now}`, tier: "full" });
+      }
+      return res;
+    }),
+    onDiscard: () => setEdit(null)
+  };
+  const keep = (e) => e.stopPropagation();
+  const editRows = edit ? Math.min(40, Math.max(8, edit.text.split("\n").length + 2)) : 0;
+  const editor = edit ? jsx24("textarea", {
+    value: edit.text,
+    rows: editRows,
+    autoFocus: true,
+    spellCheck: false,
+    onChange: (e) => {
+      const value = e.target.value;
+      setEdit((cur) => cur && { ...cur, text: value });
+    },
+    onClick: keep,
+    onMouseDown: keep,
+    onKeyDown: keep,
+    onKeyUp: keep,
+    onPaste: keep,
+    className: "w-full rounded",
+    style: {
+      display: "block",
+      boxSizing: "border-box",
+      resize: "none",
+      padding: "4px",
+      fontSize: "0.65rem",
+      fontFamily: "inherit",
+      lineHeight: 1.4,
+      whiteSpace: "pre-wrap",
+      cursor: "text",
+      color: "var(--ui-text-primary)",
+      background: "transparent",
+      border: "1px solid var(--ui-orange)",
+      outline: "none"
+    }
+  }, "editor") : null;
+  if (isEmptyLeadIn(row)) return null;
   return jsx24(BrickRow, {
     tokens: tokensLabel(factTokens(fact)),
     chip: jsx24(ChipTrigger, {
@@ -5426,9 +5544,9 @@ function ReplyBrick({ row, popup, setPopup }) {
       renderPopup: (tier, eye) => ({
         head: jsx24(PopupHead, {
           tone,
-          canPaste: true,
           address: row.address,
           fallback: text,
+          edit: editControl,
           raw: eye.raw,
           onToggleRaw: eye.toggleRaw,
           // Токены рядом с символами (владелец, 2026-09-23): цена сообщения читается в
@@ -5441,7 +5559,7 @@ function ReplyBrick({ row, popup, setPopup }) {
         // дважды. `TwoPanes` с пустым верхом схлопывается сам — своей ветки не нужно.
         body: jsx24(TwoPanes, {
           bottomChars: tier === "full" ? chars : Math.min(chars, POPUP_PREVIEW_CHARS),
-          bottom: jsx24("div", {
+          bottom: editor || jsx24("div", {
             style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
             children: !text ? emptyLabel : tier === "full" ? jsx24(FullText, { address: row.address, fallback: text, cut }) : briefPreview(text, POPUP_PREVIEW_CHARS)
           })
@@ -5609,7 +5727,6 @@ function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
           // Без `paste`: результат инструмента правке не подлежит.
           head: jsx24(PopupHead, {
             tone,
-            canPaste: false,
             address: addr,
             fallback: text,
             raw: eye.raw,
@@ -5629,7 +5746,7 @@ function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
             // СЫРЬЁ — это `call.raw`, то есть БУКВАЛЬНО то, что уходит в файл выгрузки
             // (`context_ctl/_export.py::render_call`). Обещание глазика «покажи как есть»
             // держится тем, что сравнивать не с чем: строка одна и приехала с сервера.
-            top: !call ? null : eye.raw ? jsx24("div", {
+            top: !call ? null : tier === "full" ? jsx24(FullCall, { address: addr, fallback: call, raw: eye.raw }) : eye.raw ? jsx24("div", {
               style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
               children: callText
             }) : jsx24(CallView, { name: call.name, args: call.args, limit: callLimit }),
@@ -7456,28 +7573,32 @@ function PromptMirror() {
               overflowX: "hidden",
               backgroundColor: WORKAREA_BG
             },
-            children: jsxs30("div", {
-              ref: tapeRef,
-              style: {
-                display: "grid",
-                width: "fit-content",
-                maxWidth: "100%",
-                // 2px справа ВНУТРИ ширины (владелец, 2026-09-29): на минимальной ширине рамка
-                // правой рельсы срезалась окном. 1px на рамку, 1px зазора до среза.
-                paddingRight: "2px",
-                boxSizing: "border-box",
-                gridTemplateColumns: "minmax(0, max-content)" + railCols,
-                columnGap: railColumnGap,
-                rowGap: "0.5rem",
-                alignItems: "start",
-                justifyItems: "start"
-              },
-              children: [
-                ...chromes.reduce((acc, c) => acc.concat(c.body, c.cap), []),
-                ...items,
-                jsx31("div", { style: { height: TAIL_SPACE, pointerEvents: "none", gridColumn: "1 / -1" } }, "tail-space")
-              ]
-            })
+            children: [
+              jsxs30("div", {
+                ref: tapeRef,
+                style: {
+                  display: "grid",
+                  width: "fit-content",
+                  maxWidth: "100%",
+                  // 2px справа ВНУТРИ ширины (владелец, 2026-09-29): на минимальной ширине рамка
+                  // правой рельсы срезалась окном. 1px на рамку, 1px зазора до среза.
+                  paddingRight: "2px",
+                  boxSizing: "border-box",
+                  gridTemplateColumns: "minmax(0, max-content)" + railCols,
+                  columnGap: railColumnGap,
+                  rowGap: "0.5rem",
+                  alignItems: "start",
+                  justifyItems: "start"
+                },
+                children: [
+                  ...chromes.reduce((acc, c) => acc.concat(c.body, c.cap), []),
+                  ...items
+                ]
+              }, "tape"),
+              // Хвост — СОСЕДОМ сетки, прямым ребёнком скроллера (2026-10-02: он жил внутри сетки,
+              // 40% от её auto-высоты схлопнулись в ноль, и последний вагон лёг на нижний край).
+              jsx31("div", { style: { height: TAIL_SPACE, pointerEvents: "none" } }, "tail-space")
+            ]
           })
         ]
       }),
@@ -7893,6 +8014,11 @@ function seamsTallyText(tally) {
   if (!tally || typeof tally !== "object") return "";
   return Object.keys(tally).sort().map((k2) => k2 + ": " + tally[k2]).join(" \xB7 ");
 }
+function hermesVerifiedText(verified) {
+  const commit = String(verified && verified.commit || "");
+  const date = String(verified && verified.date || "");
+  return "Verified on Hermes " + (commit || "\u2014") + (date ? " (" + date + ")" : "") + ". Much of this plugin hooks into Hermes code that is not a public API \u2014 after a Hermes update, run Full check.";
+}
 function textArea(value, rows, small) {
   return jsx34("textarea", {
     readOnly: true,
@@ -8109,6 +8235,7 @@ function ConfigPane() {
   const [seamsFull, setSeamsFull] = useState14(false);
   const [seamsStarted, setSeamsStarted] = useState14(0);
   const [seamsNow, setSeamsNow] = useState14(0);
+  const [hermesVerified, setHermesVerified] = useState14({ commit: "", date: "" });
   useEffect7(() => {
     if (seamsState !== "pending" || !seamsFull) return void 0;
     const id = setInterval(() => setSeamsNow(Date.now()), 1e3);
@@ -8143,6 +8270,8 @@ function ConfigPane() {
     setCtxEnabled(!!data.context_ctl_enabled);
     setDataRoot(String(data.data_root || ""));
     setSettingsFile(String(data.settings_file || ""));
+    const verified = data.hermes_verified || {};
+    setHermesVerified({ commit: String(verified.commit || ""), date: String(verified.date || "") });
     const compaction = data.compaction || {};
     setCompactHeadKeep(String(compaction.head_keep ?? 6));
     setCompactAutoPercent(String(compaction.auto_percent ?? 70));
@@ -8430,6 +8559,14 @@ function ConfigPane() {
           children: seamsState === "pending" && seamsFull ? "running\u2026 " + seamsElapsedText(seamsNow - seamsStarted) : seamsTally
         })
       ] }),
+      // ЗАЧЕМ ЭТА ЗОНА, одной строкой (владелец, 2026-10-02): многое у нас держится за
+      // НЕПУБЛИЧНЫЙ код Hermes — другого способа достать это нет, — и их обновление может это
+      // сломать. Поэтому каждая версия называет коммит Hermes, на котором её проверили.
+      jsx34("div", {
+        className: "text-[10px] text-(--ui-text-quaternary)",
+        style: SELECTABLE,
+        children: hermesVerifiedText(hermesVerified)
+      }),
       textArea(seamsOutput, seamsState === "idle" ? 2 : 28, true)
     ] })
   ]);
@@ -8624,6 +8761,11 @@ function renderCard(brick, key, toolColumnWidth, onSelectOp, stale, drop, onPick
     children: jsx36(OperationCard, props)
   });
 }
+var DEV_MODES = ["operations", "palette"];
+function effectiveMode(saved, dev) {
+  const mode = String(saved || "mirror");
+  return !dev && DEV_MODES.includes(mode) ? "mirror" : mode;
+}
 function FileOpsPaneImpl() {
   const view = useView();
   const fileContext = useFileContext();
@@ -8632,10 +8774,13 @@ function FileOpsPaneImpl() {
   const shownSessionRef = useRef9(null);
   const shownListRef = useRef9("");
   const [version, setVersion] = useState15("");
+  const [dev, setDev] = useState15(false);
   useEffect8(() => {
     let dead = false;
     loadConfig().then((data) => {
-      if (!dead && data && !data.error) setVersion(String(data.version || ""));
+      if (dead || !data || data.error) return;
+      setVersion(String(data.version || ""));
+      setDev(data.dev === true);
     }).catch(() => {
     });
     return () => {
@@ -8701,7 +8846,7 @@ function FileOpsPaneImpl() {
     () => buildContextView(liveContextOps(fileContext.ops)),
     [fileContext.ops]
   );
-  const mode = view.mode || "mirror";
+  const mode = effectiveMode(view.mode, dev);
   const mirrorOn = mode === "mirror";
   const paletteOn = mode === "palette";
   const configOn = mode === "config";
@@ -8739,11 +8884,11 @@ function FileOpsPaneImpl() {
     return jsxs35("div", { className: "flex items-center gap-1 shrink-0", children: [
       modeBtn((mirrorOn ? "\u25C9" : "\u25CB") + " Mirror", "mirror", mirrorOn),
       modeBtn((configOn ? "\u25C9" : "\u25CB") + " Config", "config", configOn),
-      // Operations — за Config и приглушённым текстом (владелец, 2026-09-30).
-      modeBtn((mode === "operations" ? "\u25C9" : "\u25CB") + " Operations", "operations", mode === "operations", true),
+      // Operations — за Config и приглушённым текстом (владелец, 2026-09-30). Только в dev.
+      dev ? modeBtn((mode === "operations" ? "\u25C9" : "\u25CB") + " Operations", "operations", mode === "operations", true) : null,
       // Palette последней — инструмент разработки, временный (см. adapter.js: "плагин при запуске
-      // должен показывать то, ради чего он существует", не палитру).
-      modeBtn((paletteOn ? "\u25C9" : "\u25CB") + " Palette", "palette", paletteOn)
+      // должен показывать то, ради чего он существует", не палитру). Только в dev.
+      dev ? modeBtn((paletteOn ? "\u25C9" : "\u25CB") + " Palette", "palette", paletteOn) : null
     ] }, "modes");
   }
   if (mirrorOn) {

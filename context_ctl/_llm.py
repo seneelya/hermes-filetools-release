@@ -284,13 +284,13 @@ def register(ctx) -> str:
             defaults=dict(_DEFAULTS),
         )
     except Exception as exc:  # noqa: BLE001 — отчёт, не падение
-        return f"auxiliary-слот {TASK_KEY!r} НЕ зарегистрирован: {exc}"
+        return f"auxiliary slot {TASK_KEY!r} NOT registered: {exc}"
     try:
         _llm = ctx.llm
     except Exception as exc:  # noqa: BLE001
-        return f"слот {TASK_KEY!r} зарегистрирован, но ctx.llm недоступен: {exc}"
+        return f"slot {TASK_KEY!r} registered, but ctx.llm is unavailable: {exc}"
     _registered = TASK_KEY
-    return f"auxiliary-слот {TASK_KEY!r} зарегистрирован, ctx.llm на месте"
+    return f"auxiliary slot {TASK_KEY!r} registered, ctx.llm present"
 
 
 def available() -> tuple[bool, str]:

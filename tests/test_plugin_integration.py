@@ -786,14 +786,29 @@ def test_e0_ui_json_prefix_keeps_text_intact(tmp_path, monkeypatch):
     assert "■BLOCK" in rest and "b = 22" in rest
 
 
-def test_e2_modify_file_new_rejects_pasted_gutter(loaded_plugin, tmp_path):
+# `ui_json: min` PINNED for the two failure tests below: the machine-readable failure block they
+# check exists only in that mode, and the manifest default is `off` since 2026-10-02 (owner: with
+# `min` the desktop app rendered a failed call's error several times). The mode itself stays.
+_PATCH_UI_JSON_MIN = "          patch:\n            params:\n              ui_json: min\n"
+
+
+def _dispatch_patch_min(tmp_path, monkeypatch, args):
+    _manager, token = _load_plugin(tmp_path, monkeypatch, settings_yaml=_PATCH_UI_JSON_MIN)
+    try:
+        return _dispatch_text("patch", args)
+    finally:
+        import hermes_constants
+        hermes_constants.reset_hermes_home_override(token)
+
+
+def test_e2_modify_file_new_rejects_pasted_gutter(tmp_path, monkeypatch):
     """A pasted "N|" gutter is a corruption of the code, not one of our marker
     lines - it must be a distinguishable ERROR, never a silent repair
     (Vision01__patch.md §10)."""
     target = tmp_path / "gut.py"
     target.write_text("a = 1\n", encoding="utf-8")
-    text = _dispatch_text(
-        "patch",
+    text = _dispatch_patch_min(
+        tmp_path, monkeypatch,
         {"path": str(target), "line": 1, "old_string": "1|a = 1",
          "new_string": "a = 2", "flags": ""},
     )
@@ -1311,11 +1326,11 @@ def test_e3_modify_file_missing_line_degrades(loaded_plugin, tmp_path):
     assert target.read_text() == "alpha BETA\n"
 
 
-def test_e3_modify_file_old_string_not_found(loaded_plugin, tmp_path):
+def test_e3_modify_file_old_string_not_found(tmp_path, monkeypatch):
     target = tmp_path / "nomatch.txt"
     target.write_text("some content\n", encoding="utf-8")
-    text = _dispatch_text(
-        "patch",
+    text = _dispatch_patch_min(
+        tmp_path, monkeypatch,
         {"path": str(target), "line": 1, "old_string": "absent-string",
          "new_string": "x", "flags": ""},
     )

@@ -291,14 +291,14 @@ def set_distillate_role(value: str) -> str:
     """
     global DISTILLATE_ROLE
     if value is None:
-        return (f"роль дистиллята: {DISTILLATE_ROLE} — значения в конфиге НЕТ "
-                "(ключ compact_distillate_role не доехал до движка)")
+        return (f"distillate role: {DISTILLATE_ROLE} — config value MISSING "
+                "(compact_distillate_role did not reach the engine)")
     name = str(value).strip().lower()
     if name not in ("auto", "user", "assistant"):
-        return (f"compact_distillate_role = {value!r} не понят — оставлена "
-                f"{DISTILLATE_ROLE!r}; ждём auto/user/assistant")
+        return (f"compact_distillate_role = {value!r} not understood — kept "
+                f"{DISTILLATE_ROLE!r}; expected auto/user/assistant")
     DISTILLATE_ROLE = name
-    return f"роль дистиллята: {name}"
+    return f"distillate role: {name}"
 
 
 def summary_role(prev_row, next_row) -> str:
@@ -832,7 +832,7 @@ def _assemble(session_id, session, agent, rows, by_msg, runs, patch, hollow, rep
     # оболочка для него — другая строка, а исходная выглядит непосчитанной, и он отказал бы
     # целиком. Тот же законный вход, которым живёт `erase`: «удалённое нарочно отсутствует».
     _progress.progress(session_id, stage="write")
-    ok, applied_why = _apply.commit_replacement(session, agent, new_rows, new_history,
+    ok, applied_why = _apply.commit_replacement(session, agent, new_rows,
                                                 removed=eaten_rows + replaced)
     if not ok:
         if _apply.should_retry(applied_why):
@@ -1115,6 +1115,10 @@ def _first_call_id(row) -> str:
 
 def _rebuild(rows, history, runs, summaries, patch=None, eaten=()) -> tuple[list, list, list]:
     """Собрать новые списки базы и памяти гейтвея. `(строки базы, память, съеденное)`.
+
+    Второй список — ПРОГНОЗ памяти: по нему считаются токены «после» и проверка чередования до
+    записи. В гейтвей он не кладётся: после записи память перечитывает их загрузчик (`Plan26`,
+    `_apply._memory_loader`), поэтому правленая строка входит сюда как есть.
 
     Сводка встаёт на индекс ПЕРВОГО съеденного своего пробега. Память гейтвея правится тем
     же набором, но ключом `_apply._row_key`: у её строк координаты сообщения может не быть

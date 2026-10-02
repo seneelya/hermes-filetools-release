@@ -61,6 +61,28 @@ if os.path.isdir(HERMES_SRC):
 _load_plugin_package()
 
 
+# --- their session loader (Plan26) ----------------------------------------
+# After our write the gateway memory is re-read by THEIR loader
+# (`get_messages_as_conversation(..., repair_alternation=True, include_row_ids=True)`), not built
+# by us. Fake databases in the tests answer it with this: table-only columns dropped, empty columns
+# dropped, and the two marks their loader stamps on every message - `_row_id` and `_db_persisted`.
+_TABLE_ONLY = ("id", "session_id", "active", "compacted", "observed", "token_count",
+               "display_identity", "display_order", "platform_message_id", "_row_id")
+
+
+def their_loader(rows) -> list:
+    """What `get_messages_as_conversation(..., include_row_ids=True)` would give for `rows`."""
+    out = []
+    for row in rows:
+        msg = {k: v for k, v in dict(row).items() if k not in _TABLE_ONLY and v is not None}
+        row_id = row.get("id", row.get("_row_id"))
+        if row_id is not None:
+            msg["_row_id"] = row_id
+        msg["_db_persisted"] = True
+        out.append(msg)
+    return out
+
+
 # --- operation addresses (Plan09) ---------------------------------------
 # Every one of our tools now leads its answer with `Operation ID: <hex>[<FileTag>]`.
 # Tests that assert on the WHOLE rendered text need to take that line off
