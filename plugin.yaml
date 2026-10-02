@@ -1,5 +1,5 @@
 name: hermes-filetools
-version: "0.38.0"
+version: "0.38.2"
 # THIS FILE IS THE DEFAULTS (since 2026-09-30). A plugin update / our deploy overwrites it.
 # YOUR changes live in <HERMES_HOME>/filetools/settings.yaml - the Config panel writes only the
 # differences from the values below there; delete a key in that file to get the default back.

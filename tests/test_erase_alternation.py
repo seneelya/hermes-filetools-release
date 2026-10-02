@@ -4,11 +4,12 @@
   E2  реплика человека между двумя ответами стёрта — мостик от человека
   E3  цепочка «вызов + результат» между двумя ответами стёрта (правило владения) — мостик
   E4  стёрто начало, лента начинается с ответа ассистента — мостик «conversation start removed»
-  E5  стирание без нового стыка одной роли — мостиков нет; старое нарушение не лечим
+  E5  стирание без нового стыка одной роли — мостиков нет; старое нарушение ДО места правки не трогаем
   E6  тексты erase — свои, короткие, с меткой мостика; не похожи на дистиллят
   E7  мостик (старый и новый) не идёт в данные для модели, как и закрывающая скобка
   E8  их проверка чередования: лента с мостиками — не хуже исходной (шов
       `ctxctl.alternation_repair_count`)
+  E9  с первой изменённой строки чинятся все стыки одной роли, до неё — нет (живой случай `4fb201`)
 """
 from __future__ import annotations
 
@@ -69,9 +70,28 @@ def test_e5_no_new_seam_no_bridge():
     rows = [_m("user", "a", 1), _m("assistant", "b", 2), _m("user", "c", 3), _m("assistant", "d", 4)]
     out, n = _erase(rows, {2, 3})     # ушла пара целиком — стык user|конец
     assert n == 0 and _shape(out) == ["user", "assistant"]
+    # Старое нарушение ДО места правки (закешированный префикс) не трогаем (владелец, 2026-10-03).
     old_bad = [_m("user", "a", 1), _m("user", "b", 2), _m("assistant", "c", 3), _m("user", "d", 4)]
     out, n = _erase(old_bad, {3})
-    assert n == 0 and _shape(out) == ["user", "user", "assistant"], "старое нарушение — их дело"
+    assert n == 0 and _shape(out) == ["user", "user", "assistant"], "до места правки — не наше"
+
+
+def test_e9_from_the_first_changed_row_every_same_role_seam_is_repaired():
+    """Граница — первая изменённая строка (владелец, 2026-10-03). Живой случай — сессия
+    `20261002_012006_4fb201`: голова под `head_keep` — человек, ассистент, СТАРЫЙ дистиллят от
+    ассистента; новый дистиллят встаёт после него. Пара в голове (до правки, кеш) остаётся как
+    есть; новый стык дистиллят|дистиллят и старая пара в хвосте ПОСЛЕ правки — чинятся."""
+    head = [_m("user", "a", 1), _m("assistant", "b", 2),
+            _m("assistant", "[◆FT-DISTILL_v1◆ old summary]", 3)]
+    tail = [_m("user", "x", 9), _m("user", "x2", 10), _m("assistant", "y", 11)]   # старая пара после
+    distillate = {"role": "assistant", "content": "[◆FT-DISTILL_v1◆ new]", "timestamp": 5.0}
+    old = head + [_m("user", "eaten", 4), _m("assistant", "eaten", 5)] + tail
+    new = head + [distillate] + tail
+    out, n = _alternation.fit(new, old)
+    assert _shape(out) == ["user", "assistant", "assistant",          # голова — нетронута
+                           "user*", "assistant",                      # мостик перед новым дистиллятом
+                           "user", "assistant*", "user", "assistant"], _shape(out)  # пара в хвосте починена
+    assert n == 2
 
 
 def test_e6_erase_texts():

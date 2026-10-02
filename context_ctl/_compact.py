@@ -1013,10 +1013,17 @@ def splice_for_delivery(rows: list, new_rows: list, history: list) -> tuple:
     problems = _stubs.lint_pairs(out)
     if problems:
         return None, f"в сшитой ленте {len(problems)} рассогласованных пар вызов/ответ"
-    was_bad, now_bad = _alternation.their_repairs(history), _alternation.their_repairs(out)
+    # ПОДОБНОЕ С ПОДОБНЫМ (2026-10-03): голова сшитой ленты — из строк БАЗЫ, а их загрузчик в
+    # памяти хода старые пары одной роли склеивает. Сравнение только с памятью давало «1 против 0»
+    # на паре, которую мы не вносили (сессия `4fb201`, голова под `head_keep`). База сравнения —
+    # худшее из двух: память хода и та же лента до правки в виде строк базы.
+    was_turn = _alternation.their_repairs(history)
+    was_rows = _alternation.their_repairs([_as_message(r) for r in rows])
+    was_bad = max((n for n in (was_turn, was_rows) if n is not None), default=None)
+    now_bad = _alternation.their_repairs(out)
     if was_bad is not None and now_bad is not None and now_bad > was_bad:
         return None, (f"их проверка чередования нашла в сшитой ленте {now_bad} нарушений "
-                      f"против {was_bad} в ленте хода")
+                      f"против {was_bad} до правки")
     return out, ""
 
 

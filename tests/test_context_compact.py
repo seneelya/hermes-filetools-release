@@ -11,6 +11,7 @@
   K6  сводка уезжает в рамке: шапка «это справка» + маркер конца, обе половины
   K7  запись о поглощении — событие, видное своему читателю и невидимое чужим
   K8  без аргументов модель НЕ зовётся и база НЕ трогается (правка необратима)
+  K9  проверка сшитой ленты сравнивает подобное с подобным (строки базы, не только память хода)
 """
 from __future__ import annotations
 
@@ -544,3 +545,27 @@ def test_e5_middle_changed_while_waiting_is_a_refusal(monkeypatch):
     assert not facts["ok"]
     assert len(written) == 1, "с изменённой серединой вторая запись не делается"
     assert "изменилась середина" in facts["lines"][-1]
+
+
+def test_k9_splice_check_compares_like_with_like():
+    """Сессия `20261002_012006_4fb201` (2026-10-03): голова под `head_keep` — человек, ответ,
+    СТАРЫЙ дистиллят от ассистента; в базе это пара ассистентов, их загрузчик в памяти хода её
+    склеил. Сшитая лента несёт пару как в базе (1 нарушение), память — 0. Мы её не вносили, и
+    отказа быть не должно: база сравнения — та же лента до правки в виде строк базы."""
+    def row(i, role, text):
+        return {"id": i, "role": role, "content": text, "timestamp": float(i)}
+    u1, a1 = row(1, "user", "show tools"), row(2, "assistant", "here they are")
+    old_d = row(3, "assistant", _prompts.wrap_distillate("old summary"))
+    u3, a3 = row(4, "user", "eaten q"), row(5, "assistant", "eaten a")
+    u4, a4 = row(6, "user", "tail q"), row(7, "assistant", "tail a")
+    rows = [u1, a1, old_d, u3, a3, u4, a4]
+    bridge = {"role": "user", "content": "[bridge]", "timestamp": 3.5}
+    new_d = {"role": "assistant", "content": _prompts.wrap_distillate("new summary"), "timestamp": 4.0}
+    new_rows = [u1, a1, old_d, bridge, new_d, u4, a4]
+    merged = {"role": "assistant", "content": a1["content"] + "\n" + old_d["content"]}
+    history = [{"role": "user", "content": u1["content"]}, merged,
+               {"role": "user", "content": u3["content"]}, {"role": "assistant", "content": a3["content"]},
+               {"role": "user", "content": u4["content"]}, {"role": "assistant", "content": a4["content"]}]
+    out, why = _compact.splice_for_delivery(rows, new_rows, history)
+    assert out is not None, why
+    assert [m["role"] for m in out][-2:] == ["user", "assistant"]
