@@ -23,23 +23,27 @@ try:  # plugin mode
     from .file_backend import FileBackend
     from .create_file_core import _is_internal_file_tool_content
     from ._new_format import (to_lines_and_trailing_nl, join_lines, count_lines,
-                              format_mtime, detect_eol, ui_envelope, minimal_diff)
+                              format_mtime, detect_eol, ui_envelope, minimal_diff,
+                              make_commenter)
     from .markers import strip_marker_lines
     from .flags import (has_flag, parse_flags_report, flag_int, unknown_flags,
                         FlagError, QUOTE_HINT)
     from ._tool_text import op_line
     from . import _ledger
+    from . import _vocab
 except ImportError:  # console mode
     from mocks import resolve_path_for_tool, file_ops  # type: ignore
     from file_backend import FileBackend  # type: ignore
     from create_file_core import _is_internal_file_tool_content  # type: ignore
     from _new_format import (to_lines_and_trailing_nl, join_lines, count_lines,  # type: ignore
-                             format_mtime, detect_eol, ui_envelope, minimal_diff)
+                             format_mtime, detect_eol, ui_envelope, minimal_diff,
+                             make_commenter)
     from markers import strip_marker_lines  # type: ignore
     from flags import (has_flag, parse_flags_report, flag_int, unknown_flags,  # type: ignore
                        FlagError, QUOTE_HINT)
     from _tool_text import op_line  # type: ignore
     import _ledger  # type: ignore
+    import _vocab  # type: ignore
 
 
 # write_file always writes UTF-8 today - be.ops.write_file() has no encoding
@@ -119,7 +123,7 @@ def create_file_tool_new(path: str, content: str, insert_line: int = None,
                          base_dir: str = None, task_id: str = "default",
                          session_id: str = "",
                          mtime_enabled: bool = True, flags: str = None,
-                         ui_json: str = "off") -> str:
+                         ui_json: str = "off", symbols: dict = None) -> str:
     """Write or insert *content*, returning a plain-text description of what happened.
 
     `ui_json` works exactly as it does for patch (CONTRACT.md §19): the
@@ -152,7 +156,8 @@ def create_file_tool_new(path: str, content: str, insert_line: int = None,
     # monotonic, not contiguous.
     first = op_line(op)
     if first and facts.get("success"):
-        text = first + "\n" + text
+        # Metadata, so it wears the comment of the file written (the diamond when it has none).
+        text = make_commenter(path or "", symbols)(first) + "\n" + text
     out = ui_envelope(ui_json, facts, text)
     # Записываем ТОЛЬКО успех и ТОЛЬКО финальный текст (после конверта) — именно он ложится в
     # строку messages, и именно его компакция потом подменяет своей заглушкой.
@@ -219,13 +224,15 @@ def _write_impl(path, content, insert_line, base_dir, task_id, mtime_enabled,
             suffix += f" Removed {removed_count} marker-like line(s) before writing."
         if quoted:
             suffix += " " + QUOTE_HINT
-        suffix += f" Encoding: {WRITE_ENCODING}, {detect_eol(final_content)}."
+        # Words from the tool dictionary (Plan28).
+        w = _vocab.header("write_file")
+        suffix += f" {w['encoding']}: {WRITE_ENCODING}, {detect_eol(final_content)}."
         if resolved_str != path:
-            suffix += f" Resolved to: {resolved_str}."
+            suffix += f" {w['resolved_to']}: {resolved_str}."
         if mtime_enabled:
             mtime = be.stat_mtime(resolved_str)
             if mtime is not None:
-                suffix += f" Modified: {format_mtime(mtime)}."
+                suffix += f" {w['modified']}: {format_mtime(mtime)}."
 
         # `added` counts what this call actually put in. A full overwrite has no
         # "removed" side we could show without dumping the whole previous file,

@@ -59,6 +59,12 @@
 вокруг (владелец, 2026-09-28: «при сравнении удалять ненужные переводы строк»): файл
 задуман правимым руками, и лишняя или съеденная пустая строка не должна рвать пару.
 
+ПОЛОЖЕНИЕ РЕШАЕТ, ЧТО ЭТО (версия 3, владелец 2026-10-05). В файле реплики ассистента первая
+половина — ВСЕГДА проза, даже пустая: нет прозы — файл начинается с разделителя. Каждая
+следующая — вызов: имя тула и под ним JSON аргументов, ВСЕГДА, пустые — `{}`. До версии 3
+вызов без аргументов писался голым именем, а реплика без прозы начиналась с вызова, и ответ
+ассистента `done` / `OK` был неотличим от вызова `done()` — импорт принимал его за вызов.
+
 ЕДИНИЦА ВЫГРУЗКИ — та же, что у правила владения (`context_ctl/_pairs.py`):
 
     проза  → судьба СВОЕГО сообщения
@@ -98,14 +104,19 @@ except ImportError:  # загружены по пути, вне пакета —
     _addresses = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_addresses)
 
-VERSION = 2
+VERSION = 3
+
+# Спутник снимка: записи журнала об операциях выгруженных результатов (`Plan27-Task01`).
+LEDGER_FILE = "ledger.jsonl"
 
 # Разделитель половин внутри файла (версия 2, 2026-09-28). Разбор — в шапке модуля.
 RULER_MARK = "<!-- tool call separator (do not remove or edit) -->"
 RULER = "\n\n\n\n---\n\n" + RULER_MARK + "\n\n---\n\n\n\n"
 
 # Разделитель при чтении: черта, метка, черта — с ЛЮБЫМ числом пустых строк вокруг и между.
-_RULER_RE = re.compile(r"\n\s*^---[ \t]*\n\s*^" + re.escape(RULER_MARK) +
+# В НАЧАЛЕ файла (реплика без прозы, версия 3) перевода строки перед чертой может не быть —
+# руками стёрли пустые строки сверху; отсюда `\A`.
+_RULER_RE = re.compile(r"(?:\A|\n)\s*^---[ \t]*\n\s*^" + re.escape(RULER_MARK) +
                        r"[ \t]*\n\s*^---[ \t]*$\s*", re.M)
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -216,7 +227,7 @@ def body_of(row) -> str:
 
 
 def render_call(call) -> str:
-    """Один вызов: имя тула, под ним аргументы.
+    """Один вызов: имя тула, под ним аргументы — ВСЕГДА, пустые как `{}` (версия 3, шапка).
 
     Аргументы приходят строкой JSON — печатаем разобранными и с отступом, потому что
     однострочный JSON человек не читает. Не разобралось — отдаём строку как есть, а не
@@ -233,7 +244,7 @@ def render_call(call) -> str:
         except (TypeError, ValueError):
             pass
     if raw in (None, "", {}):
-        args = ""
+        args = "{}"
     elif isinstance(raw, str):
         args = raw
     else:
@@ -268,9 +279,12 @@ def render(row, carrier=None) -> str:
         parts.append(body)
         return RULER.join(p for p in parts if p != "")
 
-    parts = [body] if body else []
-    parts.extend(render_call(c) for c in calls_of(row))
-    return RULER.join(p for p in parts if p != "")
+    # Проза — ВСЕГДА первая половина, даже пустая: у реплики без прозы файл начинается с
+    # разделителя, и первая половина никогда не бывает вызовом (версия 3, шапка).
+    calls = [render_call(c) for c in calls_of(row)]
+    if not calls:
+        return body
+    return RULER.join([body] + calls)
 
 
 def carriers_by_call(rows) -> dict:
@@ -329,7 +343,7 @@ def seat_mark(index: int, width: int) -> str:
 
 
 def export(session: str | None, rows, addresses, wanted, root: str | None = "",
-           snapshot: bool = False, at=None) -> dict:
+           snapshot: bool = False, at=None, operations=None) -> dict:
     """Выгрузить названные адреса. Возвращает отчёт, НИЧЕГО не бросает.
 
     `addresses` — список той же длины, что `rows` (адрес строки или ""), ровно в том виде,
@@ -351,6 +365,12 @@ def export(session: str | None, rows, addresses, wanted, root: str | None = "",
 
     `at` — время снимка числом; None значит «сейчас». Параметр существует ради тестов и
     зондов: без него имя папки нельзя было бы предсказать, и проверять было бы нечего.
+
+    `operations` — записи журнала рода «операция» этой сессии (вызывающий отбирает их
+    `_ledger.is_event`: этот модуль грузится по пути и журнал импортировать не может). Только
+    у снимка: в папку ложится спутник `ledger.jsonl` — записи, чей `tool_call_id` у
+    выгруженного результата, как есть, по строке JSON (`Plan27-Task01`). Импорт по ним
+    заводит операции в журнал целевой сессии. В файлы сообщений id вызовов не попадают.
     """
     report = {"version": VERSION, "session": str(session or ""), "root": "",
               "dir": "", "snapshot": bool(snapshot),
@@ -404,6 +424,7 @@ def export(session: str | None, rows, addresses, wanted, root: str | None = "",
         picked.append((found[0], address, found[1]))
     picked.sort(key=lambda item: item[0])
     kept = {item[0] for item in picked}
+    written_calls: set = set()
 
     for index, address, row in picked:
         carrier = carriers.get(str(row.get("tool_call_id") or "")) \
@@ -431,4 +452,27 @@ def export(session: str | None, rows, addresses, wanted, root: str | None = "",
             continue
         report["written"].append({"msg": address, "path": str(path),
                                   "seat": index, "chars": len(text)})
+        if str(row.get("role") or "") == "tool" and row.get("tool_call_id"):
+            written_calls.add(str(row.get("tool_call_id")))
+
+    if snapshot and operations is not None:
+        report["ledger"] = _write_ledger(folder, operations, written_calls, report)
     return report
+
+
+def _write_ledger(folder, operations, call_ids, report) -> int:
+    """Спутник снимка `ledger.jsonl`: записи операций выгруженных результатов. Сколько записано.
+
+    Нечего писать — файла нет: папка без спутника импортируется как прежде (старые папки).
+    """
+    picked = [e for e in operations or []
+              if isinstance(e, dict) and str(e.get("tool_call_id") or "") in call_ids]
+    if not picked:
+        return 0
+    try:
+        text = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in picked)
+        write_text(Path(folder) / LEDGER_FILE, text)
+    except Exception as exc:  # noqa: BLE001 - без спутника снимок всё равно годен
+        report["errors"].append(f"{LEDGER_FILE}: {type(exc).__name__}: {exc}")
+        return 0
+    return len(picked)

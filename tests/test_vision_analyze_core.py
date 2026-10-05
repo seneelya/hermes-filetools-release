@@ -182,9 +182,9 @@ def test_empty_content_is_reported_rather_than_becoming_an_empty_data_url():
 
 def test_success_renders_analysis_as_the_body():
     raw = json.dumps({"success": True, "analysis": "A cat on a keyboard."})
-    head, sep, body = vac.render_vision_result(raw).partition("\n○○○\n")
+    head, sep, body = vac.render_vision_result(raw).partition("\n◆○○○\n")
     assert sep
-    assert head == "Success: True"
+    assert head == "◆Success: True"
     assert body == "A cat on a keyboard."
 
 
@@ -199,7 +199,7 @@ def test_failure_renders_error_and_keeps_whatever_analysis_survived():
     raw = json.dumps({"success": False, "error": "provider timeout",
                        "analysis": "partial"})
     result = vac.render_vision_result(raw)
-    assert result.startswith("Success: False\nError: provider timeout\n○○○\n")
+    assert result.startswith("◆Success: False\nError: provider timeout\n◆○○○\n")
     assert result.endswith("partial")
 
 
@@ -243,7 +243,7 @@ def test_string_return_is_rendered(monkeypatch):
     got = asyncio.run(vac.vision_analyze_tool_new(
         {"image_url": "https://x/y.png", "question": "?"}))
     _op, rest = split_op_line(got)   # the address leads the answer (Plan09)
-    assert rest == "Success: True\n○○○\ndescribed"
+    assert rest == "◆Success: True\n◆○○○\ndescribed"
 
 
 def test_a_path_reaches_their_handler_as_a_data_url(monkeypatch):

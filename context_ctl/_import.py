@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from datetime import datetime
 from pathlib import Path
 
@@ -51,6 +52,10 @@ FILE_RE = re.compile(r"^(?P<seat>\d+)__(?P<stamp>\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2
 # только в сочетании со вторым признаком (JSON ниже или ничего), поэтому проверяется вместе.
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
 ROLES = ("user", "assistant", "tool", "system")
+# Режимы импорта (`Plan27`): заменить ленту, дописать в хвост, вставить в голову.
+MODES = ("replace", "tail", "head")
+# Сдвиг времени строки, чьё место `(роль, время)` уже занято в целевой ленте.
+_STAMP_STEP = 1e-3
 
 
 def parse_stamp(text: str):
@@ -63,11 +68,13 @@ def parse_stamp(text: str):
         return None
 
 
-def parse_call(half: str):
+def parse_call(half: str, need_args: bool = False):
     """Половина → `(имя, аргументы)` или None, если это не вызов.
 
     Аргументы — разобранный JSON, когда он разбирается; иначе строка как есть (битые аргументы
-    выгрузка тоже пишет строкой — факт разговора, возвращаем его тем же).
+    выгрузка тоже пишет строкой — факт разговора, возвращаем его тем же). Голое имя без строки
+    аргументов — вызов `{}` (так писала выгрузка до версии 3), но не при `need_args`: там одно
+    слово — проза (`done`, `OK`), см. `_export`, шапка «Положение решает».
     """
     text = str(half or "").strip("\n")
     head, _, rest = text.partition("\n")
@@ -76,7 +83,7 @@ def parse_call(half: str):
         return None
     rest = rest.strip()
     if not rest:
-        return head, {}
+        return None if need_args else (head, {})
     try:
         return head, json.loads(rest)
     except (TypeError, ValueError):
@@ -131,10 +138,16 @@ def list_files(folder) -> tuple[list, list]:
     return files, problems
 
 
-def build_rows(files, read=None) -> tuple[list, list]:
+def new_tag() -> str:
+    """Метка одного импорта: id вызовов `imp_<метка>_<место>_<k>` не повторяются, если ту же папку
+    влить дважды или в сессию, где импорт уже был (`Plan27-Task03`)."""
+    return secrets.token_hex(3)
+
+
+def build_rows(files, read=None, tag: str = "") -> tuple[list, list]:
     """Файлы → `(строки ленты, проблемы)`. Строки — в форме `replace_messages` Hermes.
 
-    `read(path) -> str` — подмена чтения для тестов.
+    `read(path) -> str` — подмена чтения для тестов. `tag` — метка импорта в id вызовов.
     """
     read = read or (lambda p: Path(p).read_text(encoding="utf-8"))
     rows, problems = [], []
@@ -164,11 +177,18 @@ def build_rows(files, read=None) -> tuple[list, list]:
             calls = []
             prose = ""
             for i, half in enumerate(halves):
+                if i == 0:
+                    # Первая половина — проза (версия 3: нет прозы — пустая, файл начинается с
+                    # разделителя). Вызовом она бывает только в старой выгрузке реплики без прозы,
+                    # и тогда под именем стоит JSON; одно слово (`done`, `OK`) — всегда проза.
+                    call = parse_call(half, need_args=True) if half else None
+                    if call is None:
+                        prose = half
+                    else:
+                        calls.append(call)
+                    continue
                 call = parse_call(half)
                 if call is None:
-                    if i == 0:
-                        prose = half
-                        continue
                     problems.append(f"{name}: половина {i + 1} не читается как вызов "
                                     "(имя тула первой строкой, ниже JSON)")
                     continue
@@ -178,7 +198,7 @@ def build_rows(files, read=None) -> tuple[list, list]:
             if calls:
                 tool_calls = []
                 for k, (tool, args) in enumerate(calls):
-                    call_id = f"imp_{f['seat']}_{k}"
+                    call_id = f"imp_{tag}_{f['seat']}_{k}" if tag else f"imp_{f['seat']}_{k}"
                     tool_calls.append({"id": call_id, "type": "function",
                                        "function": {"name": tool, "arguments": _arguments(args)}})
                     pending.append((tool, _canon(args), call_id))
@@ -213,8 +233,86 @@ def build_rows(files, read=None) -> tuple[list, list]:
     return rows, problems
 
 
-def load(folder, read=None) -> dict:
-    """Папка → `{rows, problems, files}`. Ничего не пишет."""
+def load(folder, read=None, tag: str | None = None) -> dict:
+    """Папка → `{rows, problems, files}`. Ничего не пишет. Без `tag` — новая метка импорта."""
     files, problems = list_files(folder)
-    rows, more = build_rows(files, read) if files else ([], [])
-    return {"rows": rows, "problems": problems + more, "files": len(files)}
+    tag = new_tag() if tag is None else tag
+    rows, more = build_rows(files, read, tag) if files else ([], [])
+    ledger, bad = read_ledger_sidecar(folder)
+    return {"rows": rows, "problems": problems + more, "files": len(files),
+            "ledger": ledger, "ledger_bad": bad}
+
+
+def read_ledger_sidecar(folder) -> tuple[list, int]:
+    """Спутник снимка `ledger.jsonl` (`Plan27-Task01`) → `(записи, сколько строк не разобрано)`.
+
+    Нет файла — пустой список: старая папка импортируется как прежде. Битая строка не отказ
+    импорта, а только потеря привязки той операции — её результат придёт без записи журнала.
+    """
+    path = Path(str(folder or "")).expanduser() / _export.LEDGER_FILE
+    if not path.is_file():
+        return [], 0
+    records, bad = [], 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return [], 1
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if isinstance(entry, dict):
+            records.append(entry)
+        else:
+            bad += 1
+    return records, bad
+
+
+def _place(row) -> tuple:
+    """`(роль, время)` — личность сообщения, как её видит индекс адресов (`_msgindex.place`)."""
+    try:
+        ts = float(row.get("timestamp"))
+    except (TypeError, ValueError):
+        ts = str(row.get("timestamp") or "")
+    return (str(row.get("role") or ""), ts)
+
+
+def restamp(imported, live) -> int:
+    """Сдвинуть время импортированных строк, чьё место `(роль, время)` уже занято в живой ленте
+    (та же папка второй раз, выгрузка этой же сессии). Иначе два сообщения делили бы личность,
+    и адрес одного достался бы другому. Строки импорта — наши свежие словари, правим на месте.
+    Возвращает, сколько строк сдвинуто."""
+    taken = {_place(r) for r in live}
+    moved = 0
+    for row in imported:
+        spot = _place(row)
+        if spot in taken and isinstance(spot[1], float):
+            ts = spot[1]
+            while (spot[0], ts) in taken:
+                ts += _STAMP_STEP
+            row["timestamp"] = ts
+            spot = (spot[0], ts)
+            moved += 1
+        taken.add(spot)
+    return moved
+
+
+def assemble(live, imported, mode: str = "replace") -> tuple[list, list]:
+    """`(новая лента, удаляемые нарочно)` по режиму. Чередование ролей — дело вызывающего
+    (`_alternation.fit`), здесь только порядок.
+
+    replace — импорт вместо ленты, `removed` = вся прежняя;
+    tail    — живая лента + импорт: прежние строки стоят на месте, кеш провайдера живёт;
+    head    — импорт + живая лента: всё прежнее перевставляется, кеш сгорает целиком.
+    """
+    if mode not in MODES:
+        raise ValueError(f"unknown import mode {mode!r}, expected one of {MODES}")
+    live, imported = list(live), list(imported)
+    if mode == "replace":
+        return imported, live
+    restamp(imported, live)
+    return (live + imported if mode == "tail" else imported + live), []

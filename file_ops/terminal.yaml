@@ -10,7 +10,7 @@ name: terminal
 description: >
   Execute shell commands on a Linux environment. Filesystem, current working
   directory, and exported environment variables persist between calls.
-  Response is plain text, not JSON — labeled lines (Exit code:, Error:, Cwd:,
+  Response is plain text, not JSON — labeled lines ({terminal.exit_code}:, {terminal.error}:, {terminal.cwd}:,
   ...) above the command's own output.
 
 

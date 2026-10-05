@@ -10,14 +10,14 @@ description: >
   Read a text file as plain text. Technical metadata (byte ranges, hashes,
   markers) is placed in comment-style header lines and inline tags, not
   returned as a separate structure. Lines starting with
-  ■BLOCK/■END are tool-written framing, never file content — never include
+  {block_open}/{block_close} are tool-written framing, never file content — never include
   them if reproducing or rewriting the file's content. An occasional
-  "⚓ Line: N" line is an automatic, passive signpost — also tool-written, not
+  "{anchor_symbol} {anchor_word}: N" line is an automatic, passive signpost — also tool-written, not
   content: it marks a blank line and states its number. Nothing to act on;
   copying one along with an excerpt is harmless, the other tools put the blank
   line back. Each response includes
-  a FileTag: short content hash tag for this file (may coincide with other
-  files) — helps identify tool markers, not content; ■BLOCK/■END carry the
+  a {read_file.file_tag}: short content hash tag for this file (may coincide with other
+  files) — helps identify tool markers, not content; {block_open}/{block_close} carry the
   same tag. Use "--line N --count N" in `flags` to page through large files
   instead of reading everything at once.
 required: [path, flags]
@@ -35,11 +35,11 @@ properties:
       never with "=": "--line 400 --count 200". Paging: "--line N" starts at
       that line (1-indexed, default 1), "--count N" reads at most N lines
       (default 2000, max 2000; "--count 0" returns only the header — size,
-      encoding, FileTag — and no file content). "--numbered" prefixes every
+      encoding, {read_file.file_tag} — and no file content). "--numbered" prefixes every
       returned line with its absolute number "N|"; without it the content is
-      verbatim and occasional "⚓ Line: N" signposts stand in for lines that
+      verbatim and occasional "{anchor_symbol} {anchor_word}: N" signposts stand in for lines that
       were already blank, so line numbers are still available (e.g. for
-      patch's `line`) without a number on every line — the ■BLOCK header
+      patch's `line`) without a number on every line — the {block_open} header
       states the exact range either way. "--force" reads a file that looks
       binary or whose encoding can't be confirmed (refused by default, with a
       reason). "--encoding NAME" (e.g. "--encoding cp866") decodes with

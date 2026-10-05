@@ -1,5 +1,5 @@
 name: hermes-filetools
-version: "0.38.2"
+version: "0.40.0"
 # THIS FILE IS THE DEFAULTS (since 2026-09-30). A plugin update / our deploy overwrites it.
 # YOUR changes live in <HERMES_HOME>/filetools/settings.yaml - the Config panel writes only the
 # differences from the values below there; delete a key in that file to get the default back.
@@ -49,9 +49,8 @@ capabilities: [tools.override]
 # of an already-enabled plugin). Hermes does not read requirements.txt;
 # that file is the same list for humans.
 pip_dependencies:
-  - python-docx>=1.1
   - openpyxl>=3.1
-  - python-pptx>=1.0
+  - firecrawl-anydoc>=0.2.4
   - charset-normalizer>=3.3
   - filetype>=1.2
   - pytest>=9.1
@@ -74,6 +73,8 @@ pip_dependencies:
 tools:
   read_file:
     enabled: true
+    # panel icon (card + mirror chip); a foreign tool gets the panel's fallback ◆
+    icon: "◧"
     # help/params_help below: UI-facing one-liners (Plan17's Config panel reads these).
     # Neither is read by register() itself - unrecognized keys inside a slot's own
     # mapping are silently ignored (confirmed: cfg = {**fallback, **manifest_cfg,
@@ -101,6 +102,7 @@ tools:
       anchor_gap: "Minimum lines between two anchor marks. Higher = rarer/quieter, lower = denser."
   write_file:
     enabled: true
+    icon: "✚"
     help: "Plain-text answer instead of JSON."
     path: new                # rolled out 2026-08-25, same as read_file above.
     # schema: same auto-derivation as read_file above (create_file.yaml /
@@ -123,6 +125,7 @@ tools:
       ui_json: ["min", "off", "diff", "wrap"]
   search_files:
     enabled: true
+    icon: "⌕"
     help: "Plain-text answer instead of JSON. No params - same old|new switch as the other three file tools."
     path: new                # implemented 2026-08-26 (sift_files_new_core.py /
                               # Vision01__search.md), flipped here for live-agent
@@ -133,6 +136,7 @@ tools:
     # for new).
   patch:
     enabled: true
+    icon: "Δ"
     help: "Plain-text answer instead of JSON."
     path: new                # implemented 2026-08-26 (modify_file_new_core.py /
                               # Vision01__patch.md) - the last of the four slots
@@ -158,6 +162,7 @@ tools:
       ui_json: ["min", "off", "diff", "wrap"]
   terminal:
     enabled: true
+    icon: "❯"
     help: "Calls hermes-agent's own terminal_tool() unmodified (approval/sudo/docker/sandbox logic stays theirs) and reformats its JSON return into plain text."
     # Single implementation (Plan03, 2026-09-01).
     #
@@ -180,6 +185,7 @@ tools:
     # for why: we want the freedom to diverge from upstream's wording).
   execute_code:
     enabled: true
+    icon: "▷"
     help: "Wraps hermes-agent's own sandboxed execute_code handler (sandbox/RPC/approval - all theirs), reformats only the JSON return."
     # Plan04 task 4, 2026-09-02. tools.code_execution_tool._execute_code_handler()
     # (RPC loop, misdirected-argument recovery - all theirs).
@@ -205,6 +211,7 @@ tools:
     path: new
   process:
     enabled: true
+    icon: "⟳"
     help: "Wraps hermes-agent's own process_registry handler (start/stop/kill/stdin - all theirs), reformats only the JSON return."
     # Plan04 task 5, 2026-09-02. tools.process_registry._handle_process()
     # (action dispatch, session lookup, kill escalation, secret redaction - all
@@ -223,6 +230,7 @@ tools:
     path: new
   vision_analyze:
     enabled: true
+    icon: "◉"
     help: "Fixes one upstream bug (Windows host pathlib mangling a container path) and reformats the answer."
     # Plan05, 2026-09-02.
     #
@@ -503,7 +511,7 @@ config_schema:
       Per-slot overrides of the `tools:` defaults declared above in this same
       file. Slot keys: read_file, write_file, patch, search_files; per-slot
       fields: enabled (bool), path (old|new), schema (filename in file_ops/),
-      params (mtime, anchors, anchor_gap, ui_json). A missing slot or field
+      icon (panel glyph), params (mtime, anchors, anchor_gap, ui_json). A missing slot or field
       falls back to this manifest's own default. Hermes validates only that
       this key is a mapping - the nested shape is enforced by __init__.py,
       which treats anything it does not recognize as absent.

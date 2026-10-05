@@ -157,6 +157,34 @@ def asserted_ids(registry: dict) -> list:
     return out
 
 
+def dependency_python(paths=None) -> str:
+    """Python of the venv whose `site-packages` this process runs with, or `""`.
+
+    WHY (2026-10-06, Hermes `b79c45bd3e`): the gateway now runs on the BARE store python and
+    its loader adds the dependency venv's `site-packages` at runtime. A child started with
+    `sys.executable` therefore is not that venv: importing `run_agent` there (our tests do)
+    re-runs their loader with the tests' temporary `HERMES_HOME`, which tries to build a
+    dependency environment for that empty home and exits — pytest reports `internal error`.
+    The venv's own python is what `__HQ/tools/hermes_python.py` uses, and there the same tests
+    pass. Standard venv layout only (`Lib/site-packages` → `Scripts/python.exe`,
+    `lib/pythonX/site-packages` → `bin/python`); nothing of their installer is read.
+    """
+    import sys
+    for entry in (paths if paths is not None else sys.path):
+        p = os.path.normpath(str(entry or ""))
+        if os.path.basename(p).lower() != "site-packages":
+            continue
+        lib = os.path.dirname(p)
+        for venv in (os.path.dirname(lib), os.path.dirname(os.path.dirname(lib))):
+            if not os.path.isfile(os.path.join(venv, "pyvenv.cfg")):
+                continue
+            for exe in (os.path.join(venv, "Scripts", "python.exe"),
+                        os.path.join(venv, "bin", "python")):
+                if os.path.isfile(exe):
+                    return exe
+    return ""
+
+
 def run_tests(plugin_root: str, ids: list, *, python: str | None = None,
               timeout: float = 1200) -> dict:
     """pytest по `ids` в корне плагина. `{ran, error, seconds, summary, by_node}`;
@@ -172,10 +200,15 @@ def run_tests(plugin_root: str, ids: list, *, python: str | None = None,
     if missing:
         return {"ran": False, "error": "tests not shipped: " + ", ".join(missing), "by_node": {},
                 "seconds": 0.0, "summary": {}}
-    fd, junit = tempfile.mkstemp(prefix="ft-seams-", suffix=".xml")
+    # Loaded by path (no package). Same rule as `_home.scratch_dir`: RAM disk, else
+    # <plugin>/scratch — never AppData Temp.
+    ram = os.path.join("c:\\RAM_Cache", "Temp")
+    scratch = os.path.join(ram, "hermes-filetools") if os.path.isdir(ram) else os.path.join(plugin_root, "scratch")
+    os.makedirs(scratch, exist_ok=True)
+    fd, junit = tempfile.mkstemp(prefix="ft-seams-", suffix=".xml", dir=scratch)
     os.close(fd)
     started = time.time()
-    cmd = [python or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+    cmd = [python or dependency_python() or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
            f"--junitxml={junit}", *ids]
     try:
         proc = subprocess.run(cmd, cwd=plugin_root, capture_output=True, text=True,

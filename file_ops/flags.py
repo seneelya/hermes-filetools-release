@@ -6,6 +6,11 @@ instead of a growing pile of individual JSON booleans.
 
 from __future__ import annotations
 
+try:  # plugin mode
+    from . import _vocab
+except ImportError:  # console mode
+    import _vocab  # type: ignore
+
 
 # Every pair a model has been seen to reach for, plus the ones it plausibly
 # would. Backticks because markdown is its native habitat; the typographic and
@@ -103,7 +108,7 @@ def parse_flags_report(flags: str):
     return result, stripped
 
 
-QUOTE_HINT = ('Hint: quotes around the flag string/values were removed - write '
+QUOTE_HINT = (f'{_vocab.COMMON["hint"]}: quotes around the flag string/values were removed - write '
               'them bare (--count 20, not --count "20"), the value is taken '
               'literally including any quote characters.')
 

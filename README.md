@@ -115,7 +115,7 @@ context:
   gateway.
 - Check: after a gateway restart `<HERMES_HOME>/logs/agent.log` has
   `capability_check plugin=hermes-filetools capability=tools.override decision=allow`.
-- Python packages the plugin needs (`python-docx`, `openpyxl`, and `pytest` for the full
+- Python packages the plugin needs (`openpyxl`, `firecrawl-anydoc`, and `pytest` for the full
   compatibility check) are installed by Hermes itself on install (`pip_dependencies` in
   `plugin.yaml`).
 
@@ -141,7 +141,7 @@ back to Hermes' own version in Config → **Our tools** (`enabled` off).
 
 | tool | what it is now |
 | --- | --- |
-| `read_file` | **Our implementation.** Plain text with a short header (size, lines, line endings), line numbers outside the file body, Word / Excel / PowerPoint / Jupyter files read as text. |
+| `read_file` | **Our implementation.** Plain text with a short header (size, lines, line endings), line numbers outside the file body, PDF / Word / Excel / PowerPoint / OpenDocument / RTF / EPUB / Jupyter files read as text (a scanned PDF is refused with a hint - no OCR). |
 | `write_file` | **Our implementation.** Plain-text answer: what was written, how many lines, the encoding. |
 | `patch` | **Our implementation.** Plain-text answer; a failed edit is a clear `ERROR …` line, never a silent repair. |
 | `search_files` | **Our implementation.** Plain-text results instead of JSON. |
@@ -179,7 +179,7 @@ access to the session, the gateway's memory, the tool registry, the way results 
 There is no other way to reach these things, and a Hermes update can move or change them. That is
 why every release names the Hermes commit it was verified on:
 
-**This version was verified on Hermes `54bc5e509c` (2026-10-02).**
+**This version was verified on Hermes `b79c45bd3e` (2026-10-06).**
 
 The same line is shown in the panel next to the check buttons. Running a newer Hermes? Run the
 check below before trusting the plugin.

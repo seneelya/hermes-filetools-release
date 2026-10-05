@@ -25,6 +25,11 @@ from typing import Any
 
 from . import _prompts
 
+try:
+    from ..file_ops import _tool_text
+except ImportError:  # pragma: no cover - плоская загрузка
+    from file_ops import _tool_text  # type: ignore
+
 # Номер операции лежит в ТЕЛЕ ответа инструмента (`Operation ID: 0001`) — это шапка наших
 # же тулов. Вытаскиваем его, чтобы он встал в ЯРЛЫК обеих половин пары, и вырезаем из тела:
 # в ярлыке он полезен (по нему адресуется вся механика теней), в теле он дубль.
@@ -35,7 +40,9 @@ from . import _prompts
 #     <!-- Operation ID: 0003 -->
 # Поэтому якоримся не на начало строки, а на сами слова, и режем строку ЦЕЛИКОМ вместе с
 # обёрткой. Ограничение слева держит нас от совпадения с прозой, где номер лишь упомянут.
-_OP_RE = re.compile(r"^[^\n]{0,40}?Operation ID:\s*([0-9a-fA-F]+)[^\n]{0,20}$", re.M)
+# The label is the dictionary's (`_tool_text.OP_LABEL`, Plan28).
+_OP_RE = re.compile(r"^[^\n]{0,40}?" + re.escape(_tool_text.OP_LABEL)
+                    + r":\s*([0-9a-fA-F]+)[^\n]{0,20}$", re.M)
 
 IMPORT_PROBLEM = ""
 # Срезание `<think>`-блоков импортируется ЛЕНИВО (их модуль тяжёлый), поэтому отказ

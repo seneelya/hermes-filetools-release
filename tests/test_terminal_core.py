@@ -118,8 +118,8 @@ def test_separator_between_header_and_output():
                        "cwd": "/srv/app"})
     result = terminal_core.render_terminal_result(raw)
     assert "○○○" in result
-    head, _, body = result.partition("\n○○○\n")
-    assert "Exit code: 0" in head and "Cwd: /srv/app" in head
+    head, _, body = result.partition("\n◆○○○\n")
+    assert "◆Exit code: 0" in head and "◆Cwd: /srv/app" in head
     assert body == "hello\n"  # body is verbatim, nothing appended below it
 
 
@@ -129,13 +129,13 @@ def test_no_separator_when_output_empty():
     raw = json.dumps({"output": "", "exit_code": 0, "error": None})
     result = terminal_core.render_terminal_result(raw)
     assert "○○○" not in result
-    assert result == 'Exit code: 0  (raw: "exit_code": 0)'
+    assert result == '◆Exit code: 0  (raw: "exit_code": 0)'
 
 
 def test_separator_symbol_honours_configured_symbols():
     raw = json.dumps({"output": "hi", "exit_code": 0, "error": None})
     result = terminal_core.render_terminal_result(raw, symbols={"separator_symbol": "#"})
-    assert "\n###\n" in result
+    assert "\n◆###\n" in result
     assert "○" not in result
 
 

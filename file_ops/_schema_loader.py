@@ -20,24 +20,51 @@ The console `main()` entry points in each `*_core.py` never import this module,
 so they still run without it.
 """
 
+import re
 from pathlib import Path
 
 from hermes_yaml import safe_load
 
 _SCHEMA_DIR = Path(__file__).resolve().parent
 
+# `{block_open}`, `{anchor_word}`, `{read_file.file_tag}` (Plan28). Descriptions are prompt text
+# for the MODEL, and they used to spell symbols the human can change (`■BLOCK`) and words the
+# tools print — so a changed `block_symbol` reached the tool's output and never its description.
+# Values come from `_vocab.placeholders(symbols)`; the yaml holds only the names.
+PLACEHOLDER = re.compile(r"\{([a-z_]+(?:\.[a-z_]+)?)\}")
 
-def load_schema(filename: str) -> dict:
+
+def fill(text: str, values: dict) -> str:
+    """Replace known placeholders; an unknown one is left as is (a test fails on it)."""
+    return PLACEHOLDER.sub(lambda m: str(values.get(m.group(1), m.group(0))), text)
+
+
+def _fill_tree(node, values: dict):
+    """Every `description` string, however deep (parameters, nested items)."""
+    if isinstance(node, dict):
+        return {k: (fill(v, values) if k == "description" and isinstance(v, str)
+                    else _fill_tree(v, values)) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_fill_tree(v, values) for v in node]
+    return node
+
+
+def load_schema(filename: str, values: dict | None = None) -> dict:
     """Read `<filename>` (relative to this file's directory) and shape it into
     `{"name", "description", "parameters": {"type": "object", "properties", "required"}}`.
+
+    `values` — placeholder values (`_vocab.placeholders(symbols)`); registration always passes
+    them. Without them the text keeps its `{names}` — fine for the panel, which drops
+    descriptions anyway.
     """
     data = safe_load((_SCHEMA_DIR / filename).read_text(encoding="utf-8"))
+    values = values or {}
     return {
         "name": data["name"],
-        "description": data["description"].strip(),
+        "description": fill(data["description"].strip(), values),
         "parameters": {
             "type": "object",
-            "properties": data.get("properties", {}),
+            "properties": _fill_tree(dict(data.get("properties", {})), values),
             "required": data.get("required", []),
         },
     }

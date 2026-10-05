@@ -11,8 +11,10 @@ import re
 
 try:  # plugin mode
     from ._new_format import DEFAULT_SYMBOLS, comment_delims
+    from . import _vocab
 except ImportError:  # console mode
     from _new_format import DEFAULT_SYMBOLS, comment_delims  # type: ignore
+    import _vocab  # type: ignore
 
 # Vision01__unique_tokens.md §2 - cheapest (fewest tokens) first, escalate
 # only on a real, verified collision against the actual file content.
@@ -49,7 +51,8 @@ def resolve_file_tag(content: str, block_symbol: str = None) -> str:
     tag = None
     for bits in TAG_BIT_LADDER:
         tag = _tag_for_bits(content, bits)
-        probes = (f"{block_symbol}BLOCK {tag}", f"{block_symbol}END {tag}")
+        els = _vocab.format_elements({"block_symbol": block_symbol})
+        probes = (f"{els['block_open']} {tag}", f"{els['block_close']} {tag}")
         if not any(p in content for p in probes):
             return tag
     return tag
@@ -57,20 +60,22 @@ def resolve_file_tag(content: str, block_symbol: str = None) -> str:
 
 def _marker_line_pattern(symbols: dict) -> re.Pattern:
     block = re.escape(symbols["block_symbol"])
+    # Words from the tool dictionary (Plan28): what the tools print is what we recognise.
+    w = {k: re.escape(v) for k, v in {**_vocab.MARKS, **_vocab.header("read_file")}.items()}
     anchor = re.escape(symbols["anchor_symbol"])
     sep = re.escape(symbols["separator_symbol"])
     return re.compile(
         rf"^(?:"
-        rf"{block}(?:BLOCK|END)\s*(?:{_TAG_RE})?\s*:.*"
+        rf"{block}(?:{w['block_word']}|{w['end_word']})\s*(?:{_TAG_RE})?\s*:.*"
         # `Line:` with the colon is what place_anchors emits now; the
         # colon-less `Line N` form stays accepted on purpose - a model may
         # still be holding a response produced before the format changed, and
         # failing to recognise it would mean writing an anchor into a file.
-        rf"|{anchor}(?:{_TAG_RE})?\s*Line\s*:?\s*\d+.*"
+        rf"|{anchor}(?:{_TAG_RE})?\s*{w['anchor_word']}\s*:?\s*\d+.*"
         rf"|{sep}{{3}}"
-        rf"|File:.*"
-        rf"|Modified:.*"
-        rf"|FileTag:\s*{_TAG_RE}"
+        rf"|{w['file']}:.*"
+        rf"|{w['modified']}:.*"
+        rf"|{w['file_tag']}:\s*{_TAG_RE}"
         # The operation address (Plan09, label spelled out 2026-09-03 - see
         # `_tool_text.OP_LABEL`). It lives only in a response header
         # and must never reach a file, but the model can copy our header into
@@ -79,7 +84,7 @@ def _marker_line_pattern(symbols: dict) -> re.Pattern:
         # is no longer EMITTED (2026-09-03) but stays matched here: a session
         # in flight, or a model still holding an older response, can echo
         # `0156xbc` back into content.
-        rf"|Operation ID:\s*[0-9a-fA-F]{{4,}}(?:{_TAG_RE})?"
+        rf"|{w['op']}:\s*[0-9a-fA-F]{{4,}}(?:{_TAG_RE})?"
         rf")$"
     )
 

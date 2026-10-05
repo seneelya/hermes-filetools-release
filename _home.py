@@ -37,6 +37,33 @@ def plugin_home() -> Path:
     return hermes_home() / "filetools"
 
 
+# Scratch: throwaway files of tests, release staging, seam junit, tool spill, probe logs.
+# Owner's RAM disk first (`c:\RAM_Cache\Temp\hermes-filetools`); otherwise `<plugin_home>/scratch`.
+# Never AppData Local Temp. The named folder is ours — wipe it without touching other RAM junk.
+_RAM_TEMP = Path(r"c:\RAM_Cache\Temp")
+_OURS = "hermes-filetools"
+
+
+def scratch_dir(*parts: str) -> Path:
+    """Directory for throwaway files. Created on the call. Subfolders via extra parts."""
+    root = (_RAM_TEMP / _OURS) if _RAM_TEMP.is_dir() else (plugin_home() / "scratch")
+    path = root.joinpath(*parts) if parts else root
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def use_scratch_as_temp() -> Path:
+    """Point TMP/TEMP/TMPDIR and tempfile.tempdir at scratch_dir('pytest')."""
+    import tempfile
+    path = scratch_dir("pytest")
+    target = str(path)
+    os.environ["TMP"] = target
+    os.environ["TEMP"] = target
+    os.environ["TMPDIR"] = target
+    tempfile.tempdir = target
+    return path
+
+
 def settings_path() -> Path:
     """Файл настроек пользователя — то, что панель пишет вместо `plugin.yaml`."""
     return plugin_home() / SETTINGS_FILE

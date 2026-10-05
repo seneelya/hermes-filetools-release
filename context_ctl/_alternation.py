@@ -33,6 +33,8 @@ Hermes перед каждым запросом, а в автокомпакци�
 ДВА ПОТРЕБИТЕЛЯ (2026-09-30): компакция и `erase`. Стирание тоже рождает новые стыки одной роли
 (ответ между двумя репликами человека, реплика между двумя ответами, начало ленты), но сводки у
 него нет — поэтому свои, короткие тексты мостика (`fit(..., kind="erase")`), та же метка.
+ТРЕТИЙ — импорт (`Plan27`, 2026-10-05): стыки на входе в импортированное и на выходе из него
+(`tail`/`head`) и внутри него (папку правили руками) — `fit(..., kind="import")`, свои тексты.
 """
 from __future__ import annotations
 
@@ -67,6 +69,14 @@ ERASE_TEXT = {
     "gap": _say("messages removed here"),
 }
 
+# Мостики импорта (`Plan27`, 2026-10-05): по месту — вход в импортированное, выход из него, стык
+# внутри него. Какая сторона импортирована, `fit` знает по `old` (импортированных строк там нет).
+IMPORT_TEXT = {
+    "start": _say("messages imported from a saved session follow"),
+    "end": _say("the imported messages end here, the conversation continues"),
+    "inside": _say("the imported conversation continues"),
+}
+
 
 def _text(row) -> str:
     return str(row.get("content") or "") if isinstance(row, dict) else ""
@@ -76,10 +86,21 @@ def _is_distillate(row) -> bool:
     return is_distillate(_text(row))
 
 
-def bridge_text(prev, row, kind: str = "compact") -> str:
-    """Текст мостика между `prev` и `row` — по тому, что стоит рядом; `kind` — чья правка."""
+def bridge_text(prev, row, kind: str = "compact", is_new=None) -> str:
+    """Текст мостика между `prev` и `row` — по тому, что стоит рядом; `kind` — чья правка.
+
+    `is_new(row) -> bool` — строки не было в ленте до правки. Нужен импорту: отличить вход в
+    импортированное от выхода из него.
+    """
     if kind == "erase":
         return ERASE_TEXT["start"] if prev is None else ERASE_TEXT["gap"]
+    if kind == "import":
+        new = is_new or (lambda r: True)
+        if prev is None or (new(row) and not new(prev)):
+            return IMPORT_TEXT["start"]
+        if new(prev) and not new(row):
+            return IMPORT_TEXT["end"]
+        return IMPORT_TEXT["inside"]
     if _is_distillate(row):
         return BRIDGE_TEXT["before"]
     if _is_distillate(prev):
@@ -123,16 +144,21 @@ def fit(new: list, old: list, kind: str = "compact") -> tuple[list, int]:
     stamp = time.time() + 0.0005
     first_changed = next((i for i, row in enumerate(new) if i >= len(old) or old[i] is not row),
                          len(new))
+    old_ids = {id(r) for r in old}
+
+    def is_new(row) -> bool:
+        return id(row) not in old_ids
+
     for index, row in enumerate(new):
         # ПЕРВАЯ реплика после системного промпта — от пользователя (многие провайдеры иначе
         # отказывают; их собственная компакция в начале ленты тоже пишет от пользователя). Если
         # лента начинается с НАШЕЙ строки от ассистента (голова `head_keep: 0`) — мостик перед ней.
         # У `erase` первая строка — СТАРАЯ (стёрто то, что стояло перед ней), поэтому для него
         # новое начало — «лента раньше начиналась не с неё».
-        new_start = (id(row) not in {id(r) for r in old}) or (
-            kind == "erase" and (not old or old[0] is not row))
+        new_start = is_new(row) or (kind == "erase" and (not old or old[0] is not row))
         if not out and _role(row) == "assistant" and new_start:
-            out.append({"role": "user", "content": bridge_text(None, row, kind), "timestamp": stamp})
+            out.append({"role": "user", "content": bridge_text(None, row, kind, is_new),
+                        "timestamp": stamp})
             bridges += 1
         prev = out[-1] if out else None
         if (index >= first_changed and prev is not None
@@ -142,7 +168,7 @@ def fit(new: list, old: list, kind: str = "compact") -> tuple[list, int]:
                 prev["role"] = _other(_role(prev))
             else:
                 role = _other(_role(row))
-                out.append({"role": role, "content": bridge_text(prev, row, kind),
+                out.append({"role": role, "content": bridge_text(prev, row, kind, is_new),
                             "timestamp": stamp + bridges * 1e-3})
                 bridges += 1
         out.append(row)

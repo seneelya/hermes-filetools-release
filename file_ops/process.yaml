@@ -29,9 +29,9 @@ description: >
   stdin/send EOF).
 
 
-  Response is plain text, not JSON — labeled lines (Status:, Session id:,
-  Command:, Exit code:, ...) above the process's own output, separated by
-  ○○○. 'list' puts one process per line below the separator.
+  Response is plain text, not JSON — labeled lines ({process.status}:, {process.session_id}:,
+  {process.command}:, {process.exit_code}:, ...) above the process's own output, separated by
+  {header_separator}. 'list' puts one process per line below the separator.
 required: [action]
 properties:
   action:
@@ -52,7 +52,7 @@ properties:
     description: >
       Max seconds to block for 'wait' action. Returns partial output on
       timeout. A wait window elapsing is NOT an error — the response says so
-      in its Note: line.
+      in its {process.timeout_note}: line.
     minimum: 1
   offset:
     type: integer

@@ -31,6 +31,7 @@ try:  # plugin mode
     from ._tool_text import op_line
     from . import _drift
     from . import _ledger
+    from . import _vocab
 except ImportError:  # console mode
     from mocks import resolve_path_for_tool, file_ops, is_extractable_document, extract_document_bytes  # type: ignore
     from file_backend import FileBackend, add_line_numbers  # type: ignore
@@ -46,6 +47,7 @@ except ImportError:  # console mode
     from _tool_text import op_line  # type: ignore
     import _drift  # type: ignore
     import _ledger  # type: ignore
+    import _vocab  # type: ignore
 
 
 # Read the file's full raw bytes rather than paging through the backend's own
@@ -182,8 +184,11 @@ def view_file_tool_new(path: str, line: int = 1, count: int = 2000, numbered: bo
 
         c = make_commenter(resolved_str, symbols)
         block_symbol = symbols.get("block_symbol", DEFAULT_SYMBOLS["block_symbol"])
-        separator_symbol = symbols.get("separator_symbol", DEFAULT_SYMBOLS["separator_symbol"])
         tag = resolve_file_tag(text, block_symbol)
+        # Words and elements come from the tool dictionary (Plan28): the panel and the schema
+        # description read the same ones.
+        els = _vocab.format_elements({**DEFAULT_SYMBOLS, **symbols})
+        w = _vocab.header("read_file")
 
         max_len, avg_len = line_length_stats(lines)
         eol = detect_eol(text)
@@ -196,22 +201,22 @@ def view_file_tool_new(path: str, line: int = 1, count: int = 2000, numbered: bo
         # the address and only duplicated the `FileTag:` line three rows below.
         op = _ledger.next_op(session=session_id, task_id=task_id)
         header = [c(op_line(op))] if op else []
-        header.append(c(f"File: {resolved_str}"))
+        header.append(c(f"{w['file']}: {resolved_str}"))
         header.append(c(
-            f"Size: {total_lines} lines, {file_size} bytes, {len(text)} chars, "
+            f"{w['size']}: {total_lines} lines, {file_size} bytes, {len(text)} chars, "
             f"{eol}, max/avg line {max_len}/{avg_len:.1f}"
         ))
 
         if mtime_enabled:
             mtime = be.stat_mtime(resolved_str)
             if mtime is not None:
-                header.append(c(f"Modified: {format_mtime(mtime)}"))
+                header.append(c(f"{w['modified']}: {format_mtime(mtime)}"))
 
         if encoding_label:
-            header.append(c(f"Encoding: {encoding_label}"))
+            header.append(c(f"{w['encoding']}: {encoding_label}"))
 
         if encoding_label and encoding_label.endswith("(guessed)"):
-            header.append(c('Hint: encoding was guessed - retry with '
+            header.append(c(f"{w['hint']}: encoding was guessed - retry with "
                              'flags="--encoding NAME" if this looks wrong.'))
 
         # Accepting the quotes is not enough: unless the answer SAYS they were
@@ -223,12 +228,12 @@ def view_file_tool_new(path: str, line: int = 1, count: int = 2000, numbered: bo
 
         if controls:
             header.append(c(
-                f"Control chars: {controls} shown as pictures (␀-style) - "
+                f"{w['control_chars']}: {controls} shown as pictures (␀-style) - "
                 "this body is NOT a byte copy of the file."
             ))
 
-        header.append(c(f"FileTag: {tag}"))
-        header.append(c(separator_symbol * 3))
+        header.append(c(f"{w['file_tag']}: {tag}"))
+        header.append(c(els["header_separator"]))
 
         if metadata_only:
             out = "\n".join(header)
@@ -238,7 +243,7 @@ def view_file_tool_new(path: str, line: int = 1, count: int = 2000, numbered: bo
             _note_read(out, session_id, task_id, resolved_str, 0, 0, 0, op)
             return out
 
-        header.append(c(f"{block_symbol}BLOCK {tag} : {actual_start}-{actual_end}"))
+        header.append(c(f"{els['block_open']} {tag} : {actual_start}-{actual_end}"))
 
         if numbered and page_lines:
             # The gutter already numbers every line - anchors would be pure
@@ -253,12 +258,12 @@ def view_file_tool_new(path: str, line: int = 1, count: int = 2000, numbered: bo
         else:
             body = page_lines
 
-        footer = [c(f"{block_symbol}END {tag} : {actual_end}")]
+        footer = [c(f"{els['block_close']} {tag} : {actual_end}")]
 
         out = "\n".join(header + body + footer)
         _note_read(out, session_id, task_id, resolved_str,
                    actual_start, actual_end, len(page_lines), op,
-                   total=total_lines)
+                   total=total_lines, body=page_lines)
         return out
 
     except Exception as e:
@@ -267,8 +272,11 @@ def view_file_tool_new(path: str, line: int = 1, count: int = 2000, numbered: bo
 
 def _note_read(out: str, session_id: str, task_id: str, resolved_str: str,
                start: int, end: int, lines: int, op: str = "",
-               total: int = 0) -> None:
+               total: int = 0, body=None) -> None:
     """Record the read, and under no circumstances affect the return value.
+
+    `body` — the page lines handed over; inside execute_code the ledger compares
+    them with the script's answer (`deferred/17`), and never stores them.
 
     `_ledger.note_read` already swallows its own errors; this second guard is
     for the import/attribute layer, so a ledger module that failed to load or
@@ -284,6 +292,7 @@ def _note_read(out: str, session_id: str, task_id: str, resolved_str: str,
         _ledger.note_read(
             text=out, path=resolved_str, session=session_id, task_id=task_id,
             from_line=start, to_line=end, lines=lines, op=op, total=total,
+            body=body,
         )
     except Exception:
         pass

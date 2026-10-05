@@ -26,6 +26,12 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))            # tests/
 PROJECT_ROOT = os.path.dirname(TESTS_DIR)                          # hermes-filetools (project == plugin root)
 PLUGIN_DIR = PROJECT_ROOT                                          # the plugin itself
 
+# Throwaway files: `_home.scratch_dir` (RAM disk, else plugin scratch). Never AppData Temp.
+# Must run before mkdtemp / pytest tmp_path.
+sys.path.insert(0, PROJECT_ROOT)
+from _home import use_scratch_as_temp  # noqa: E402
+use_scratch_as_temp()
+
 # --- hermetic home (must precede any core import) ---
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="filetools-test-home-")
 
@@ -90,7 +96,9 @@ def their_loader(rows) -> list:
 # accumulates across tests sharing this process's temp home.
 import re as _re
 
-OP_LINE_RE = _re.compile(r"^Operation ID: [0-9a-f]{4,}(?:x[0-9a-f]{2,4})?$")
+# The address is metadata, so it may wear a comment (`◆`, `#`, `<!-- … -->`): the wrapper is
+# allowed and `split_op_line` hands back the bare `Operation ID: <hex>` for comparisons.
+OP_LINE_RE = _re.compile(r"^[^\w\s]{0,4}\s?(Operation ID: [0-9a-f]{4,}(?:x[0-9a-f]{2,4})?)(?:\s?(?:-->|\*/))?$")
 
 
 def split_op_line(text: str) -> tuple:
@@ -101,5 +109,6 @@ def split_op_line(text: str) -> tuple:
     the header" is not the contract.
     """
     first, _, rest = (text or "").partition("\n")
-    assert OP_LINE_RE.match(first.strip()), f"no Operation ID on the first line: {first!r}"
-    return first.strip(), rest
+    found = OP_LINE_RE.match(first.strip())
+    assert found, f"no Operation ID on the first line: {first!r}"
+    return found.group(1), rest

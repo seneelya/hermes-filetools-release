@@ -32,11 +32,48 @@ import os
 import re
 import tempfile
 
+
+def _sibling_vocab():
+    """`_vocab.py` next to this file: package, bare (console), or by path (this module is
+    itself loaded by path from the dashboard, where neither import works)."""
+    try:
+        from . import _vocab
+        return _vocab
+    except ImportError:
+        pass
+    try:
+        import _vocab  # type: ignore
+        return _vocab
+    except ImportError:
+        pass
+    import importlib.util
+    import sys
+    from pathlib import Path as _P
+    name = "hermes_filetools_vocab"
+    mod = sys.modules.get(name)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(name, _P(__file__).with_name("_vocab.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
+_vocab = _sibling_vocab()
+
 # The default header/body divider. Callers pass the resolved `symbols` dict
 # (plugin.yaml's `formatting:` section, overridable by a profile), so this is
 # only the code-level safety net — same arrangement as _new_format's
 # DEFAULT_SYMBOLS, kept as a literal here so this module stays dependency-free.
 _DEFAULT_SEPARATOR = "○"
+
+# The symbol that opens every METADATA line of an answer that has no file (so no native
+# comment syntax): address, fields, divider. Same arrangement as the separator: `symbols`
+# carries `comment_fallback`, this literal is `_new_format.SYNTHETIC_COMMENT_START` kept here
+# so the module stays dependency-free. The body below the divider and an `error` line are
+# NOT metadata and never get it.
+_DEFAULT_COMMENT = "◆"
+_NOT_METADATA_KEYS = ("error",)
 
 
 # Head/tail split when truncating, copied from hermes-agent's own
@@ -44,6 +81,14 @@ _DEFAULT_SEPARATOR = "○"
 # appear EARLY and the relevant result LATE, so the middle is what to drop. Same
 # split as their execute_code stdout cap (_truncate_stdout_text).
 _HEAD_FRACTION = 0.4
+
+
+def _scratch_dir() -> str:
+    ram = os.path.join("c:\\RAM_Cache", "Temp")
+    path = os.path.join(ram, "hermes-filetools", "spill") if os.path.isdir(ram) else os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scratch", "spill")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def truncate_for_model(text: str, max_chars: int, *, spill_dir: str = None,
@@ -76,7 +121,7 @@ def truncate_for_model(text: str, max_chars: int, *, spill_dir: str = None,
     path = None
     try:
         fd, path = tempfile.mkstemp(prefix=spill_prefix, suffix=".txt",
-                                     dir=spill_dir or None)
+                                     dir=spill_dir or str(_scratch_dir()))
         with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as fh:
             fh.write(text)
     except OSError:
@@ -171,7 +216,7 @@ def _render_body(value, labels: dict) -> str:
 # RECOGNISERS have to move together, or an echoed header stops being stripped
 # and the panel stops finding the address: `markers._marker_line_pattern`,
 # `dashboard/plugin_api.py::_OP_IN_HEADER`, `desktop/src/core.js::OP_RE`.
-OP_LABEL = "Operation ID"
+OP_LABEL = _vocab.COMMON["op"]
 
 
 def op_line(op: str) -> str:
@@ -209,7 +254,7 @@ def op_line(op: str) -> str:
 
 NL_JOIN = chr(10)
 
-STATE_LABEL = "State"
+STATE_LABEL = _vocab.COMMON["state"]
 
 # Header fields that die WITH the body, because their only use is to point into
 # it or to act on it. Dropped when an operation is removed (owner, 2026-09-09:
@@ -347,8 +392,8 @@ def as_removed(text: str, *, symbols: dict = None, op: str = "", tool: str = "")
         # ЧУЖОЙ ответ (владелец, 2026-09-29): от него не остаётся ничего, поэтому след —
         # имя тула и сколько было. Без него модель видит «что-то убрано» и не знает что.
         if tool:
-            stamped.append(f"Tool: {tool}")
-        stamped.append(f"Size: {len(text)} chars")
+            stamped.append(f"{_vocab.COMMON['tool']}: {tool}")
+        stamped.append(f"{_vocab.COMMON['size']}: {len(text)} chars")
         stamped.append(f"{STATE_LABEL}: {STATE_REMOVED}")
         return NL_JOIN.join(stamped)
 
@@ -404,6 +449,7 @@ def render_json_result(raw: str, *, labels: dict = None, body_keys=("output",),
     labels = labels or {}
     value_formatters = value_formatters or {}
     sep = (symbols or {}).get("separator_symbol", _DEFAULT_SEPARATOR) * 3
+    mark = (symbols or {}).get("comment_fallback") or _DEFAULT_COMMENT
 
     try:
         data = json.loads(raw)
@@ -421,28 +467,32 @@ def render_json_result(raw: str, *, labels: dict = None, body_keys=("output",),
     lines = []
     first = op_line(op)
     if first:
-        lines.append(first)
+        lines.append(mark + first)
+
+    def field(key, value):
+        render = value_formatters.get(key, _scalar)
+        text = f"{_label_for(key, labels)}: {render(value)}"
+        return text if key in _NOT_METADATA_KEYS else mark + text
+
     for key in head_keys:
         if key not in data:
             continue
         value = data.pop(key)
         if _skip(value):
             continue
-        render = value_formatters.get(key, _scalar)
-        lines.append(f"{_label_for(key, labels)}: {render(value)}")
+        lines.append(field(key, value))
 
     for key, value in data.items():
         if _skip(value):
             continue
-        render = value_formatters.get(key, _scalar)
-        lines.append(f"{_label_for(key, labels)}: {render(value)}")
+        lines.append(field(key, value))
 
     header = "\n".join(lines)
     body = _render_body(body_value, labels)
     if body_max_chars:
         body = truncate_for_model(body, body_max_chars, spill_dir=spill_dir)
     if header and body:
-        return f"{header}\n{sep}\n{body}"
+        return f"{header}\n{mark}{sep}\n{body}"
     # No separator with nothing under it: ○○○ promises a body, and a tool that
     # produced no output has none.
     return header or body
@@ -465,7 +515,7 @@ _ERROR_PREFIX = "ERROR:"
 # terminal_core's `(raw: ...)` tail, which exists precisely so an exit code can
 # be machine-read out of our text - agent/context_compressor.py already does
 # the same thing).
-_EXIT_CODE_LINE = re.compile(r"^Exit code:\s*(-?\d+)")
+_EXIT_CODE_LINE = re.compile(r"^\W*Exit code:\s*(-?\d+)")
 
 
 def _facade_exit_code(text: str, header: str) -> int:

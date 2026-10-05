@@ -47,9 +47,11 @@ TWO FACTS ESTABLISHED IN THEIR SOURCE, both of which shaped this file:
 try:
     from ._tool_text import render_json_result
     from . import _ledger
+    from . import _vocab
 except ImportError:  # console/dev mode - file_ops/ is on sys.path, not a package
     from _tool_text import render_json_result  # type: ignore
     import _ledger  # type: ignore
+    import _vocab  # type: ignore
 
 # Friendly labels for the keys their result dicts carry (collected from the
 # `json.dumps(...)` return sites in tools/code_execution_tool.py: the local
@@ -58,18 +60,9 @@ except ImportError:  # console/dev mode - file_ops/ is on sys.path, not a packag
 # _assemble_stdout_result ~107). Any key NOT here is still rendered, with its
 # label title-cased from its own snake_case name - a future upstream field must
 # never silently disappear.
-_LABELS = {
-    "status": "Status",
-    "exit_code": "Exit code",
-    "error": "Error",
-    "tool_calls_made": "Tool calls",
-    "duration_seconds": "Duration, s",
-    "stdout_truncated": "Stdout truncated",
-    "stdout_bytes_captured": "Stdout bytes captured",
-    "stdout_bytes_total": "Stdout bytes total",
-    "stdout_bytes_omitted": "Stdout bytes omitted",
-    "warning": "Warning",
-}
+# The table lives in `_vocab.py` since 2026-10-05 (`deferred/08`): the panel reads the same
+# words over `/config`, and a word printed here but unknown there stops being coloured.
+_LABELS = _vocab.LABELS["execute_code"]
 
 # What the model needs first when a script fails: did it run, what came back,
 # what went wrong. Everything else keeps upstream's own order.
@@ -141,12 +134,21 @@ def execute_code_tool_new(args: dict, symbols: dict = None, **kwargs) -> str:
     # try/finally rather than a context manager because the reset MUST happen
     # even if their handler raises: a leaked flag would mislabel every later
     # operation in this context as nested.
+    #
+    # The nested entries were held while the script ran (`deferred/17`): only now,
+    # with the answer the model receives in hand, can a nested read say which of
+    # its lines reached the model (`seen`). Flushed even if anything below raises —
+    # with an empty answer, i.e. nothing proven seen.
+    pending, out = [], ""
     token = _ledger.enter_sandbox()
     try:
-        raw = _execute_code_handler(args, **kwargs)
+        try:
+            raw = _execute_code_handler(args, **kwargs)
+        finally:
+            pending = _ledger.exit_sandbox(token)
+        out = render_execute_code_result(raw, symbols=symbols, op=op)
     finally:
-        _ledger.exit_sandbox(token)
-    out = render_execute_code_result(raw, symbols=symbols, op=op)
+        _ledger.flush_sandbox(pending, out)
     # Read out of `args` rather than taken as a named parameter, because this
     # file deliberately does NOT validate their argument shape: their own
     # misdirected-argument recovery accepts `command` where `code` was meant

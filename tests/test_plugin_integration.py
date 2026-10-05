@@ -599,7 +599,7 @@ def test_e2f_search_pagination_hint_keeps_the_other_flags(loaded_plugin):
         "search_files",
         {"path": str(FIXTURES), "pattern": "e", "flags": "--glob *.py --limit 1"},
     )
-    hint = [ln for ln in text.split("\n") if ln.startswith("Hint:")]
+    hint = [ln for ln in text.split("\n") if ln.lstrip("◆").startswith("Hint:")]
     assert hint, f"expected a truncation hint: {text[:400]}"
     assert "--glob *.py" in hint[0] and "--offset" in hint[0], \
         f"the hint dropped the caller's own flags: {hint[0]}"

@@ -28,7 +28,7 @@ properties:
       lines PASTED FROM A read_file RESPONSE are dropped before writing, so
       there is no need to strip them by hand — that means lines exactly as
       that response showed them, carrying the comment prefix of this file's
-      type (e.g. "#File:", "#FileTag:", "#■BLOCK", "#■END", "#⚓ Line: N" in a
+      type (e.g. "#{read_file.file}:", "#{read_file.file_tag}:", "#{block_open}", "#{block_close}", "#{anchor_symbol} {anchor_word}: N" in a
       .py file). A line with the same words but WITHOUT that prefix is not
       recognised as tool-written and is written into the file as ordinary
       content — deliberately, since a file may legitimately contain such a

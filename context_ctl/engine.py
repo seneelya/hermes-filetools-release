@@ -307,6 +307,7 @@ class ContextCtlEngine(ContextEngine):
         """Выгрузка всей сессии снимком перед автокомпакцией (задача D): сессия не теряется."""
         try:
             from . import _apply, _compact, _export, _settings
+            from ..file_ops._ledger import is_event, read_ledger
             agent = self.live_agent()
             rows, why = _apply.db_history(agent)
             if why:
@@ -314,8 +315,11 @@ class ContextCtlEngine(ContextEngine):
             by_msg = _compact._index(self._session_id, rows)
             addr_of = {id(r): a for a, r in by_msg.items()}
             addresses = [addr_of.get(id(r), "") for r in rows]
+            # Спутник `ledger.jsonl` — записи операций (Plan27-Task01).
+            operations = [e for e in (read_ledger(self._session_id) or []) if not is_event(e)]
             report = _export.export(self._session_id, rows, addresses, [a for a in addresses if a],
-                                    root=_settings.export_root(), snapshot=True)
+                                    root=_settings.export_root(), snapshot=True,
+                                    operations=operations)
             if report.get("errors"):
                 return f"с ошибками ({len(report['errors'])}) — {report.get('dir') or ''}"
             return f"{len(report.get('written') or [])} файлов → {report.get('dir') or '?'}"
@@ -472,13 +476,14 @@ class ContextCtlEngine(ContextEngine):
         from . import _command
         return _command.run_edit(self._session_id, self, str(addr or ""), content)
 
-    def apply_import(self, folder: str) -> dict:
+    def apply_import(self, folder: str, mode: str = "replace") -> dict:
         """Заменить живую ленту этой сессии строками из папки выгрузки (импорт, 2026-09-29).
 
         Метод на движке по той же причине, что `apply_addresses`: дашборд грузится по пути.
         """
         from . import _command
-        return _command.run_import(self._session_id, self, str(folder or ""))
+        return _command.run_import(self._session_id, self, str(folder or ""),
+                                   str(mode or "replace"))
 
     def start_compact(self, addrs) -> dict:
         """Запустить компакцию В ФОНЕ для НАЗВАННЫХ m-адресов этой сессии (Plan16-Task03).

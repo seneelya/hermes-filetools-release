@@ -68,18 +68,17 @@ import os
 try:
     from ._tool_text import render_json_result
     from . import _ledger
+    from . import _vocab
     from .file_backend import FileBackend
 except ImportError:  # console/dev mode - file_ops/ is on sys.path, not a package
     from _tool_text import render_json_result  # type: ignore
     import _ledger  # type: ignore
+    import _vocab  # type: ignore
     from file_backend import FileBackend  # type: ignore
 
-_LABELS = {
-    "success": "Success",
-    "error": "Error",
-    "scale_note": "Scale note",
-    "analysis": "Analysis",  # only ever a label if it is NOT the body
-}
+# The table lives in `_vocab.py` since 2026-10-05 (`deferred/08`): the panel reads the same
+# words over `/config`, and a word printed here but unknown there stops being coloured.
+_LABELS = _vocab.LABELS["vision_analyze"]
 
 _HEAD_KEYS = ("success", "error")
 

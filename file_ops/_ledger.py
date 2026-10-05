@@ -290,22 +290,82 @@ _in_sandbox: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 
+# Nested entries are HELD while the script runs and written at its end (`deferred/17`).
+#
+# Whether a nested read reached the model is known only once the script's answer exists:
+# the read gave its text to the script, and only the answer goes to the model. So every
+# nested entry waits here with the lines it returned, and `flush_sandbox` writes them all
+# — with `seen` on the reads — right before the execute_code entry itself. ALL nested
+# entries wait, writes included: the panel folds line numbers in ledger order, and a write
+# landing in the file ahead of a read that happened before it would move the read.
+#
+# A list object, not a fresh var per entry: a copied context still shares it by reference.
+# The price — a gateway killed mid-script loses that script's nested entries.
+_sandbox_pending: contextvars.ContextVar = contextvars.ContextVar(
+    "filetools_sandbox_pending", default=None
+)
+
+
 def enter_sandbox():
     """Mark the current context as "inside execute_code"; returns the reset token.
 
     Caller MUST pass the token to :func:`exit_sandbox` in a `finally`, or the
     flag leaks into whatever runs next in this context.
     """
+    _sandbox_pending.set([])
     return _in_sandbox.set(True)
 
 
-def exit_sandbox(token) -> None:
-    """Undo :func:`enter_sandbox`. Never raises — observability must not be able
-    to turn a working tool call into an error."""
+def exit_sandbox(token) -> list:
+    """Undo :func:`enter_sandbox`; returns the held nested entries for
+    :func:`flush_sandbox`. Never raises — observability must not be able to turn
+    a working tool call into an error."""
+    pending = []
+    try:
+        pending = _sandbox_pending.get() or []
+        _sandbox_pending.set(None)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         _in_sandbox.reset(token)
     except Exception:  # noqa: BLE001 - a stale token is not worth an exception
         pass
+    return pending
+
+
+def flush_sandbox(pending, out: str) -> None:
+    """Write the held nested entries; each nested `read_file` gets `seen` — the line
+    ranges found in `out`, the answer the model received (`_seen.py`). Never raises."""
+    for held in pending or []:
+        try:
+            entry, start, lines = held
+            if lines is not None:
+                seen = _seen_module().seen_ranges(start, lines, out)
+                # Absent when nothing was proven seen, like every optional key here;
+                # a reader treats a missing `seen` as "the model saw none of it".
+                if seen:
+                    entry["seen"] = seen
+            _write_entry(entry)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("filetools ledger: skipped a held nested entry: %s", e)
+
+
+def _seen_module():
+    """`_seen.py` next to this file: package import, or by path like `_home_module`."""
+    try:
+        from . import _seen
+        return _seen
+    except ImportError:
+        import importlib.util
+        import sys
+        mod = sys.modules.get("hermes_filetools_seen")
+        if mod is None:
+            path = Path(__file__).resolve().parent / "_seen.py"
+            spec = importlib.util.spec_from_file_location("hermes_filetools_seen", path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["hermes_filetools_seen"] = mod
+            spec.loader.exec_module(mod)
+        return mod
 
 
 def _observability_context() -> tuple[str, str, str]:
@@ -700,6 +760,18 @@ def _append(entry: dict, session: str | None) -> bool:
         return False
 
 
+def note_imported(session: str | None, entry: dict) -> bool:
+    """Записать ОПЕРАЦИЮ, привезённую импортом (`Plan27-Task02`), в журнал целевой сессии.
+
+    Запись уже собрана `context_ctl/_relink.py` (новый `op`, `tool_call_id` импорта,
+    `session_src: "import"`, `imported_from`, при ручной правке `edited`) — здесь только
+    дописывание тем же хвостом, что у всех писателей. Род — «операция»: ключа `event` нет.
+    """
+    if not isinstance(entry, dict) or entry.get("event"):
+        return False
+    return _append(entry, session)
+
+
 def note_message(
     *,
     session: str | None,
@@ -816,9 +888,13 @@ def note_op(
     command: str = "",
     counts: dict | None = None,
     op: str = "",
+    body=None,
 ) -> None:
     """Append one entry for a successful operation. Never raises, never returns
     anything the caller could be tempted to put in the model's answer.
+
+    `body` — the file lines a read returned, from `from_line` on. Never stored: inside
+    execute_code it is what `flush_sandbox` compares against the script's answer.
 
     Writes matter here even more than reads. In-place compaction does not
     shorten a `write_file` result, it REPLACES it with a one-liner of its own
@@ -912,15 +988,28 @@ def note_op(
             if small:
                 entry["counts"] = small
 
-        target = ledger_path(entry["session"])
-        target.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(entry, ensure_ascii=False)
-        # newline="" keeps Windows from turning our "\n" into "\r\n": the file
-        # must read back byte-identical wherever it was written.
-        with io.open(target, "a", encoding="utf-8", newline="") as fh:
-            fh.write(line + "\n")
+        # Inside execute_code: held until the script's answer exists (`flush_sandbox`).
+        pending = _sandbox_pending.get() if entry.get("nested") else None
+        if pending is not None:
+            lines_back = None
+            if (tool or "read_file") == "read_file" and body is not None:
+                lines_back = list(body)
+            pending.append((entry, int(from_line or 0), lines_back))
+            return
+        _write_entry(entry)
     except Exception as e:
         logger.debug("filetools ledger: skipped an entry for %r: %s", path, e)
+
+
+def _write_entry(entry: dict) -> None:
+    """Append an operation entry to its session's journal. Raises — callers guard."""
+    target = ledger_path(entry["session"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(entry, ensure_ascii=False)
+    # newline="" keeps Windows from turning our "\n" into "\r\n": the file
+    # must read back byte-identical wherever it was written.
+    with io.open(target, "a", encoding="utf-8", newline="") as fh:
+        fh.write(line + "\n")
 
 
 def read_ledger(session: str | None) -> list:

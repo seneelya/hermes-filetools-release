@@ -85,3 +85,15 @@ def test_h6_no_hardcoded_paths():
         if 'r"Y:' in code or "r'Y:" in code or '"Y:\\\\' in code:
             bad.append(path.name)
     assert bad == [], f"зашитый путь Y: в {bad}"
+
+
+def test_h7_scratch_never_uses_appdata_temp(fake_home, monkeypatch):
+    """Throwaway files: RAM disk if present, else plugin scratch. Not AppData Temp."""
+    monkeypatch.setattr(_home, "_RAM_TEMP", Path("z:/no-such-ram-cache"))
+    got = _home.scratch_dir("probe")
+    assert got == fake_home / "filetools" / "scratch" / "probe"
+    assert "AppData" not in str(got)
+    ram = Path(r"c:\RAM_Cache\Temp")
+    if ram.is_dir():
+        monkeypatch.setattr(_home, "_RAM_TEMP", ram)
+        assert _home.scratch_dir("probe") == ram / "hermes-filetools" / "probe"

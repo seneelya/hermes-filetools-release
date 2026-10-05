@@ -37,13 +37,13 @@ def test_success_renders_status_output_and_separator():
         "tool_calls_made": 3, "duration_seconds": 1.25,
     })
     result = render(raw)
-    head, sep, body = result.partition("\n○○○\n")
+    head, sep, body = result.partition("\n◆○○○\n")
     assert sep
     assert head.splitlines() == [
-        "Status: success",
-        "Exit code: 0",
-        "Tool calls: 3",
-        "Duration, s: 1.25",
+        "◆Status: success",
+        "◆Exit code: 0",
+        "◆Tool calls: 3",
+        "◆Duration, s: 1.25",
     ]
     assert body == "42\n"
 
@@ -64,8 +64,8 @@ def test_error_path_leads_with_status_and_error():
     })
     result = render(raw)
     lines = result.splitlines()
-    assert lines[0] == "Status: error"
-    assert lines[1] == "Exit code: 1"
+    assert lines[0] == "◆Status: error"
+    assert lines[1] == "◆Exit code: 1"
     assert lines[2] == "Error: Script exited with code 1"
 
 
@@ -131,13 +131,13 @@ def test_body_cap_truncates_and_says_so(tmp_path):
     assert "chars omitted out of 5000 total" in result
     # The HEADER is never cut - an exit code the model cannot see is worse than
     # output it knows was cut.
-    assert result.startswith("Status: success\nExit code: 0\n○○○\n")
+    assert result.startswith("◆Status: success\n◆Exit code: 0\n◆○○○\n")
 
 
 def test_body_cap_leaves_a_fitting_body_alone():
     raw = json.dumps({"status": "success", "output": "short", "exit_code": 0})
     result = execute_code_core.render_execute_code_result(raw, max_body_chars=1000)
-    assert result.endswith("○○○\nshort")
+    assert result.endswith("◆○○○\nshort")
     assert "TRUNCATED" not in result
 
 
@@ -294,6 +294,28 @@ def test_nested_ops_are_flagged_while_the_script_runs(home, monkeypatch):
     assert "nested" not in by_path["/before.py"]
     assert by_path["/inside.py"]["nested"] is True
     assert "nested" not in by_path["/after.py"], "the window must close"
+
+
+@pytest.mark.parametrize("printed, seen", [
+    ("12", None),                                   # counted dots: nothing reached the model
+    ("\n".join(f"text {k}" for k in range(1, 16)), [[1, 15]]),
+])
+def test_nested_read_records_what_reached_the_model(home, monkeypatch, printed, seen):
+    """`deferred/17`: `seen` comes from the answer the model receives, written at the
+    end of execute_code, before the execute_code entry itself."""
+    body = [f"text {k}" for k in range(1, 21)]
+
+    def _fake_handler(args, **kwargs):
+        _ledger.note_read(text="inner", path="/f.txt", session="s", from_line=1,
+                          to_line=20, lines=20, total=20, body=body)
+        return json.dumps({"status": "success", "output": printed, "exit_code": 0})
+
+    _install_fake_handler(monkeypatch, _fake_handler)
+    execute_code_core.execute_code_tool_new({"code": "x"}, session_id="s")
+
+    nested, outer = _ledger.read_ledger("s")
+    assert nested["path"] == "/f.txt" and outer["tool"] == "execute_code"
+    assert nested.get("seen") == seen
 
 
 def test_sandbox_window_closes_even_if_their_handler_raises(home, monkeypatch):

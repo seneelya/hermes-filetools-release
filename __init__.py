@@ -76,6 +76,7 @@ try:  # plugin mode
                            process_core, vision_analyze_core)
     from .file_ops.mocks import tool_error
     from .file_ops._schema_loader import load_schema
+    from .file_ops import _vocab
     from .file_ops._new_format import DEFAULT_SYMBOLS
     from .file_ops.flags import has_flag
     from .file_ops._execute_code_bridge import patch_execute_code_bridge
@@ -91,6 +92,7 @@ except ImportError:  # console/dev mode: put file_ops/ on sys.path
     import process_core, vision_analyze_core  # type: ignore
     import mocks  # type: ignore
     from _schema_loader import load_schema  # type: ignore
+    import _vocab  # type: ignore
     from _new_format import DEFAULT_SYMBOLS  # type: ignore
     from flags import has_flag  # type: ignore
     from _execute_code_bridge import patch_execute_code_bridge  # type: ignore
@@ -345,7 +347,7 @@ def _make_handle_view_file_new(mtime_enabled: bool, symbols: dict, anchors_enabl
     return _handler
 
 
-def _make_handle_create_file_new(mtime_enabled: bool, ui_json: str = "off"):
+def _make_handle_create_file_new(mtime_enabled: bool, ui_json: str = "off", symbols: dict = None):
     def _handler(args, **kw) -> str:
         if has_flag(args.get("flags"), "help"):
             return _WRITE_FILE_FLAGS_HELP
@@ -368,6 +370,7 @@ def _make_handle_create_file_new(mtime_enabled: bool, ui_json: str = "off"):
             mtime_enabled=mtime_enabled,
             flags=args.get("flags"),
             ui_json=ui_json,
+            symbols=symbols,
         )
     return _handler
 
@@ -921,7 +924,7 @@ def _register_process(ctx, symbols: dict, cfg: dict) -> None:
         return
 
     try:
-        schema = load_schema("process.yaml")
+        schema = load_schema("process.yaml", _vocab.placeholders(symbols))
         # THEIR name, resolved at registration, not the one our YAML happens to
         # carry: this is the only slot upstream has renamed so far
         # (process -> process_manage), and shadowing the wrong name is silent
@@ -978,7 +981,7 @@ def _register_vision_analyze(ctx, symbols: dict, cfg: dict) -> None:
         return
 
     try:
-        schema = load_schema("vision_analyze.yaml")
+        schema = load_schema("vision_analyze.yaml", _vocab.placeholders(symbols))
         ctx.register_tool(
             name=schema["name"],
             toolset="vision",
@@ -1114,17 +1117,9 @@ def _suppress_disabled_tools(ctx) -> None:
 # doesn't explicitly set `schema:` (see plugin.yaml's config_schema docs for
 # the explicit-override escape hatch). `patch` has only one implementation
 # (old) so it just has that one entry.
-_SCHEMA_BY_PATH = {
-    "read_file": {"old": "view_file.yaml", "new": "view_file_new.yaml"},
-    "write_file": {"old": "create_file.yaml", "new": "create_file_new.yaml"},
-    "patch": {"old": "modify_file.yaml", "new": "modify_file_new.yaml"},
-    "search_files": {"old": "sift_files.yaml", "new": "sift_files_new.yaml"},
-    # terminal has only one implementation (calls hermes-agent's live tool and
-    # reformats its result), so it has only the "new" key: `path: old` for this
-    # slot means "don't register at all, leave upstream's own terminal", and
-    # the loop returns before it ever needs a schema name.
-    "terminal": {"new": "terminal.yaml"},
-}
+# The table itself lives in `file_ops/_vocab.py` (`deferred/08`): the panel reads tool
+# parameters from the same files, and two copies of this map would drift.
+_SCHEMA_BY_PATH = _vocab.SCHEMA_BY_PATH
 
 # "old"-path handlers only - "new"-path handlers are built per-call by the
 # factories above, since they close over per-slot config (mtime/symbols).
@@ -1233,7 +1228,7 @@ def register(ctx) -> None:
                 params.get("anchor_gap"))
         elif path == "new" and slot == "write_file":
             handler = _make_handle_create_file_new(mtime_enabled,
-                                                    params.get("ui_json", "off"))
+                                                    params.get("ui_json", "off"), symbols)
         elif path == "new" and slot == "search_files":
             handler = _make_handle_sift_files_new(symbols)
         elif path == "new" and slot == "patch":
@@ -1255,7 +1250,8 @@ def register(ctx) -> None:
             # registering nothing if a slot ever loses one again.
             handler = _SLOT_HANDLERS_OLD[slot]
 
-        schema = load_schema(schema_name)
+        # Placeholders in the description (`{block_open}`, Plan28) get the symbols this run uses.
+        schema = load_schema(schema_name, _vocab.placeholders(symbols))
         # Only path:new slots get the dict facade, and the condition is the
         # same one that puts a slot in new_path_schemas below - a slot whose
         # stub we did NOT patch can never receive the marker, so wrapping it

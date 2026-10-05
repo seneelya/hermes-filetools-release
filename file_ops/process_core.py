@@ -46,43 +46,18 @@ anything inside a live Hermes process with a real process registry.
 try:
     from ._tool_text import render_json_result
     from . import _ledger
+    from . import _vocab
 except ImportError:  # console/dev mode - file_ops/ is on sys.path, not a package
     from _tool_text import render_json_result  # type: ignore
     import _ledger  # type: ignore
+    import _vocab  # type: ignore
 
 # Friendly labels across all 8 actions. Any key NOT here is still rendered,
 # title-cased from its own snake_case name - a future upstream field must never
 # silently disappear.
-_LABELS = {
-    "status": "Status",
-    "error": "Error",
-    "session_id": "Session id",
-    # Unlike terminal, `command` EARNS its header line here: the model sent a
-    # session_id, not a command, so this is information it does not already
-    # have - and acting on the wrong background process is a real mistake.
-    "command": "Command",
-    "cwd": "Cwd",
-    "pid": "Pid",
-    "exit_code": "Exit code",
-    "uptime_seconds": "Uptime, s",
-    "started_at": "Started at",
-    "completion_reason": "Completion reason",
-    "termination_source": "Termination source",
-    "total_lines": "Total lines",
-    "showing": "Showing",
-    "timeout_note": "Note",
-    "note": "Note",
-    "process_running": "Process running",
-    "bytes_written": "Bytes written",
-    "message": "Message",
-    "detached": "Detached",
-    "closed": "Closed",
-    "watch_patterns": "Watching",
-    "watch_hit": "Watch hit",
-    "notify_on_complete": "Notify on complete",
-    "session_scoped": "Session scoped",
-    "output_preview": "Output preview",  # only as a LIST-row label; see above
-}
+# The table lives in `_vocab.py` since 2026-10-05 (`deferred/08`): the panel reads the same
+# words over `/config`, and a word printed here but unknown there stops being coloured.
+_LABELS = _vocab.LABELS["process"]
 
 # What identifies the process and what happened to it, before the details.
 _HEAD_KEYS = ("status", "error", "session_id", "command", "exit_code")

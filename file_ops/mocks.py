@@ -683,28 +683,30 @@ def truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, boo
     return trimmed, len(result_lines), first_line_exceeded
 
 
-# ── Document extraction mock (stub for structured docs) ────────────
+# ── Document extraction (structured docs) ──────────────────────────
 
-EXTRACTABLE_EXTENSIONS = {'.pdf', '.docx', '.xlsx', '.pptx', '.ipynb'}
-
-def is_extractable_document(path: str) -> bool:
-    """Check if file can be extracted to text."""
-    ext = Path(path).suffix.lower()
-    return ext in EXTRACTABLE_EXTENSIONS
-
-
-def extract_document_bytes(data: bytes, path: str) -> str | None:
-    """Extract text from document bytes - delegates to _doc_extract (kept
-    separate so python-docx/openpyxl/python-pptx are only imported when a
-    matching extension is actually read, not on every mocks.py import).
-
-    Handles .ipynb/.docx/.xlsx/.pptx; .pdf isn't wired up yet (returns None -
-    the caller turns that into a clean "not supported" instead of a crash)."""
+def _doc_extract_module():
     try:  # plugin mode
         from . import _doc_extract
     except ImportError:  # console mode
         import _doc_extract  # type: ignore
-    return _doc_extract.extract(data, path)
+    return _doc_extract
+
+
+def is_extractable_document(path: str) -> bool:
+    """Check if file can be extracted to text (the set lives in _doc_extract)."""
+    ext = Path(path).suffix.lower()
+    return ext in _doc_extract_module().EXTRACTABLE_EXTENSIONS
+
+
+def extract_document_bytes(data: bytes, path: str) -> str | None:
+    """Extract text from document bytes - delegates to _doc_extract (kept
+    separate so openpyxl/anydoc are only imported when a
+    matching extension is actually read, not on every mocks.py import).
+
+    Raises _doc_extract.ExtractionError with a model-facing message when a
+    document cannot be converted; the callers turn it into an ERROR line."""
+    return _doc_extract_module().extract(data, path)
 
 
 # ── Shared instance ────────────────────────────────────────────────

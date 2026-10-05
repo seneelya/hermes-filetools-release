@@ -34,15 +34,15 @@ def test_poll_body_is_output_preview():
         "session_id": "proc_ab12", "command": "npm run dev", "status": "running",
         "pid": 4567, "uptime_seconds": 12, "output_preview": "listening on 3000\n",
     })
-    head, sep, body = render(raw).partition("\n○○○\n")
+    head, sep, body = render(raw).partition("\n◆○○○\n")
     assert sep
     assert body == "listening on 3000\n"
     assert head.splitlines() == [
-        "Status: running",
-        "Session id: proc_ab12",
-        "Command: npm run dev",
-        "Pid: 4567",
-        "Uptime, s: 12",
+        "◆Status: running",
+        "◆Session id: proc_ab12",
+        "◆Command: npm run dev",
+        "◆Pid: 4567",
+        "◆Uptime, s: 12",
     ]
 
 
@@ -51,7 +51,7 @@ def test_log_body_is_output_with_pagination_scalars():
         "session_id": "proc_ab12", "command": "pytest", "status": "exited",
         "output": "line1\nline2", "total_lines": 900, "showing": "2 lines",
     })
-    head, _, body = render(raw).partition("\n○○○\n")
+    head, _, body = render(raw).partition("\n◆○○○\n")
     assert body == "line1\nline2"
     assert "Total lines: 900" in head
     assert "Showing: 2 lines" in head
@@ -65,10 +65,10 @@ def test_wait_exited_leads_with_status_and_exit_code():
     })
     result = render(raw)
     assert result.splitlines()[:3] == [
-        "Status: exited", "Command: make", "Exit code: 0",
+        "◆Status: exited", "◆Command: make", "◆Exit code: 0",
     ]
     assert "Termination source" not in result  # None is dropped
-    assert result.endswith("○○○\ndone\n")
+    assert result.endswith("◆○○○\ndone\n")
 
 
 def test_wait_timeout_note_reaches_the_model_intact():
@@ -90,7 +90,7 @@ def test_kill_body_is_output():
         "completion_reason": "killed", "termination_source": "process.kill",
         "output": "tail of the log\n",
     })
-    head, _, body = render(raw).partition("\n○○○\n")
+    head, _, body = render(raw).partition("\n◆○○○\n")
     assert body == "tail of the log\n"
     assert "Completion reason: killed" in head
     assert "Termination source: process.kill" in head
@@ -100,17 +100,17 @@ def test_write_has_no_body_and_no_dangling_separator():
     raw = json.dumps({"status": "ok", "bytes_written": 12})
     result = render(raw)
     assert "○○○" not in result
-    assert result == "Status: ok\nBytes written: 12"
+    assert result == "◆Status: ok\n◆Bytes written: 12"
 
 
 def test_close_message_renders():
     assert render(json.dumps({"status": "ok", "message": "stdin closed"})) == \
-        "Status: ok\nMessage: stdin closed"
+        "◆Status: ok\n◆Message: stdin closed"
 
 
 def test_not_found_error_leads_the_header():
     raw = json.dumps({"status": "not_found", "error": "No process with ID x"})
-    assert render(raw) == "Status: not_found\nError: No process with ID x"
+    assert render(raw) == "◆Status: not_found\nError: No process with ID x"
 
 
 def test_tool_error_shape_renders_as_an_error_line():
@@ -200,7 +200,7 @@ def test_process_tool_new_forwards_args_dict_and_renders(monkeypatch):
                                  "data": "yes"}
     assert captured["kwargs"] == {"task_id": "t1"}
     _op, rest = split_op_line(result)   # the address leads the answer (Plan09)
-    assert rest == "Status: ok\nBytes written: 3"
+    assert rest == "◆Status: ok\n◆Bytes written: 3"
 
 
 def test_process_tool_new_does_not_validate_args_itself(monkeypatch):

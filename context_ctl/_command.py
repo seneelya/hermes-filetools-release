@@ -425,17 +425,23 @@ def run_addresses(session_id: str, engine, addrs: list, operation: str) -> dict:
                          lines, _compact)
 
 
-def run_import(session_id: str, engine, folder: str) -> dict:
-    """Заменить ВСЮ живую ленту сессии строками из папки выгрузки (владелец, 2026-09-29).
+def run_import(session_id: str, engine, folder: str, mode: str = "replace") -> dict:
+    """Влить строки из папки выгрузки в живую ленту сессии (владелец, 2026-09-29; режимы — `Plan27`).
 
-    Разбор и сборка пар — `_import.load`; здесь только проверка и коммит. Валидатор без
-    исправления: любой разрыв пары — отказ целиком, контекст не тронут. Прежние строки уходят
-    в архив их же `replace_messages(archive_dropped=True)` — тот же путь, что у `erase`.
+    `mode`: `replace` — заменить ВСЮ ленту (прежние строки уходят в архив их же
+    `replace_messages(archive_dropped=True)`, тот же путь, что у `erase`); `tail` — дописать в
+    хвост; `head` — вставить в голову. Разбор и сборка пар — `_import.load`, порядок —
+    `_import.assemble`; здесь проверка и коммит. Валидатор без исправления: любой разрыв пары в
+    папке — отказ целиком, контекст не тронут. Стыки одной роли (на входе в импорт, на выходе,
+    внутри) — мостики `_alternation.fit(kind="import")`, проверка их функцией: не хуже, чем было.
     """
-    from . import _import
+    from . import _alternation, _import
     facts = {"ok": False, "session": session_id, "operation": "import", "mode": "import",
-             "folder": str(folder or ""), "applied": [], "tokens_before": 0,
-             "tokens_after": 0, "chars_saved": 0}
+             "import_mode": str(mode or ""), "folder": str(folder or ""), "applied": [],
+             "tokens_before": 0, "tokens_after": 0, "chars_saved": 0}
+    if mode not in _import.MODES:
+        return _facts(facts, [f"режим {mode!r} не знаем, есть: {', '.join(_import.MODES)}",
+                              "ИТОГ: контекст не тронут"], f"unknown import mode {mode!r}")
     loaded = _import.load(folder)
     new_rows = loaded["rows"]
     problems = list(loaded["problems"])
@@ -462,26 +468,63 @@ def run_import(session_id: str, engine, folder: str) -> dict:
         return _facts(facts, lines + [rows_why, "ИТОГ: контекст не тронут"],
                       "the session database is unreachable")
 
+    # `removed` — при `replace` ВСЯ прежняя лента: её уход и есть операция, предохранитель
+    # коммита иначе принял бы его за потерю данных. При `tail`/`head` не уходит ничего.
+    tape, removed = _import.assemble(rows, new_rows, mode)
+    tape, bridged = _alternation.fit(tape, rows, kind="import")
+    lines.append(f"режим: {mode}")
+    if bridged:
+        lines.append(f"чередование: вставлено мостиков {bridged} — их правило склеило бы соседние "
+                     "реплики одной роли")
+    was_bad, now_bad = _alternation.their_repairs(rows), _alternation.their_repairs(tape)
+    if was_bad is not None and now_bad is not None and now_bad > was_bad:
+        lines.append(f"ИТОГ: контекст НЕ тронут — их проверка чередования нашла {now_bad} "
+                     f"нарушений против {was_bad} до импорта: такую ленту Hermes склеит")
+        _note(engine, "импорт не применён: чередование", was=was_bad, now=now_bad)
+        return _facts(facts, lines, f"refused: role alternation ({now_bad} vs {was_bad})")
+    # Пары по ВСЕЙ новой ленте: разрыв, которого не было в живой ленте, — наш, отказ.
+    pairs_before = len(_stubs.lint_pairs(rows)) if mode != "replace" else 0
+    pairs_after = _stubs.lint_pairs(tape)
+    if len(pairs_after) > pairs_before:
+        lines.append(f"ИТОГ: контекст НЕ тронут — на стыке разорвано пар вызов/ответ: "
+                     f"{len(pairs_after) - pairs_before}")
+        _note(engine, "импорт не применён: разрыв пары", problems=pairs_after)
+        return _facts(facts, lines, f"refused: {len(pairs_after)} broken call/result pair(s)")
+    facts["bridges"] = bridged
+
+    # ЖУРНАЛ (Plan27-Task02): операции из спутника папки получают номера ЦЕЛЕВОЙ сессии, и
+    # номер в тексте результата меняется до записи ленты. Записи в журнал — только после
+    # успешного коммита: отказ иначе оставил бы записи о том, чего в ленте нет.
+    from . import _relink
+    entries, relink_notes = _relink.relink(new_rows, loaded.get("ledger") or [], session_id)
+    lines += [f"журнал: {n}" for n in relink_notes]
+    if loaded.get("ledger_bad"):
+        lines.append(f"журнал: строк спутника не разобрано {loaded['ledger_bad']} — те операции без привязки")
+
     before = _apply._estimate(agent, history)
-    after = _apply._estimate(agent, new_rows)
-    # `removed` — ВСЯ прежняя лента: её уход и есть операция, предохранитель коммита иначе
-    # принял бы его за потерю данных.
-    ok, applied_why = _apply.commit_replacement(session, agent, new_rows,
-                                                removed=list(rows))
+    after = _apply._estimate(agent, tape)
+    ok, applied_why = _apply.commit_replacement(session, agent, tape, removed=removed)
     if not ok:
         lines.append(f"ИТОГ: НЕ применено — {applied_why}")
-        _note(engine, f"импорт не применён: {applied_why}", folder=str(folder))
+        _note(engine, f"импорт не применён: {applied_why}", folder=str(folder), mode=mode)
         return _facts(facts, lines, "refused at commit, context untouched")
+    from ..file_ops import _ledger
+    written = sum(1 for e in entries if _ledger.note_imported(session_id, e))
+    edited = sum(1 for e in entries if e.get("edited"))
+    facts.update({"relinked": written, "relinked_edited": edited})
+    if entries or loaded.get("ledger"):
+        lines.append(f"журнал: привязано операций {written} из {len(loaded.get('ledger') or [])} "
+                     f"записей спутника" + (f", правленых руками {edited}" if edited else ""))
     _signal.bump(session_id, [])
-    lines.append(f"было строк: {len(rows)}, стало: {len(new_rows)}")
+    lines.append(f"было строк: {len(rows)}, стало: {len(tape)}")
     lines.append(f"токены: было ~{before}, стало ~{after}")
     lines.append("ИТОГ: применено"
                  + ("" if applied_why.strip() == "применено" else f" — {applied_why}"))
-    _note(engine, applied_why, imported=len(new_rows), folder=str(folder))
-    facts.update({"ok": True, "rows_before": len(rows), "rows_after": len(new_rows),
+    _note(engine, applied_why, imported=len(new_rows), folder=str(folder), mode=mode)
+    facts.update({"ok": True, "rows_before": len(rows), "rows_after": len(tape),
                   "tokens_before": before, "tokens_after": after,
                   "revision": _signal.read_signal(session_id).get("revision", 0)})
-    return _facts(facts, lines, f"imported {len(new_rows)} messages · ~{after} tk")
+    return _facts(facts, lines, f"imported {len(new_rows)} messages ({mode}) · ~{after} tk")
 
 
 EDITABLE_ROLES = ("user", "assistant", "system")

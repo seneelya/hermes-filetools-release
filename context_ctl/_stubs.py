@@ -604,7 +604,9 @@ def ledger_index(session: str | None) -> dict:
     return index
 
 
-_OP_IN_HEADER = re.compile(r"Operation ID:\s*([0-9a-fA-F]{4,}(?:x[0-9a-fA-F]{2,4})?)")
+# The label is the dictionary's (`_tool_text.OP_LABEL` = `_vocab.COMMON["op"]`, Plan28).
+_OP_IN_HEADER = re.compile(re.escape(_tool_text.OP_LABEL)
+                           + r":\s*([0-9a-fA-F]{4,}(?:x[0-9a-fA-F]{2,4})?)")
 
 
 def ops_from_history(messages) -> dict:

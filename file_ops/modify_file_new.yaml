@@ -43,7 +43,7 @@ properties:
       The text to replace, as it appears in the file. Differences in
       indentation or spacing are tolerated. It does NOT have to be unique -
       `line` disambiguates. Never include the "N|" line-number column from
-      numbered output; send the code itself. An automatic "⚓ Line: N" signpost inside a
+      numbered output; send the code itself. An automatic "{anchor_symbol} {anchor_word}: N" signpost inside a
       copied excerpt needs no attention - it is recognised and becomes the
       blank line it marked.
   new_string:

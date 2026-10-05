@@ -2,7 +2,7 @@
 WHETHER and HOW read_file should read a given file's bytes, before
 view_file_new_core.py builds any response text.
 
-Extension-routed known document types (.docx/.xlsx/.pptx/.ipynb) stay
+Extension-routed known document types (_doc_extract.EXTRACTABLE_EXTENSIONS) stay
 handled by view_file_new_core.py itself, unchanged - this module only
 covers everything else: is it actually binary regardless of what its
 extension/lack of extension claims, and if not, what encoding is it.

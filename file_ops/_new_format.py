@@ -8,6 +8,11 @@ duplicated between the two.
 
 from __future__ import annotations
 
+try:  # plugin mode
+    from . import _vocab
+except ImportError:  # console mode
+    import _vocab  # type: ignore
+
 from pathlib import Path
 
 
@@ -263,7 +268,7 @@ def place_anchors(page_lines, start_line: int, commenter, anchor_symbol: str,
             # emit (File:/Size:/FileTag:/Modified:). Without it this was the
             # only one phrased as prose - "Line 33" reads as a claim to be
             # checked, "Line: 33" reads as a field.
-            out.append(commenter(f"{anchor_symbol}{tag} Line: {n}") + eol)
+            out.append(commenter(f"{anchor_symbol}{tag} {_vocab.MARKS['anchor_word']}: {n}") + eol)
             last = n
         else:
             out.append(line)

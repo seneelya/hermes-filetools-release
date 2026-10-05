@@ -27,7 +27,18 @@
 # yet — write that down instead of a guess.
 
 meta:
-  # Rebased 2026-10-02 (evening) to 54bc5e509c after the live update from
+  # Rebased 2026-10-06 to b79c45bd3e after the live update from 54bc5e509c
+  # (1567 commits). Prepared by HowTo__PrepareForUpdate.md up to 79af3f6cea:
+  # no risks, 3 seams reviewed (forced_compress_entry: new kwarg
+  # snapshot_is_current, None = current; alternation_repair_count: new
+  # in-place pre-pass, we pass a deepcopy; name_process unchanged). 8 commits
+  # landed after the audit - desktop app / i18n / docs only. Full check green
+  # on the live tree: 59 OK + 2 TEST-OK, 180 tests; no count moved. The update
+  # changed how the gateway runs (bare store python, deps activated at runtime):
+  # Full check now starts pytest with the dependency venv's python
+  # (check.dependency_python).
+  #
+  # Before that: rebased 2026-10-02 (evening) to 54bc5e509c after the live update from
   # f42f579cf8 (900 commits). Prepared by HowTo__PrepareForUpdate.md (agent in
   # the container, code compare): no risks, 4 ATTENTION; 27 commits landed
   # after that audit (desktop/icons + provider tool-id normalization in
@@ -65,8 +76,8 @@ meta:
   # bridge.tool_stubs's tuple shape changed (name dropped, was redundant
   # with the dict key) - file_ops/_execute_code_bridge.py now detects the
   # shape instead of assuming it.
-  baseline_taken: "2026-10-02"
-  baseline_head: "54bc5e509c"
+  baseline_taken: "2026-10-06"
+  baseline_head: "b79c45bd3e"
   # Fallback only. The checker resolves the live checkout itself:
   # HERMES_AGENT_ROOT, else <HERMES_HOME>/hermes-agent (installer layout).
   prod_root: "Y:/Hermess/body/hermes-agent"
@@ -1081,8 +1092,8 @@ seams:
     # a second in-file mention (not the def itself) was consolidated away by
     # the same refactor pass; the definition and its signature are unchanged.
     baseline_count: 1
-    we_do: Read raw bytes through it (patch's exact-string resolver, and vision's image read).
-    breaks: Signature change -> patch's resolver and the vision path both fail.
+    we_do: Read raw bytes through it (read_file - text and documents, patch's exact-string resolver, and vision's image read).
+    breaks: Signature change -> read_file, patch's resolver and the vision path all fail.
     asserted_by: tests/test_vision_analyze_core.py
 
   - id: backend.patch_result_has_no_counter

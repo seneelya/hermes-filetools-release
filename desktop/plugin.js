@@ -85,9 +85,76 @@ var FORMAT_DEFAULTS = Object.freeze({
   block_open: "\u25A0BLOCK",
   block_close: "\u25A0END"
 });
-var HEADER_WORDS = Object.freeze(["File:", "Size:", "Modified:", "Encoding:", "FileTag:"]);
+var TOOL_DEFAULTS = Object.freeze({
+  icon: Object.freeze({
+    read_file: "\u25E7",
+    write_file: "\u271A",
+    patch: "\u0394",
+    search_files: "\u2315",
+    terminal: "\u276F",
+    execute_code: "\u25B7",
+    process: "\u27F3",
+    vision_analyze: "\u25C9"
+  }),
+  header: Object.freeze({
+    read_file: Object.freeze({
+      file: "File",
+      size: "Size",
+      modified: "Modified",
+      encoding: "Encoding",
+      file_tag: "FileTag"
+    }),
+    patch: Object.freeze({ lines: "Lines", unchanged: "Unchanged", dry_run: "Dry run" }),
+    terminal: Object.freeze({ exit_code: "Exit code" }),
+    vision_analyze: Object.freeze({ success: "Success" })
+  })
+});
+var FOREIGN_ICON = "\u25C6";
 var vocab = { ...FORMAT_DEFAULTS };
+var tools = {};
 var cache = null;
+function applyTools(src) {
+  const next = {};
+  const obj = (v) => v && typeof v === "object" && !Array.isArray(v) ? v : null;
+  for (const [name, raw] of Object.entries(obj(src) || {})) {
+    const t = obj(raw);
+    if (!t) continue;
+    const header = {};
+    for (const [role, word] of Object.entries(obj(t.header) || {})) {
+      if (typeof word === "string" && word !== "") header[role] = word;
+    }
+    const call = obj(t.call) || {};
+    next[name] = {
+      icon: typeof t.icon === "string" ? t.icon : "",
+      header,
+      call: {
+        params: (Array.isArray(call.params) ? call.params : []).filter((p) => obj(p) && typeof p.name === "string"),
+        body: (Array.isArray(call.body) ? call.body : []).filter((k2) => typeof k2 === "string")
+      }
+    };
+  }
+  tools = next;
+  cache = null;
+  return tools;
+}
+function toolIcon(name) {
+  const own = tools[name] && tools[name].icon;
+  return own || TOOL_DEFAULTS.icon[name] || FOREIGN_ICON;
+}
+function headerWord(tool, role) {
+  const fromServer = tools[tool] && tools[tool].header[role];
+  if (fromServer) return fromServer;
+  const fallback = TOOL_DEFAULTS.header[tool];
+  return fallback && fallback[role] || "";
+}
+function toolCall(name) {
+  return tools[name] ? tools[name].call : null;
+}
+function headerWords() {
+  const header = tools.read_file && Object.keys(tools.read_file.header).length ? tools.read_file.header : TOOL_DEFAULTS.header.read_file;
+  return Object.entries(header).filter(([role]) => role in TOOL_DEFAULTS.header.read_file || !(role in COMMON_ROLES)).map(([, word]) => word + ":");
+}
+var COMMON_ROLES = Object.freeze({ op: 1, tool: 1, size: 1, state: 1 });
 function escapeRe(text) {
   return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -115,19 +182,40 @@ function built() {
   const anchor = escapeRe(vocab.anchor_symbol);
   const sep = escapeRe(vocab.header_separator);
   const hash = escapeRe(vocab.comment_fallback);
-  const words = HEADER_WORDS.map(escapeRe).join("|");
+  const words = headerWords().map(escapeRe).join("|");
+  const word = (tool, role) => escapeRe(headerWord(tool, role));
   cache = {
     // Маркер может быть голым или обёрнутым: в markdown его прячут в HTML-комментарий, в
     // JS/Python — за `//` или `#`, у файлов без известного комментария — за `comment_fallback`.
     // Тег между маркером и телом (`■BLOCK x0a :`) не мешает — матчим только НАЧАЛО строки.
     own: new RegExp(`^\\s*(\u2192\\s*)?(<!--\\s*)?(\\/\\/\\s*|#\\s*|${hash}\\s*)?(${block}(?!\\w)|${end}(?!\\w)|${anchor}|${sep}|${words})`),
     separator: new RegExp(sep),
-    blockTag: new RegExp(`${block}\\s*(x[0-9a-fA-F]{2,4})\\s*:`)
+    blockTag: new RegExp(`${block}\\s*(x[0-9a-fA-F]{2,4})\\s*:`),
+    // Разбор значений строк шапки. Слово — из справочника по роли, формат значения — логика
+    // панели. Где стоит `^\W*`, матчим НАЧАЛО строки: то же слово в выводе самой команды не
+    // должно подменять её статус.
+    exitCode: new RegExp(`^\\W*${word("terminal", "exit_code")}:\\s*(-?\\d+)`, "m"),
+    success: new RegExp(`^\\W*${word("vision_analyze", "success")}:\\s*(True|False)\\b`, "m"),
+    noChange: new RegExp(`${word("patch", "lines")}:\\s*\\d+\\s*\\(unchanged\\)`),
+    patchLines: new RegExp(`${word("patch", "lines")}: (\\d+) -> (\\d+)`),
+    nothingChanged: new RegExp(`^\\W*(${word("patch", "unchanged")}|${word("patch", "dry_run")}):`, "m")
   };
   return cache;
 }
 function ownMarkerRe() {
   return built().own;
+}
+function exitCodeRe() {
+  return built().exitCode;
+}
+function successRe() {
+  return built().success;
+}
+function patchLinesRe() {
+  return built().patchLines;
+}
+function nothingChangedRe() {
+  return built().nothingChanged;
 }
 function separatorRe() {
   return built().separator;
@@ -214,10 +302,9 @@ function brickTitles(tool, args) {
       return null;
   }
 }
-var EXIT_CODE_RE = /^Exit code:\s*(-?\d+)/m;
 var EXIT_CODE_TOOLS = ["terminal", "execute_code"];
 function terminalExitCode(body) {
-  const m = typeof body === "string" ? body.match(EXIT_CODE_RE) : null;
+  const m = typeof body === "string" ? body.match(exitCodeRe()) : null;
   return m ? Number(m[1]) : null;
 }
 function kindFromExitCode(body) {
@@ -225,9 +312,8 @@ function kindFromExitCode(body) {
   if (code == null) return null;
   return code === 0 ? "ok" : "error";
 }
-var SUCCESS_RE = /^Success:\s*(True|False)\b/m;
 function kindFromSuccess(body) {
-  const m = typeof body === "string" ? body.match(SUCCESS_RE) : null;
+  const m = typeof body === "string" ? body.match(successRe()) : null;
   if (!m) return null;
   return m[1] === "True" ? "ok" : "error";
 }
@@ -247,6 +333,22 @@ function toMs(v) {
   if (v <= 0) return null;
   return v > 1e12 ? Math.round(v) : Math.round(v * 1e3);
 }
+function countLines(text) {
+  if (typeof text !== "string" || text === "") return 0;
+  const n2 = text.split("\n").length;
+  return text.endsWith("\n") ? n2 - 1 : n2;
+}
+function diffFromArgs(tool, args) {
+  const a = args || {};
+  if (tool === "patch" && (typeof a.new_string === "string" || typeof a.old_string === "string")) {
+    return { added: countLines(a.new_string), removed: countLines(a.old_string) };
+  }
+  if (tool === "write_file" && typeof a.content === "string") {
+    return { added: countLines(a.content), removed: a.insert_line != null ? 0 : null };
+  }
+  return null;
+}
+var NOTHING_WRITTEN_RE = /^\W*(Unchanged|Dry run):/m;
 function buildBrick(event) {
   const p = asRecord(event && event.payload || {}) || {};
   const tool = typeof p.name === "string" ? p.name : "";
@@ -256,7 +358,10 @@ function buildBrick(event) {
   const body = coerceBody(p.result);
   const finalBody = !isError || body !== "" ? body : String(rawError);
   const { facts, rest } = parseEnvelope(finalBody);
-  const t = brickTitles(tool, asRecord(p.args ?? p.arguments)) || { title: tool, subtitle: "" };
+  const args = asRecord(p.args ?? p.arguments);
+  const t = brickTitles(tool, args) || { title: tool, subtitle: "" };
+  const kind = isError ? "error" : EXIT_CODE_TOOLS.includes(tool) && kindFromExitCode(rest) || tool === "vision_analyze" && kindFromSuccess(rest) || kindFromFacts(facts, rest);
+  const guess = !facts && kind === "ok" && !NOTHING_WRITTEN_RE.test(rest) ? diffFromArgs(tool, args) : null;
   return {
     tool,
     ts: toMs(p.timestamp) || Date.now(),
@@ -265,17 +370,13 @@ function buildBrick(event) {
     title: t.title,
     subtitle: t.subtitle,
     body: rest,
-    // У обёрнутых тулов конверта нет, поэтому статус берётся из шапки: у terminal и execute_code
-    // это КОД ВОЗВРАТА, у vision_analyze — строка `Success:`. Ни один из них не выдумывает
-    // состояние: не нашёл своего признака — возвращает null, и мы уходим в общий фолбек, тот же
-    // что у файловых тулов.
-    kind: isError ? "error" : EXIT_CODE_TOOLS.includes(tool) && kindFromExitCode(rest) || tool === "vision_analyze" && kindFromSuccess(rest) || kindFromFacts(facts, rest),
+    kind,
     meta: {
       duration_s: Number.isFinite(p.duration_s) ? p.duration_s : null,
       // Счётчики показываем в подзаголовке: «что именно сделано» без раскрытия карточки.
       replacements: facts && Number.isFinite(facts.replacements) ? facts.replacements : null,
-      added: facts && Number.isFinite(facts.added) ? facts.added : null,
-      removed: facts && Number.isFinite(facts.removed) ? facts.removed : null,
+      added: facts && Number.isFinite(facts.added) ? facts.added : guess ? guess.added : null,
+      removed: facts && Number.isFinite(facts.removed) ? facts.removed : guess ? guess.removed : null,
       // Адрес, которым человек и модель могут СОСЛАТЬСЯ на этот вызов (Plan09).
       // null у отказов (адрес не печатается) и у карточек, снятых до его появления.
       op: opFromHeader(rest)
@@ -476,6 +577,30 @@ function segmentKind(op) {
   if (op.tool === "patch" || op.tool === "write_file") return "patch";
   return op.nested ? "read_nested" : "read";
 }
+var isNestedRead = (f) => !!f.nested && f.tool === "read_file";
+function contextParts(f) {
+  return isNestedRead(f) ? f.seen || [] : f.parts;
+}
+function seenParts(op) {
+  if (!Array.isArray(op.seen)) return [];
+  return op.seen.filter((p) => Array.isArray(p) && p[0] >= 1 && p[1] >= p[0]).map(([from, to]) => [from, to]);
+}
+function subtractParts(parts, cut) {
+  let rest = parts.map(([from, to]) => [from, to]);
+  for (const [cfrom, cto] of cut) {
+    const next = [];
+    for (const [from, to] of rest) {
+      if (cto < from || cfrom > to) {
+        next.push([from, to]);
+        continue;
+      }
+      if (from < cfrom) next.push([from, cfrom - 1]);
+      if (to > cto) next.push([cto + 1, to]);
+    }
+    rest = next;
+  }
+  return rest;
+}
 function shadows(op, total) {
   if (op.tool !== "write_file") return true;
   const first = op.parts[0];
@@ -524,6 +649,7 @@ function buildContextView(ops) {
     if (delta !== 0 && positioned) {
       for (const prev of file.folded) {
         prev.parts = foldParts(prev.parts, op.from, delta);
+        if (prev.seen) prev.seen = foldParts(prev.seen, op.from, delta);
       }
     }
     if (op.total) {
@@ -541,7 +667,9 @@ function buildContextView(ops) {
       op: op.op,
       tool: op.tool,
       state: op.state,
-      nested: op.nested
+      nested: op.nested,
+      // Только у вложенного чтения: что из него дошло до модели (см. `contextParts`).
+      seen: positioned && isNestedRead(op) ? seenParts(op) : null
     });
   }
   const files = [];
@@ -553,10 +681,19 @@ function buildContextView(ops) {
     if (!drawable.length && (!file.total || file.folded.every((f) => GONE_STATES.has(f.state)))) continue;
     const total = file.total || Math.max(1, ...file.folded.flatMap((f) => f.parts.map((p) => p[1])), 1);
     const last = drawable.length - 1;
-    const segments = drawable.flatMap((f, i) => f.parts.map(([from, to]) => ({
+    const pieces = (f) => {
+      if (!isNestedRead(f) || !f.seen || !f.seen.length) {
+        return f.parts.map(([from, to]) => ({ from, to, kind: segmentKind(f) }));
+      }
+      return [
+        ...f.seen.map(([from, to]) => ({ from, to, kind: "read" })),
+        ...subtractParts(f.parts, f.seen).map(([from, to]) => ({ from, to, kind: "read_nested" }))
+      ].sort((a, b) => a.from - b.from);
+    };
+    const segments = drawable.flatMap((f, i) => pieces(f).map(({ from, to, kind }) => ({
       from,
       to,
-      kind: segmentKind(f),
+      kind,
       rank: last - i,
       op: f.op,
       // Зажато в [0, 100]. Без этого сегмент физически вылезал за габариты плитки: при вставке
@@ -601,14 +738,15 @@ function buildContextView(ops) {
     for (let i = 0; i < file.folded.length; i++) {
       const own = file.folded[i];
       if (!own.op || !own.pos || !SEGMENT_TOOLS.has(own.tool)) continue;
-      const span = own.parts.reduce((n2, [from, to]) => n2 + (to - from + 1), 0);
+      const ownParts = contextParts(own);
+      const span = ownParts.reduce((n2, [from, to]) => n2 + (to - from + 1), 0);
       if (!span) continue;
       const laterRanges = [];
       for (let j = i + 1; j < file.folded.length; j++) {
         const later = file.folded[j];
         if (!later.pos || !shadows(later, total)) continue;
-        for (const [ofrom, oto] of own.parts) {
-          for (const [lfrom, lto] of later.parts) {
+        for (const [ofrom, oto] of ownParts) {
+          for (const [lfrom, lto] of contextParts(later)) {
             const lo = Math.max(ofrom, lfrom);
             const hi = Math.min(oto, lto);
             if (hi >= lo) laterRanges.push([lo, hi]);
@@ -902,13 +1040,19 @@ function hasRest() {
 }
 function loadConfig() {
   return adapter.rest("/config").then((data) => {
-    if (data && !data.error) applyFormatting(data.formatting);
+    if (data && !data.error) {
+      applyFormatting(data.formatting);
+      applyTools(data.tools);
+    }
     return data;
   });
 }
 function saveConfig(patch) {
   return adapter.rest("/config", { method: "POST", body: patch }).then((data) => {
-    if (data && !data.error) applyFormatting(data.formatting);
+    if (data && !data.error) {
+      applyFormatting(data.formatting);
+      applyTools(data.tools);
+    }
     return data;
   });
 }
@@ -1241,20 +1385,22 @@ function checkImport() {
     check: { folder, ok: false, error: `request failed: ${err && err.message || err}` }
   }));
 }
-function applyImport() {
+var IMPORT_MODES = ["replace", "tail", "head"];
+function applyImport(mode = "replace") {
   const cur = $importOp.get() || IMPORT_INITIAL;
   const sid = viewKey();
   const check = cur.check || {};
   if (cur.busy || check.ok !== true || check.folder !== cur.folder) return Promise.resolve();
+  if (!IMPORT_MODES.includes(mode)) return Promise.resolve();
   if (!adapter.hasRest || !isPersistableKey(sid)) {
     setImportOp({ note: "this chat is not saved yet", ok: false });
     return Promise.resolve();
   }
   setImportOp({ busy: true });
-  return adapter.rest("/context-import", { method: "POST", body: { session: sid, folder: cur.folder, apply: true } }).then((res) => {
+  return adapter.rest("/context-import", { method: "POST", body: { session: sid, folder: cur.folder, apply: true, mode } }).then((res) => {
     const r = asRecord(res) || {};
     const ok = r.ok === true;
-    const note = ok ? `imported ${r.rows_after || 0} messages (was ${r.rows_before || 0}) \u2190 ${cur.folder}` : String(r.summary && r.summary !== "not applied" ? r.summary : r.error || r.summary || "not imported");
+    const note = ok ? `imported ${r.rows_after || 0} messages (was ${r.rows_before || 0}, ${mode}) \u2190 ${cur.folder}` : String(r.summary && r.summary !== "not applied" ? r.summary : r.error || r.summary || "not imported");
     if (ok) stopImportPaste();
     setImportOp({ busy: false, ok, note, open: !ok });
     if (ok) {
@@ -1980,7 +2126,7 @@ function brickCounts(brick) {
   const m = brick.meta || {};
   const bits = [];
   if (Number.isFinite(m.added) && m.added > 0) bits.push(`+${m.added}`);
-  if (Number.isFinite(m.removed) && m.removed > 0) bits.push(`\u2212${m.removed}`);
+  if (Number.isFinite(m.removed) && m.removed > 0) bits.push(`-${m.removed}`);
   if (Number.isFinite(m.replacements) && m.replacements > 0) bits.push(`\xD7${m.replacements}`);
   return bits.length ? bits.join(" ") : brick.subtitle || "";
 }
@@ -2248,7 +2394,7 @@ function Diff({ added, removed }) {
     style: Object.assign({ width: `${DIFF_CH}ch`, fontSize: DIFF_FONT }, SELECTABLE),
     children: [
       added ? jsx3("span", { style: { color: "var(--ui-green)" }, children: `+${added}` }) : null,
-      removed ? jsx3("span", { style: { color: "var(--ui-red)" }, children: `\u2212${removed}` }) : null
+      removed ? jsx3("span", { style: { color: "var(--ui-red)" }, children: `-${removed}` }) : null
     ]
   });
 }
@@ -2673,13 +2819,6 @@ var TOKEN_COLOR = {
 };
 
 // desktop/src/card-adapter.js
-var TOOL_ICON = {
-  read_file: "\u25E7",
-  write_file: "\u25E7",
-  patch: "\u25E7",
-  search_files: "\u2315",
-  terminal: "\u276F"
-};
 var KIND_LABEL = { ok: "done", error: "error", "no-change": "no change" };
 var FILE_TAG_RE = /FileTag:\s*(x[0-9a-fA-F]{2,4})/;
 function extractFileTag(body) {
@@ -2787,7 +2926,7 @@ function brickToCardProps(brick, toolColumnWidth, stalePct, drop, onPick) {
       // содержимого нет (после `drop content`), с ней можно работать. `disabled` — операции нет
       // вовсе, работать не с чем.
       disabled: isErasedBrick(brick),
-      icon: TOOL_ICON[brick.tool] || "\u25C6",
+      icon: toolIcon(brick.tool),
       tool: brick.tool,
       added: meta.added,
       removed: meta.removed,
@@ -2826,7 +2965,10 @@ var CHIP_STATUS = {
   // НЕ ромб (владелец, 2026-09-29: «похож на точку»). Пунктирная рамка — «не наш». На чипе
   // встаёт НА МЕСТО иконки тула, как и точка ошибки: иконка чужому тулу не нужна.
   foreign: { glyph: "\u2B1A", tone: "var(--ui-orange)", title: "foreign tool: no operation of ours carries this tool_call_id" },
-  unrecorded: { glyph: "\u25CB", tone: "var(--ui-text-quaternary)", title: "ours, no ledger record" }
+  unrecorded: { glyph: "\u25CB", tone: "var(--ui-text-quaternary)", title: "ours, no ledger record" },
+  // Результат привезён импортом и его текст правили руками до импорта (Plan27, владелец
+  // 2026-10-05: `≠` оранжевым). Сам факт импорта значка не получает — только строку в ховере.
+  edited: { glyph: "\u2260", tone: "var(--ui-orange)", title: "edited by hand before import" }
 };
 function chipState(brick, fact) {
   const meta = brick && brick.meta || {};
@@ -2842,6 +2984,7 @@ function chipStatuses({ brick, fact, foreign, unrecorded }) {
   else if (state === "compacted" || brick && brick.meta && brick.meta.compacted) out.push(CHIP_STATUS.compacted);
   else if (state === "evicted") out.push(CHIP_STATUS.evicted);
   else if (state === "unknown") out.push(CHIP_STATUS.unknown);
+  if (fact && fact.edited) out.push(CHIP_STATUS.edited);
   if (foreign) out.push(CHIP_STATUS.foreign);
   if (unrecorded) out.push(CHIP_STATUS.unrecorded);
   return out;
@@ -2860,11 +3003,41 @@ function chipTarget({ brick, fact, target }) {
   const t = String(target || "").replace(/\\/g, "/");
   return t ? t.split("/").filter(Boolean).pop() || t : "";
 }
-function chipDiff(brick) {
-  const meta = brick && brick.meta || {};
+function chipDiff(brick, fact) {
+  const fromLedger = fact && (Number(fact.added) > 0 || Number(fact.removed) > 0);
+  const meta = fromLedger ? fact : brick && brick.meta || {};
   const added = Number.isFinite(Number(meta.added)) ? Number(meta.added) : 0;
   const removed = Number.isFinite(Number(meta.removed)) ? Number(meta.removed) : 0;
-  return added || removed ? { added, removed } : null;
+  if (added || removed) return { added, removed };
+  return diffFromRow(fact);
+}
+var WRITE_TEXT_RES = [
+  /(?:Created new file|Overwritten) \((\d+) lines?\)/,
+  /Inserted (\d+) lines? at/,
+  /Appended (\d+) lines? \(/
+];
+function diffFromRow(fact) {
+  const text = String(fact && fact.text || "");
+  const call = fact && fact.call || null;
+  const name = call && call.name;
+  if (!name || !text || /^\s*ERROR/.test(text) || nothingChangedRe().test(text)) return null;
+  if (name === "write_file") {
+    for (const re of WRITE_TEXT_RES) {
+      const m = text.match(re);
+      if (m) return { added: Number(m[1]), removed: 0 };
+    }
+    return null;
+  }
+  if (name === "patch") {
+    const guess = call.cut ? null : diffFromArgs(name, call.args);
+    if (guess && (guess.added || guess.removed)) return guess;
+    const m = text.match(patchLinesRe());
+    if (m) {
+      const net = Number(m[2]) - Number(m[1]);
+      return net ? { added: Math.max(net, 0), removed: Math.max(-net, 0) } : null;
+    }
+  }
+  return null;
 }
 function chipTipLines({ name, op, brick, fact, target, statuses, tokens, freshness }) {
   const meta = brick && brick.meta || {};
@@ -2876,9 +3049,13 @@ function chipTipLines({ name, op, brick, fact, target, statuses, tokens, freshne
   if (command) lines.push(`command: ${command}`);
   else if (path) lines.push(path);
   if (brick && brick.subtitle) lines.push(brick.subtitle);
-  const diff = chipDiff(brick);
-  if (diff) lines.push(`lines: +${diff.added} \u2212${diff.removed}`);
+  const diff = chipDiff(brick, fact);
+  if (diff) lines.push(`lines: +${diff.added} -${diff.removed}`);
   (statuses || []).forEach((s) => lines.push(`${s.glyph}  \u2014  ${s.title}`));
+  const from = fact && fact.imported_from;
+  if (from && typeof from === "object") {
+    lines.push(`imported: was op ${from.op || "?"} in ${from.session || "?"}`);
+  }
   const dur = formatDuration(meta.duration_s);
   lines.push([tokens ? `${tokens} tk` : "", `freshness: ${freshness}`, dur ? `took ${dur}` : ""].filter(Boolean).join(" \xB7 "));
   return lines.filter(Boolean);
@@ -3745,7 +3922,7 @@ function LayoutSection() {
           jsx15("div", { className: "text-[0.55rem] mb-0.5", style: { color: "var(--ui-text-quaternary)" }, children: "#L2 StaleStack: 3 \u044D\u043B\u0435\u043C\u0435\u043D\u0442\u0430, \u0437\u043D\u0430\u0447\u043A\u0438 \u0432\u043C\u0435\u0441\u0442\u043E \u0442\u043E\u0447\u0435\u043A (\u2713/\u26A0/\u21BB)" }),
           jsx15(OperationCardHeader, {
             statuses: mockStatuses("patch"),
-            icon: "\u25E7",
+            icon: "\u0394",
             tool: "patch",
             added: 8,
             removed: 120,
@@ -3777,7 +3954,7 @@ function LayoutSection() {
           jsx15("div", { className: "text-[0.55rem] mb-0.5 mt-1.5", style: { color: "var(--ui-text-quaternary)" }, children: "#L4 StaleStack: 2 \u044D\u043B\u0435\u043C\u0435\u043D\u0442\u0430 (\u0442\u043E\u0447\u043A\u0438)" }),
           jsx15(OperationCardHeader, {
             statuses: mockStatuses("write_file"),
-            icon: "\u25E7",
+            icon: "\u271A",
             tool: "write_file",
             added: 150,
             removed: 0,
@@ -3792,7 +3969,7 @@ function LayoutSection() {
           jsx15("div", { className: "text-[0.55rem] mb-0.5 mt-1.5", style: { color: "var(--ui-text-quaternary)" }, children: "#L7 \u0412\u044B\u043A\u0438\u043D\u0443\u0442\u043E \u0438\u0437 \u043A\u043E\u043D\u0442\u0435\u043A\u0441\u0442\u0430 \u2014 \u0432\u0441\u0451 \u043A\u0430\u043A \u0431\u044B\u043B\u043E, \u043F\u0440\u0438\u0442\u0443\u0448\u0435\u043D\u043E, \u043D\u0435 \u043A\u043B\u0438\u043A\u0430\u0435\u0442\u0441\u044F" }),
           jsx15(OperationCardHeader, {
             statuses: mockStatuses("patch"),
-            icon: "\u25E7",
+            icon: "\u0394",
             tool: "patch",
             added: 8,
             removed: 120,
@@ -4393,13 +4570,41 @@ var UNASSIGNED_OP_OPACITY = 0.4;
 var OVERLAP_COL_WIDTH = "4.2ch";
 var CLIP = { overflow: "hidden", whiteSpace: "nowrap" };
 var OP_CHIP_GAP = "0.25rem";
-function toolIcon(name) {
-  return TOOL_ICON[name] || "\u25C6";
+var DIFF_FIELD_ON = false;
+var DIFF_PAD = "0.1rem";
+var DIFF_PLUS_W = "4.2ch";
+var DIFF_MINUS_W = "3.8ch";
+function diffWidth(diff) {
+  return `calc(${diff && diff.added ? DIFF_PLUS_W : "0px"} + ${diff && diff.removed ? DIFF_MINUS_W : "0px"})`;
+}
+function DiffPill({ tone, text, width }) {
+  return jsx20("span", {
+    style: {
+      display: "flex",
+      justifyContent: "center",
+      overflow: "hidden",
+      boxSizing: "border-box",
+      width,
+      padding: `0 ${DIFF_PAD}`,
+      backgroundColor: DIFF_FIELD_ON ? `color-mix(in oklch, ${tone}, transparent 85%)` : "transparent",
+      // Цвет темы может нести альфу (`--ui-green` полупрозрачный) — это и был «прозрачный шрифт»:
+      // `/ 1` снимает её; насыщенность (`c`) чуть выше, яркость и толщину не трогаем.
+      color: `oklch(from ${tone} l calc(c * 1.15) h / 1)`
+    },
+    children: jsx20("span", { style: { flexShrink: 0, whiteSpace: "nowrap" }, children: text })
+  });
 }
 function OpChipBody({ marks, name, data, diff, op, overlapText, overlapTone, overlapTitle }) {
   const list = Array.isArray(marks) ? marks : [];
   const leadGroup = jsxs19("span", {
-    style: Object.assign({ display: "flex", alignItems: "center", flexShrink: 0, width: LEAD_WIDTH, columnGap: "0.15rem" }, CLIP),
+    // Диф встаёт в ту же ширину: группа ужимается на его ширину, имя файла остаётся на месте.
+    style: Object.assign({
+      display: "flex",
+      alignItems: "center",
+      flexShrink: 0,
+      columnGap: "0.15rem",
+      width: diff && (diff.added || diff.removed) ? `calc(${LEAD_WIDTH} - ${diffWidth(diff)})` : LEAD_WIDTH
+    }, CLIP),
     children: [
       list.length ? jsx20("span", {
         title: list.map((m) => `${m.glyph}  \u2014  ${m.title}`).join("\n"),
@@ -4422,13 +4627,23 @@ function OpChipBody({ marks, name, data, diff, op, overlapText, overlapTone, ove
     style: Object.assign({ display: "flex", alignItems: "center", width: "100%", columnGap: OP_CHIP_GAP }, CLIP),
     children: [
       leadGroup,
-      // Диф `+N −M` — ПЕРЕД именем (владелец, 2026-09-29: «ничего, если имя сдвинется»).
-      // Только у операций, которые его знают; у прочих узла нет вовсе.
-      diff ? jsxs19("span", {
-        style: { flexShrink: 0, display: "flex", columnGap: "0.2rem", fontVariantNumeric: "tabular-nums" },
+      // Диф `+N -M` — ПЕРЕД именем файла, имя файла НЕ двигает (владелец, 2026-10-05): ширина
+      // дифа вычтена из группы слева (имя операции ужимается, не налезает), а отрицательный margin
+      // гасит лишний columnGap — у операций с дифом и без него имя файла стоит в одной точке.
+      // Только у операций, которые диф знают; у прочих узла нет вовсе.
+      diff && (diff.added || diff.removed) ? jsxs19("span", {
+        style: {
+          display: "flex",
+          flexShrink: 0,
+          marginLeft: `calc(-1 * ${OP_CHIP_GAP})`,
+          borderRadius: "0.2rem",
+          overflow: "hidden",
+          width: diffWidth(diff),
+          fontVariantNumeric: "tabular-nums"
+        },
         children: [
-          diff.added ? jsx20("span", { style: { color: "var(--ui-green)" }, children: `+${diff.added}` }) : null,
-          diff.removed ? jsx20("span", { style: { color: "var(--ui-red)" }, children: `\u2212${diff.removed}` }) : null
+          diff.added ? jsx20(DiffPill, { tone: "var(--ui-green)", text: `+${diff.added}`, width: DIFF_PLUS_W }) : null,
+          diff.removed ? jsx20(DiffPill, { tone: "var(--ui-red)", text: `-${diff.removed}`, width: DIFF_MINUS_W }) : null
         ]
       }) : null,
       jsx20("span", {
@@ -4977,6 +5192,12 @@ import { useEffect as useEffect3, useRef as useRef4, useState as useState8 } fro
 import { jsx as jsx22, jsxs as jsxs21 } from "react/jsx-runtime";
 var GRID_MAX = 21;
 var BODY_KEYS = ["content", "code", "text", "body", "patch", "old_string", "new_string", "pattern"];
+function orderedKeys(args, call) {
+  const keys = Object.keys(args);
+  if (!call || !call.params.length) return keys;
+  const known = call.params.map((p) => p.name).filter((k2) => keys.includes(k2));
+  return [...known, ...keys.filter((k2) => !known.includes(k2))];
+}
 var KEY_CH = 11;
 var CELL_CH = 32;
 var CELL_LINE = "color-mix(in oklch, var(--ui-stroke-secondary), transparent 65%)";
@@ -5025,19 +5246,21 @@ function nestedOf(value, depth, limit) {
   }
   return null;
 }
-function callRows(args, limit, depth = 0) {
+function callRows(args, limit, depth = 0, tool = "") {
   const cut = (text) => limit > 0 && text.length > limit ? text.slice(0, limit) + " \u2026" : text;
   if (typeof args === "string") {
     return args ? [{ key: "", value: cut(args), block: true }] : [];
   }
   if (!args || typeof args !== "object") return [];
-  return Object.keys(args).map((key) => {
+  const call = depth === 0 && tool ? toolCall(tool) : null;
+  const bodyKeys = call ? call.body : BODY_KEYS;
+  return orderedKeys(args, call).map((key) => {
     const raw = unfoldValue(args[key]);
     const nested = nestedOf(raw, depth, limit);
     if (nested) return { key, value: "", block: true, nested };
     const value = cut(callValue(raw));
     const many = value.includes("\n");
-    const long = value.length > GRID_MAX || BODY_KEYS.includes(key.toLowerCase());
+    const long = value.length > GRID_MAX || bodyKeys.includes(key.toLowerCase());
     return { key, value, block: many, wide: !many && long };
   });
 }
@@ -5150,7 +5373,7 @@ function NestedTable({ part }) {
 }
 var NAME_CH = 14;
 function CallView({ name, args, limit }) {
-  const { grid, wide, body } = splitFields(callRows(args, limit));
+  const { grid, wide, body } = splitFields(callRows(args, limit, 0, name));
   const head = name ? jsx22("div", {
     style: Object.assign({ fontWeight: 500 }, SELECTABLE),
     children: name
@@ -5689,7 +5912,7 @@ function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
   const realPct = realOp && stale && typeof stale[realOp] === "number" ? stale[realOp] : null;
   const pct = answer ? realPct : null;
   const statuses = chipStatuses({ brick, fact: afact, foreign, unrecorded });
-  const diff = chipDiff(brick);
+  const diff = chipDiff(brick, afact);
   const tip = chipTipLines({
     name,
     op: realOp,
@@ -6608,7 +6831,7 @@ var KEYFRAMES = `
 var ANCHOR_GAP_PX = 14;
 var ANCHOR_WIDTH_REM = 20;
 var EDGE_PX = 8;
-function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, anchor, canConfirm = true }) {
+function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, anchor, canConfirm = true, actions }) {
   if (!open) return null;
   const anchored = anchor && Number.isFinite(anchor.x) && Number.isFinite(anchor.y);
   const place = anchored ? {
@@ -6696,12 +6919,27 @@ function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, 
           //
           // Сетка из трёх колонок, а не `justify-between`: центр должен быть центром ОКНА, а
           // не серединой между двумя кнопками разной ширины.
+          Array.isArray(actions) && actions.length ? jsx30("div", {
+            className: "mt-3 flex items-center justify-center gap-2 flex-wrap",
+            children: actions.map((a) => jsx30("button", {
+              disabled: !!busy || !canConfirm,
+              onClick: a.onClick,
+              className: `${a.main ? "px-4 py-1.5 text-sm font-semibold" : "px-2.5 py-1 text-xs font-medium"} rounded-md cursor-pointer select-none`,
+              style: {
+                border: "1px solid var(--ui-red)",
+                color: "var(--ui-red)",
+                opacity: canConfirm ? 1 : 0.35,
+                whiteSpace: "nowrap"
+              },
+              children: a.label
+            }, a.key || a.label))
+          }, "actions") : null,
           jsxs29("div", {
             className: "mt-3 grid items-center gap-2",
             style: { gridTemplateColumns: "1fr auto 1fr" },
             children: [
               jsx30("div", {}),
-              jsxs29("button", {
+              Array.isArray(actions) && actions.length ? jsx30("div", {}) : jsxs29("button", {
                 disabled: !!busy || !canConfirm,
                 onClick: onConfirm,
                 className: "px-4 py-1 rounded-md text-xs font-medium cursor-pointer select-none flex items-center gap-1.5 justify-center",
@@ -6954,7 +7192,7 @@ function ImportBody({ imp }) {
   return jsxs30("div", {
     className: "flex flex-col gap-2",
     children: [
-      jsx31("div", { children: "Replaces this chat's WHOLE context with the messages from the folder. Order is the file number. Irreversible." }),
+      jsx31("div", { children: "Adds the folder's messages before (head) or after (tail) this chat's context, or replaces the WHOLE context with them. Order is the file number. Irreversible." }),
       jsxs30("div", {
         className: "flex items-center gap-1",
         children: [
@@ -7001,7 +7239,8 @@ function ImportBody({ imp }) {
         children: check.error ? String(check.error) : `${check.files || 0} files \u2192 ${check.messages || 0} messages` + (roles ? ` (${roles})` : "") + (problems.length ? `
 ${problems.length} problem(s):
 ` + problems.slice(0, 8).join("\n") + (problems.length > 8 ? `
-\u2026 and ${problems.length - 8} more` : "") : "\npairs OK \u2014 ready to import")
+\u2026 and ${problems.length - 8} more` : "") : `
+You gonna import: ${check.messages || 0} messages`)
       }, "result") : null,
       imp.note && imp.ok === false ? jsx31("div", { style: { color: "var(--ui-red)" }, children: imp.note }, "note") : null
     ]
@@ -7025,7 +7264,7 @@ function PromptMirror() {
   const tapeRef = useRef6(null);
   const headRef = useRef6(null);
   const [railBoxes, setRailBoxes] = useState11({});
-  function railDrag(read, write) {
+  function railDrag(key, read, write) {
     function mark(id, add) {
       const marks = read();
       if (!!marks[id] === add) return;
@@ -7037,12 +7276,12 @@ function PromptMirror() {
     return {
       onDown: (id) => {
         const add = !read()[id];
-        dragRef.current = { read, mode: add ? "add" : "remove" };
+        dragRef.current = { key, mode: add ? "add" : "remove" };
         mark(id, add);
       },
       onEnter: (id) => {
         const drag = dragRef.current;
-        if (!drag || drag.read !== read) return;
+        if (!drag || drag.key !== key) return;
         mark(id, drag.mode === "add");
       }
     };
@@ -7280,7 +7519,7 @@ function PromptMirror() {
       picked: exp.picked,
       paint: EXPORT_PAINT,
       setPicks: setExportPicks,
-      drag: railDrag(readExport, setExportPicks),
+      drag: railDrag("export", readExport, setExportPicks),
       onClose: () => setExportMode(false)
     });
   }
@@ -7290,7 +7529,7 @@ function PromptMirror() {
       picked: addrOp.picked,
       paint: ADDR_PAINT[addrOp.kind],
       setPicks: setAddrOpPicks,
-      drag: railDrag(readAddrOp, setAddrOpPicks),
+      drag: railDrag(addrOp.kind, readAddrOp, setAddrOpPicks),
       onClose: () => setAddrOpMode(false)
     });
   }
@@ -7632,9 +7871,18 @@ function PromptMirror() {
         body: jsx31(ImportBody, { imp }),
         busy: !!imp.busy,
         canConfirm: !!(imp.check && imp.check.ok === true && imp.check.folder === imp.folder),
-        onConfirm: () => {
-          applyImport();
-        },
+        // Три режима (Plan27, владелец): главная — `Replace session`, крупнее.
+        actions: [
+          { key: "head", label: "Add to head", onClick: () => {
+            applyImport("head");
+          } },
+          { key: "tail", label: "Add to tail", onClick: () => {
+            applyImport("tail");
+          } },
+          { key: "replace", label: "Replace session", main: true, onClick: () => {
+            applyImport("replace");
+          } }
+        ],
         onCancel: () => closeImport()
       }, "confirm-import")
       // НИЖНЕЙ ПОЛОСЫ ДЕЙСТВИЙ БОЛЬШЕ НЕТ (владелец, 2026-09-23: «эту панель можно удалить»).

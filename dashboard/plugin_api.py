@@ -113,13 +113,32 @@ _ENVELOPE_TOOLS = frozenset({"write_file", "patch"})
 # FileTag tail is no longer EMITTED (2026-09-03) but is still matched, so rows
 # stored before that keep resolving. Not anchored to the line start - read_file
 # wraps its whole header in the opened file's comment syntax.
-_OP_IN_HEADER = re.compile(r"Operation ID:\s*([0-9a-fA-F]{4,}(?:x[0-9a-fA-F]{2,4})?)")
+#
+# The words (`Operation ID`, `File`) come from the tool dictionary (Plan28,
+# `file_ops/_vocab.py`), so the regexes are built on first use: `_header_re`.
+_HEADER_RES: dict = {}
 
+
+def _header_re(key: str):
+    """`op` — the address in a header line; `file` — the path after the `File` word."""
+    if not _HEADER_RES:
+        vocab = _load_file_ops(_VOCAB_MODULE, "_vocab.py")
+        op = vocab.COMMON["op"] if vocab else "Operation ID"
+        file_word = vocab.header("read_file")["file"] if vocab else "File"
+        _HEADER_RES["op"] = re.compile(
+            re.escape(op) + r":\s*([0-9a-fA-F]{4,}(?:x[0-9a-fA-F]{2,4})?)")
+        _HEADER_RES["file"] = re.compile(re.escape(file_word) + r":\s*(\S.*)")
+        _HEADER_RES["file_word"] = file_word + ":"
+    return _HEADER_RES[key]
+
+
+# Signals are header ROLES (Plan28): the word is the dictionary's, `role:` is searched.
+# A literal (not a role) is marked by a leading `=`.
 _TOOL_SIGNALS = {
-    "read_file": ("FileTag:", "Size:"),
-    "write_file": ("Encoding:",),
-    "patch": ("Patched:", "Replacements:", "Lines:"),
-    "search_files": ("Found:",),
+    "read_file": ("file_tag", "size"),
+    "write_file": ("encoding",),
+    "patch": ("patched", "replacements", "lines"),
+    "search_files": ("found",),
     # terminal — the built-in answers with raw JSON, ours with labeled plain
     # text, so `_is_ours`'s "still JSON → not ours" check already carries most
     # of the weight here. These two are the positive proof on top of it:
@@ -130,20 +149,20 @@ _TOOL_SIGNALS = {
     #     and no exit code at all — without it those rows would be dropped.
     # Both are literals in our own code, not configurable symbols, same rule
     # as the four above.
-    "terminal": ('(raw: "exit_code"', "Session id:"),
+    "terminal": ('=(raw: "exit_code"', "session_id"),
     # execute_code — same reasoning as terminal: the built-in answers with raw
     # JSON, ours with labeled text, so `_is_ours`'s "still JSON → not ours"
     # carries most of it. `Stdout bytes captured:` is the strongest positive:
     # it is our _LABELS wording for their `stdout_bytes_captured` key, and it
     # appeared in every live sample. `Tool calls:` is the same kind of label
     # and covers a script that captured no stdout at all.
-    "execute_code": ("Stdout bytes captured:", "Tool calls:", "Status:"),
+    "execute_code": ("stdout_bytes_captured", "tool_calls_made", "status"),
     # vision_analyze — `Success:` is our label for their `success` field and is
     # a head key, so it is present whenever the answer is TEXT at all. Note
     # what this correctly does NOT match: on the native-vision fast path their
     # handler returns a `_multimodal` DICT that our wrapper passes through
     # untouched, so that row is not our text and must not be claimed as ours.
-    "vision_analyze": ("Success:", "Scale note:"),
+    "vision_analyze": ("success", "scale_note"),
 }
 
 
@@ -300,6 +319,19 @@ def _declared_state(content: str) -> str:
 # a thin shell. Same discipline the desktop half is held to.
 # ---------------------------------------------------------------------------
 
+def _tool_signals(tool: str) -> tuple:
+    """`_TOOL_SIGNALS[tool]` as strings to search: a role → `<its word>:`, `=literal` → literal."""
+    vocab = _load_file_ops(_VOCAB_MODULE, "_vocab.py")
+    words = vocab.header(tool) if vocab is not None else {}
+    out = []
+    for sig in _TOOL_SIGNALS.get(tool, ()):
+        if sig.startswith("="):
+            out.append(sig[1:])
+        elif sig in words:
+            out.append(words[sig] + ":")
+    return tuple(out)
+
+
 def _is_ours(row) -> bool:
     """True when this row is a result from OUR handler.
 
@@ -360,7 +392,7 @@ def _is_ours(row) -> bool:
     if body.lstrip().startswith("{"):
         return False
 
-    return any(sig in body for sig in _TOOL_SIGNALS.get(tool, ()))
+    return any(sig in body for sig in _tool_signals(tool))
 
 
 def _args_index(rows) -> dict:
@@ -414,10 +446,11 @@ def _path_from_header(content: str):
     later would be file CONTENT, not our metadata.
     """
     for line in (content or "").split("\n", 6)[:6]:
-        idx = line.find("File:")
+        word = _header_re("file_word")
+        idx = line.find(word)
         if idx == -1:
             continue
-        tail = line[idx + len("File:"):].strip()
+        tail = line[idx + len(word):].strip()
         # Strip the language-aware comment closer (`-->`, `*/`, ...) that the
         # commenter may have appended.
         for closer in ("-->", "*/", "--}}", "#}"):
@@ -440,7 +473,7 @@ def _op_from_header(content: str):
     is not anchored to the start of the line.
     """
     for line in (content or "").split("\n", 4)[:4]:
-        found = _OP_IN_HEADER.search(line)
+        found = _header_re("op").search(line)
         if found:
             return found.group(1)
     return None
@@ -471,7 +504,7 @@ def _kind(content: str) -> str:
 
 
 # Код выхода в НАШЕЙ шапке (`terminal`) — та же строка, что читает `_tool_text._facade_exit_code`.
-_EXIT_LINE_RE = re.compile(r"^Exit code:\s*(-?\d+)", re.MULTILINE)
+_EXIT_LINE_RE = re.compile(r"^\W*Exit code:\s*(-?\d+)", re.MULTILINE)
 
 
 def _row_kind(content: str) -> str:
@@ -604,6 +637,33 @@ def _session_estimator(tk, session: str) -> dict:
             "mult": (entry or {}).get("mult") or 1.0, "markup": (entry or {}).get("markup") or {}}
 
 
+def _count_lines(text) -> int:
+    """Строки в тексте вызова: пусто — 0, завершающий перевод строки новой не добавляет."""
+    if not isinstance(text, str) or text == "":
+        return 0
+    n = text.count("\n") + 1
+    return n - 1 if text.endswith("\n") else n
+
+
+# Ответ, после которого файл НЕ менялся: правки не было или это пробный прогон.
+_NOTHING_WRITTEN_RE = re.compile(r"^\W*(Unchanged|Dry run):", re.MULTILINE)
+
+
+def _diff_from_args(tool, args):
+    """Сколько строк вызов ЗАЯВЛЯЕТ изменить — когда конверта с фактами нет (`ui_json: off`).
+
+    Парная к `desktop/src/core.js::diffFromArgs` (контракт C1: живой поток и `/ops` не разъезжаются).
+    Оценка, не факт; точные числа — журнал (`fact.added` / `fact.removed`).
+    """
+    args = args or {}
+    if tool == "patch" and (isinstance(args.get("new_string"), str) or isinstance(args.get("old_string"), str)):
+        return {"added": _count_lines(args.get("new_string")), "removed": _count_lines(args.get("old_string"))}
+    if tool == "write_file" and isinstance(args.get("content"), str):
+        return {"added": _count_lines(args["content"]),
+                "removed": 0 if args.get("insert_line") is not None else None}
+    return None
+
+
 def _brick(row, args) -> dict:
     """One operation, in the shape the panel consumes (contract C1).
 
@@ -635,6 +695,11 @@ def _brick(row, args) -> dict:
     # the panel from presenting a truncated remnant as the full output.
     was_compacted = not row.get("active") and bool(row.get("compacted"))
 
+    kind = _kind_from(facts, content)
+    # Без конверта (`ui_json: off`) счётчики строк — оценка по аргументам вызова.
+    guess = (_diff_from_args(tool, args)
+             if not facts and kind == "ok" and not _NOTHING_WRITTEN_RE.search(content or "") else None)
+
     return {
         "tool": tool,
         "ts": row.get("timestamp"),
@@ -645,14 +710,14 @@ def _brick(row, args) -> dict:
         "body": content,
         # Факты уже сняты выше — передаём их, а не заставляем _kind искать конверт заново
         # в уже очищенном теле (иначе он не найдёт ничего и решит "ok").
-        "kind": _kind_from(facts, content),
+        "kind": kind,
         "meta": {
             "row_id": row.get("id"),
             # Counters from our own envelope — the panel shows them as "+1 −1 ×1" instead of
             # making the human expand the card to find out what happened.
             "replacements": (facts or {}).get("replacements"),
-            "added": (facts or {}).get("added"),
-            "removed": (facts or {}).get("removed"),
+            "added": (facts or {}).get("added", guess["added"] if guess else None),
+            "removed": (facts or {}).get("removed", guess["removed"] if guess else None),
             "compacted": was_compacted,
             "args_matched": bool(args),
             # The state the row DECLARES about itself (`State: removed_from_context`), for
@@ -1246,7 +1311,7 @@ def ping():
 # so a new ledger field cannot leak into a frozen contract by accident: the
 # contract is the promise, and the ledger is free to grow behind it.
 _FACT_KEYS = ("op", "tool", "path", "from", "to", "total", "ts",
-              "nested", "out_lines", "cmd_head", "cmd_sidecar")
+              "nested", "seen", "out_lines", "cmd_head", "cmd_sidecar")
 
 # The state of an operation that was DELIBERATELY erased, and we have the record to prove it
 # (`_ledger.EVENT_ERASED`). Not the same as "the ledger remembers it and the database has no
@@ -1532,8 +1597,7 @@ def _call_names(row) -> list:
 # стакане Operations — здесь читаем из ПОЛНОГО `content`, не из обрезанного `preview`
 # (владелец, 2026-09-15: «на поверхности каждой операции должен выводиться её номер и файл»).
 # Чужой тул или нефайловая операция (`terminal`, `search_files`) честно даёт "" — не мок.
-_OP_RE = re.compile(r"Operation ID:\s*([0-9a-fA-F]{4,}(?:x[0-9a-fA-F]{2,4})?)")
-_FILE_RE = re.compile(r"File:\s*(\S.*)")
+# The pair is `_header_re("op")` / `_header_re("file")` — words from the dictionary.
 
 
 # Ключи аргументов, которые стоит показать как короткий хинт вызова (Plan19-Task5:
@@ -1745,6 +1809,11 @@ def messages(session: str = "", index: int = 1, preview: int = 0, full: str = ""
     # worth seeing.
     fresh = ledger.read_ledger(session) or [] if index else entries
     recorded = {str(e.get("msg") or ""): e for e in ledger.message_records(fresh)}
+    # Операции, привезённые импортом (Plan27): `edited` и `imported_from` записи — на чип по
+    # `tool_call_id` (поправка 17). Род различает `is_event`, как везде.
+    imported_ops = {str(e.get("tool_call_id")): e for e in fresh
+                    if not ledger.is_event(e) and e.get("session_src") == "import"
+                    and e.get("tool_call_id")}
 
     repairs = _their_repairs(msgindex, rows)
     # Токены строки — НАШ оценщик (Plan24, владелец 2026-09-29: «на наш оценщик завязать оценку
@@ -1781,10 +1850,15 @@ def messages(session: str = "", index: int = 1, preview: int = 0, full: str = ""
             if stored != len(content):
                 fact["db_chars"] = stored
         if str(fact.get("role") or "") == "tool":
-            op_m = _OP_RE.search(content)
+            imported = imported_ops.get(str(msg.get("tool_call_id") or ""))
+            if imported is not None:
+                fact["imported_from"] = imported.get("imported_from")
+                if imported.get("edited"):
+                    fact["edited"] = True
+            op_m = _header_re("op").search(content)
             if op_m:
                 fact["op"] = op_m.group(1)
-            file_m = _FILE_RE.search(content)
+            file_m = _header_re("file").search(content)
             if file_m:
                 full_path = file_m.group(1).strip().replace("\\", "/")
                 fact["file"] = full_path.rsplit("/", 1)[-1]
@@ -2445,13 +2519,20 @@ def import_check(folder: str) -> dict:
             "messages": len(rows), "roles": roles, "problems": problems}
 
 
+# Режимы импорта — та же тройка, что `context_ctl/_import.MODES` (Plan27). Здесь своя копия:
+# модуль импорта грузится лениво, а маршрут проверяет тело до него.
+IMPORT_MODES = ("replace", "tail", "head")
+
+
 @router.post("/context-import")
 async def context_import_post(request: Request):
     """Импорт сессии из папки выгрузки С ПЕРЕЗАПИСЬЮ текущей ленты (владелец, 2026-09-29).
 
-    Body: `{session, folder, apply}`. Без `apply` — только проверка (`import_check`), ничего не
-    пишет и движка не требует. С `apply: true` — `engine.apply_import`: вся живая лента сессии
-    заменяется собранной из файлов. IRREVERSIBLE для контекста (прежние строки — в их архиве).
+    Body: `{session, folder, apply, mode?}`. Без `apply` — только проверка (`import_check`),
+    ничего не пишет и движка не требует. С `apply: true` — `engine.apply_import(folder, mode)`:
+    `mode` `replace` (по умолчанию — вся живая лента заменяется собранной из файлов), `tail`
+    (дописать в хвост), `head` (вставить в голову) — `Plan27`. IRREVERSIBLE для контекста
+    (при `replace` прежние строки — в их архиве).
     """
     try:
         body = await request.json()
@@ -2467,6 +2548,10 @@ async def context_import_post(request: Request):
         return {"session": session, **import_check(folder)}
     if not session:
         return {"ok": False, "error": "session is required"}
+    mode = str(body.get("mode") or "replace").strip()
+    if mode not in IMPORT_MODES:
+        return {"ok": False, "session": session,
+                "error": f"mode must be one of {', '.join(IMPORT_MODES)}"}
     engine, reason = _engine_for(session)
     if engine is None:
         return {"ok": False, "session": session, "error": reason}
@@ -2474,7 +2559,9 @@ async def context_import_post(request: Request):
         return {"ok": False, "session": session,
                 "error": "the live engine has no import yet — restart the Hermes client"}
     try:
-        report = engine.apply_import(folder)
+        # Старый движок (до `Plan27`) режима не знает: только `replace`, иначе — внятный отказ.
+        report = (engine.apply_import(folder) if mode == "replace"
+                  else engine.apply_import(folder, mode))
     except Exception as exc:  # noqa: BLE001 - report, never raise
         return {"ok": False, "session": session, "error": f"{type(exc).__name__}: {exc}"}
     if not isinstance(report, dict):
@@ -2896,8 +2983,16 @@ async def context_export_post(request: Request):
     if error:
         return {"ok": False, "session": session, "error": error}
 
+    # Снимок везёт спутник `ledger.jsonl` (Plan27-Task01): записи ОПЕРАЦИЙ сессии, род
+    # различает `_ledger.is_event` — единственное место этого знания.
+    snapshot = bool(body.get("snapshot"))
+    operations = None
+    if snapshot:
+        ledger = _load_ledger()
+        if ledger is not None:
+            operations = [e for e in (ledger.read_ledger(session) or []) if not ledger.is_event(e)]
     report = exporter.export(session, rows, addresses, msgs, root=_export_root(),
-                             snapshot=bool(body.get("snapshot")))
+                             snapshot=snapshot, operations=operations)
     ok = bool(report.get("written")) and not report.get("errors")
     return {"ok": ok, **report}
 
@@ -2942,6 +3037,61 @@ def _load_home():
     return mod
 
 
+_VOCAB_MODULE = "hermes_filetools_dashboard_vocab"
+_SCHEMA_LOADER_MODULE = "hermes_filetools_dashboard_schema_loader"
+
+
+def _load_file_ops(name: str, filename: str):
+    """`file_ops/<filename>` loaded by path under `name`, or None. Same lazy, fail-closed
+    shape as the other loaders here."""
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    path = _PLUGIN_ROOT / "file_ops" / filename
+    if not path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:  # noqa: BLE001 - the route degrades, never 500s
+        sys.modules.pop(name, None)
+        return None
+    return mod
+
+
+def _tool_dictionary(slot: str, cfg: dict) -> dict:
+    """The tool dictionary for one slot (`deferred/08`, panel amendment 19): `icon` (a
+    setting, `tools.<slot>.icon`), `header` (`role -> word` of its answer's header lines) and
+    `call` (`params` from the slot's schema file, `body` — arguments shown as text).
+
+    Every part degrades on its own to empty: a panel with no dictionary falls back to its
+    first-frame defaults, which is a cosmetic loss, while a 500 on `/config` is not.
+    """
+    vocab = _load_file_ops(_VOCAB_MODULE, "_vocab.py")
+    header, body, params = {}, [], []
+    if vocab is not None:
+        try:
+            header = dict(vocab.header(slot))
+            body = list(vocab.CALL_BODY.get(slot, []))
+            # An explicit `schema:` in the slot wins, as it does at registration (`__init__.py`).
+            schema_name = (str(cfg.get("schema") or "")
+                           or vocab.schema_file(slot, str(cfg.get("path") or "new")))
+            loader = _load_file_ops(_SCHEMA_LOADER_MODULE, "_schema_loader.py") if schema_name else None
+            if loader is not None:
+                params = vocab.call_params(loader.load_schema(schema_name))
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "icon": str(cfg.get("icon") or ""),
+        "header": header,
+        "call": {"params": params, "body": body},
+    }
+
+
 def _param_type(value, has_options: bool) -> str:
     if isinstance(value, bool):
         return "bool"
@@ -2972,9 +3122,17 @@ def _formatting(data) -> dict:
     for key, fallback in _FORMAT_DEFAULTS.items():
         value = src.get(key)
         sym[key] = str(value) if value else fallback
+    # Элементы. Имена — по РОЛИ в тексте, а не по символу: роль переживает смену символа.
+    # Правило сборки — ОДНО, `_vocab.format_elements` (Plan28): его же зовут тулы и загрузчик
+    # схем. Запасная копия здесь — на случай, если модуль не загрузился: `/config` не падает.
+    vocab = _load_file_ops(_VOCAB_MODULE, "_vocab.py")
+    if vocab is not None:
+        try:
+            return vocab.format_elements(sym)
+        except Exception:  # noqa: BLE001
+            pass
     return {
         **sym,
-        # Элементы. Имена — по РОЛИ в тексте, а не по символу: роль переживает смену символа.
         "header_separator": sym["separator_symbol"] * 3,
         "block_open": sym["block_symbol"] + "BLOCK",
         "block_close": sym["block_symbol"] + "END",
@@ -3043,6 +3201,8 @@ def read_config() -> dict:
             "path": str(cfg.get("path") or "new"),
             "help": str(cfg.get("help") or ""),
             "params": params,
+            # Справочник тула (`deferred/08`): иконка, слова шапки, параметры вызова.
+            **_tool_dictionary(str(slot), cfg),
         }
 
     disabled_help = data.get("disabled_tools_help") or {}

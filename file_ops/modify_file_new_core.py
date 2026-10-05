@@ -33,6 +33,7 @@ try:  # plugin mode
     from ._tool_text import op_line
     from . import _drift
     from . import _ledger
+    from . import _vocab
 except ImportError:  # console mode
     from mocks import resolve_path_for_tool, file_ops  # type: ignore
     from file_backend import FileBackend, add_line_numbers  # type: ignore
@@ -44,6 +45,7 @@ except ImportError:  # console mode
     from _tool_text import op_line  # type: ignore
     import _drift  # type: ignore
     import _ledger  # type: ignore
+    import _vocab  # type: ignore
 
 
 MAX_READ_BYTES = 50 * 1024 * 1024
@@ -241,8 +243,9 @@ def _echo_block(c, block_symbol: str, tag: str, file_lines: list, first: int, la
             ("→" + ln.lstrip()) if (changed and (first + i) in changed) else ln  # → = "→"
             for i, ln in enumerate(numbered_body)
         ]
-    return ([c(f"{block_symbol}BLOCK {tag} : {first}-{last}")] + body
-            + [c(f"{block_symbol}END {tag} : {last}")])
+    els = _vocab.format_elements({"block_symbol": block_symbol})
+    return ([c(f"{els['block_open']} {tag} : {first}-{last}")] + body
+            + [c(f"{els['block_close']} {tag} : {last}")])
 
 
 def _command_text(path, line, old_string, new_string, flags) -> str:
@@ -318,8 +321,10 @@ def modify_file_tool_new(path: str = None, line: int = None, old_string: str = N
     # out of the file - same hazard, same single choke point as search_files.
     text, controls = escape_controls(text)
     if controls:
-        text += ("\nNote: " + str(controls) + " control char(s) above are shown "
-                 "as pictures (␀-style); the file itself is unchanged.")
+        text += "\n" + make_commenter(str(path or ""), symbols)(
+            _vocab.header("patch")["note"] + ": " + str(controls)
+            + " control char(s) above are shown "
+            "as pictures (␀-style); the file itself is unchanged.")
     if text.lstrip().startswith("ERROR"):
         facts["success"] = False
         facts.setdefault("error", text.strip().splitlines()[0])
@@ -330,7 +335,8 @@ def modify_file_tool_new(path: str = None, line: int = None, old_string: str = N
     # so an address above an error line would report failures as successes.
     first = op_line(op)
     if first and facts.get("success"):
-        text = first + "\n" + text
+        # Metadata like the rest of this header: the comment of the file's language.
+        text = make_commenter(str(path or ""), symbols)(first) + "\n" + text
     out = ui_envelope(ui_json, facts, text)
     if facts.get("success"):
         _note_op("patch", out, path, session_id, task_id, facts, op,
@@ -342,7 +348,9 @@ def _patch_impl(path, line, old_string, new_string, flags, base_dir, task_id,
                 symbols, facts: dict) -> str:
     symbols = symbols or DEFAULT_SYMBOLS
     block_symbol = symbols.get("block_symbol", DEFAULT_SYMBOLS["block_symbol"])
-    separator = symbols.get("separator_symbol", DEFAULT_SYMBOLS["separator_symbol"]) * 3
+    separator = _vocab.format_elements({**DEFAULT_SYMBOLS, **symbols})["header_separator"]
+    # Header words from the tool dictionary (Plan28).
+    w = _vocab.header("patch")
 
     if not path or not isinstance(path, str):
         return "ERROR: patch: missing required field 'path'."
@@ -498,12 +506,12 @@ def _patch_impl(path, line, old_string, new_string, flags, base_dir, task_id,
         # ── dry run: everything except the write ────────────────────────
         if dry_run:
             end_line = change_start + core_old.count("\n")
-            head = [c(f"Dry run: {resolved_str} - no write performed."),
-                    c(f"Would replace: {occurrences} occurrence(s), "
+            head = [c(f"{w['dry_run']}: {resolved_str} - no write performed."),
+                    c(f"{w['would_replace']}: {occurrences} occurrence(s), "
                       f"line {change_start}"
                       + (f"-{end_line}" if end_line != change_start else "")),
-                    c(f"Lines: {old_total} (unchanged)")]
-            head += [c(f"Note: {n}") for n in notes]
+                    c(f"{w['lines']}: {old_total} (unchanged)")]
+            head += [c(f"{w['note']}: {n}") for n in notes]
             head.append(c(separator))
             # Plan11-Task02: position and length ARE recorded for a dry run,
             # deliberately. The model looked HERE, and that is worth showing on
@@ -529,10 +537,10 @@ def _patch_impl(path, line, old_string, new_string, flags, base_dir, task_id,
         # no write (file_operations.py:2244). Reporting "Patched" here would be
         # a lie the model then does line arithmetic on - see Vision §8.
         if getattr(result, "no_change", False):
-            head = [c(f"Unchanged: {resolved_str}"),
+            head = [c(f"{w['unchanged']}: {resolved_str}"),
                     c("Already applied - the file already contains the target text. "
                       "No write performed; do not re-send this patch."),
-                    c(f"Lines: {old_total}")]
+                    c(f"{w['lines']}: {old_total}")]
             # Plan11-Task02: same reasoning as the dry run — the target place is
             # a fact worth placing on the bar, and with no `added`/`removed`
             # there is no shift. The end is derived the way dry-run derives it,
@@ -541,12 +549,12 @@ def _patch_impl(path, line, old_string, new_string, flags, base_dir, task_id,
                          from_line=change_start,
                          to_line=change_start + core_old.count("\n"),
                          total=old_total)
-            return "\n".join(head + [c(f"Note: {n}") for n in notes])
+            return "\n".join(head + [c(f"{w['note']}: {n}") for n in notes])
 
         # ── echo: a real read AFTER the write, not a preview ─────────────
         new_content, err = _read_text(be, resolved_str)
         if err:
-            return (f"Patched: {resolved_str}\n"
+            return (f"{w['patched']}: {resolved_str}\n"
                     f"ERROR: the write succeeded but the file could not be re-read "
                     f"for confirmation: {err}")
 
@@ -559,12 +567,12 @@ def _patch_impl(path, line, old_string, new_string, flags, base_dir, task_id,
         change_end = change_start + core_new.count("\n")
         tag = resolve_file_tag(new_content, block_symbol)
 
-        header = [c(f"Patched: {resolved_str}")]
+        header = [c(f"{w['patched']}: {resolved_str}")]
         if delta:
-            header.append(c(f"Lines: {old_total} -> {new_total} "
+            header.append(c(f"{w['lines']}: {old_total} -> {new_total} "
                             f"({delta:+d} from line {change_start})"))
         else:
-            header.append(c(f"Lines: {new_total} (unchanged)"))
+            header.append(c(f"{w['lines']}: {new_total} (unchanged)"))
         # OUR count, never the backend's. The real backend's PatchResult has no
         # occurrence count at all - only files_modified, a list of PATHS, which
         # is length 1 for any single-file edit, so FileBackend can only ever
@@ -572,10 +580,10 @@ def _patch_impl(path, line, old_string, new_string, flags, base_dir, task_id,
         # works around it with its own pre-count). We already hold the file
         # content, so we know the true number exactly - and the mock backend
         # DOES count correctly, which is why only a live run exposes this.
-        header.append(c(f"Replacements: {occurrences}"))
+        header.append(c(f"{w['replacements']}: {occurrences}"))
         if quoted:
             notes.append(QUOTE_HINT)
-        header += [c(f"Note: {n}") for n in notes]
+        header += [c(f"{w['note']}: {n}") for n in notes]
         header.append(c(separator))
 
         facts.update(replacements=occurrences,
@@ -615,9 +623,11 @@ def _ambiguous(c, block_symbol: str, separator: str, content: str, file_lines: l
            "one you want, or include more surrounding text in old_string."
            if tie else
            "Fix: re-send with `line` set to the site you want (you passed 0 = anywhere).")
-    out = [c(f"ERROR: patch: {len(cands)} possible matches {where} - refusing to "
-             f"guess which one you meant."),
-           c(fix)]
+    # An error is content, not metadata: bare, so the answer STARTS with "ERROR" and every
+    # consumer that decides failure by that prefix sees it. The fix says what to do - same.
+    out = [f"ERROR: patch: {len(cands)} possible matches {where} - refusing to "
+           f"guess which one you meant.",
+           fix]
     if len(shown) < len(cands):
         out.append(c(f"Showing the first {len(shown)}."))
     out.append(c(separator))

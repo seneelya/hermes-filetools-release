@@ -401,7 +401,8 @@ def test_l14_nested_flag_is_absent_unless_inside_the_sandbox(home):
     try:
         _ledger.note_read(text="from a script", path="/b.py", session="s")
     finally:
-        _ledger.exit_sandbox(token)
+        pending = _ledger.exit_sandbox(token)
+    _ledger.flush_sandbox(pending, "")
 
     _ledger.note_read(text="after", path="/c.py", session="s")
 

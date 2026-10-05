@@ -20,16 +20,18 @@ try:  # plugin mode
     from .flags import (parse_flags_report, has_flag, flag_int, unknown_flags,
                         FlagError, QUOTE_HINT, is_quotes_only)
     from ._tool_text import op_line
-    from ._new_format import escape_controls
+    from ._new_format import escape_controls, make_commenter
     from . import _ledger
+    from . import _vocab
 except ImportError:  # console mode
     from mocks import resolve_path_for_tool, file_ops, normalize_search_pagination  # type: ignore
     from file_backend import FileBackend  # type: ignore
     from flags import (parse_flags_report, has_flag, flag_int, unknown_flags,  # type: ignore
                        FlagError, QUOTE_HINT, is_quotes_only)
     from _tool_text import op_line  # type: ignore
-    from _new_format import escape_controls  # type: ignore
+    from _new_format import escape_controls, make_commenter  # type: ignore
     import _ledger  # type: ignore
+    import _vocab  # type: ignore
 
 
 def _as_int(value, default):
@@ -117,7 +119,8 @@ def sift_files_tool_new(path: str, pattern: str, glob: str = "*", flags: str = N
     # implementation returns from half a dozen places.
     out, controls = escape_controls(out)
     if controls:
-        out += ("\nNote: " + str(controls) + " control char(s) above are shown "
+        out += ("\n" + _vocab.header("search_files")["note"] + ": " + str(controls)
+                + " control char(s) above are shown "
                 "as pictures (␀-style); the files themselves are unchanged.")
     try:
         _ledger.note_op(tool="search_files", text=out, path=str(path or ""),
@@ -149,7 +152,13 @@ def _sift_impl(path: str, pattern: str, glob: str = "*", flags: str = None,
     if quoted_pattern:
         pattern = ""
 
-    sep = (symbols or {}).get("separator_symbol", "○") * 3  # ○ = "○" ("○")
+    sep = _vocab.format_elements(
+        {"separator_symbol": (symbols or {}).get("separator_symbol", "○")})["header_separator"]
+    # Header words from the tool dictionary (Plan28).
+    w = _vocab.header("search_files")
+    # The answer has no file, so no native comment syntax: every METADATA line (address, echo,
+    # counts, hints, the divider) wears the fallback symbol; the body below the divider does not.
+    c = make_commenter("", symbols)
 
     parsed, quoted = parse_flags_report(flags)
     unknown = unknown_flags(parsed, KNOWN_FLAGS)
@@ -203,9 +212,9 @@ def _sift_impl(path: str, pattern: str, glob: str = "*", flags: str = None,
     # tail: this answer spans MANY files, so a tag taken from one of them would
     # be a supplement that misleads rather than helps.
     first = op_line(op)
-    header_prefix = (first + "\n" if first else "") + f"Search: {search_glob}\n"
+    header_prefix = (c(first) + "\n" if first else "") + c(f"{w['search']}: {search_glob}") + "\n"
     if quoted or quoted_pattern:
-        header_prefix += QUOTE_HINT + "\n"
+        header_prefix += c(QUOTE_HINT) + "\n"
 
     # Real backend's own `truncated`/`total_count` are unreliable when
     # context=0: core fetches EXACTLY `limit` rows through a shell `head`
@@ -248,15 +257,15 @@ def _sift_impl(path: str, pattern: str, glob: str = "*", flags: str = None,
         # answer knows a LOWER BOUND, not a total. Seen live 2026-09-03:
         # "Found: 4 matches (showing 3)" followed by a continuation that
         # returned 2 more - a model that trusted the 4 would have stopped.
-        found = (f"Found: at least {total} file(s)" if truncated
-                 else f"Found: {total} file(s)")
+        found = (f"{w['found']}: at least {total} file(s)" if truncated
+                 else f"{w['found']}: {total} file(s)")
         if truncated:
             found += f", truncated (showing {len(files)})"
-        lines.append(found)
+        lines.append(c(found))
         if truncated:
             next_offset = offset + limit
-            lines.append(f'Hint: truncated — flags="{_continue_flags(flags, next_offset)}" to continue.')
-        lines.append(sep)
+            lines.append(c(f'{w["hint"]}: truncated — flags="{_continue_flags(flags, next_offset)}" to continue.'))
+        lines.append(c(sep))
         lines.extend(files)
         return "\n".join(lines)
 
@@ -311,28 +320,28 @@ def _sift_impl(path: str, pattern: str, glob: str = "*", flags: str = None,
     lines = [header_prefix.rstrip("\n")]
 
     if files_only:
-        found = f"Found: {len(groups)} file(s) with matches"
+        found = f"{w['found']}: {len(groups)} file(s) with matches"
         if truncated:
             found += f" (of at least {total_count} matches)"
-        lines.append(found)
+        lines.append(c(found))
         if truncated:
             next_offset = offset + limit
-            lines.append(f'Hint: truncated — flags="{_continue_flags(flags, next_offset)}" to continue.')
-        lines.append(sep)
+            lines.append(c(f'{w["hint"]}: truncated — flags="{_continue_flags(flags, next_offset)}" to continue.'))
+        lines.append(c(sep))
         lines.extend(_to_relative(f, resolved_str) for f in groups.keys())
         return "\n".join(lines)
 
     n_files = len(groups)
     at_least = "at least " if truncated else ""
-    found = (f"Found: {at_least}{total_count} matches in {n_files} "
+    found = (f"{w['found']}: {at_least}{total_count} matches in {n_files} "
              f"file{'s' if n_files != 1 else ''}")
     if truncated:
         found += f" (showing {len(true_matches)})"
-    lines.append(found)
+    lines.append(c(found))
     if truncated:
         next_offset = offset + limit
-        lines.append(f'Hint: truncated — flags="{_continue_flags(flags, next_offset)}" to continue.')
-    lines.append(sep)
+        lines.append(c(f'{w["hint"]}: truncated — flags="{_continue_flags(flags, next_offset)}" to continue.'))
+    lines.append(c(sep))
 
     if tally:
         for f in groups.keys():

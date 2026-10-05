@@ -16,16 +16,20 @@ pure, unit-testable half; `terminal_tool_new()` is the live-only half.
 
 Since Plan04 task 3 the formatting itself lives in `file_ops/_tool_text.py`
 and is shared with the other tools we wrap; what stays here is only what is
-genuinely terminal's — its label map, its field order, and the
-`(raw: "exit_code": N)` tail that two other files regex out of our text.
+genuinely terminal's — its field order and the `(raw: "exit_code": N)` tail
+that two other files regex out of our text. Its label map is terminal's too,
+but it lives in the tool dictionary (`_vocab.LABELS["terminal"]`, 2026-10-05):
+the panel reads the same words.
 """
 
 try:
     from ._tool_text import render_json_result
     from . import _ledger
+    from . import _vocab
 except ImportError:  # console/dev mode - file_ops/ is on sys.path, not a package
     from _tool_text import render_json_result  # type: ignore
     import _ledger  # type: ignore
+    import _vocab  # type: ignore
 
 # Friendly labels for known result keys (collected from hermes-agent's
 # tools/terminal_tool.py return sites, session of 2026-09-01: 17 distinct
@@ -35,28 +39,9 @@ except ImportError:  # console/dev mode - file_ops/ is on sys.path, not a packag
 # they hand the model raw JSON today with zero unpacking on their side, so
 # the model already has to find fields by name either way (confirmed with
 # the user 2026-09-01).
-_LABELS = {
-    "cwd": "Cwd",
-    "session_id": "Session id",
-    "pid": "Pid",
-    "watch_patterns": "Watching",
-    "approval": "Approval",
-    "exit_code_meaning": "Note",
-    "hint": "Hint",
-    "sudo_auth_failed": "Sudo auth failed",
-    "sudo_cache_cleared": "Sudo cache cleared",
-    "status": "Status",
-    "reason": "Reason",
-    "retry_hint": "Retry hint",
-    "traceback": "Traceback",
-    "pty_note": "Pty note",
-    "output_total_chars": "Output total chars",
-    "full_output_path": "Full output path",
-    "truncation_note": "Truncation note",
-    "verification_evidence": "Verification evidence",
-    "exit_code": "Exit code",
-    "error": "Error",
-}
+# The table lives in `_vocab.py` since 2026-10-05 (`deferred/08`): the panel reads the same
+# words over `/config`, and a word printed here but unknown there stops being coloured.
+_LABELS = _vocab.LABELS["terminal"]
 
 # The trailing "(raw: ...)" is not decoration and this is the only place it is
 # produced: agent/context_compressor.py's own compaction summary line regexes
@@ -82,8 +67,8 @@ def render_terminal_result(raw: str, symbols: dict = None, op: str = "") -> str:
     function is the terminal-shaped configuration of it. The separator is the
     SAME boundary read_file puts between its header and the file body, so the
     model reads one convention instead of two and the panel needs no
-    terminal-only branch. Deliberately NOT comment-wrapped the way read_file's
-    header is: this is not a file and there is no language to wrap for.
+    terminal-only branch. Every header line wears the fallback symbol
+    `◆` (no file, so no native comment) except `error`, which is content.
     """
     return render_json_result(
         raw,
