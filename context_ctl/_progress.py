@@ -33,7 +33,7 @@ LABELS = {
     "q2_recount": "checking the topic list",
     "q2_merge": "merging topics",
     "q3_split": "main and minor topics",
-    "q_kinds": "kind of each topic",
+    "q_which_set": "set of questions for each topic",
     "q_talk": "the conversation",
     "q_gate": "which sections to write",
     "q5_settled": "settled decisions",
@@ -48,11 +48,8 @@ LABELS = {
     "q12_additions": "additions",
 }
 
-# Вопросы полной темы: ворота + «пришли» + до пяти за воротами + самопроверка.
-TOPIC_STEPS = 8
-# Поля ворот, каждое `false` снимает один вопрос темы.
-GATE_FIELDS = ("pending_task", "open_items", "errors_fixes", "critical_values", "class_details")
-# Финальные вопросы: запреты и добавления.
+# Финальные вопросы: запреты и добавления. Вопросы темы считает её опросник
+# (`_scenario.Questionnaire.max_steps`, ворота вычитают закрытое — `Plan32.1`).
 FINAL_STEPS = 2
 
 _KEY_RE = re.compile(r"^([^\[]+)(?:\[(\d+)\])?$")
@@ -63,17 +60,6 @@ def label_of(key: str) -> tuple[str, int]:
     m = _KEY_RE.match(str(key or ""))
     name, n = (m.group(1), int(m.group(2) or 0)) if m else (str(key or ""), 0)
     return LABELS.get(name, name), n
-
-
-def planned(done: int, kinds: list, filler: bool) -> int:
-    """Сколько вопросов всего по плану, когда темы и их вкус известны."""
-    per_topic = sum(1 if k == "talk" else TOPIC_STEPS for k in kinds)
-    return done + per_topic + (1 if filler else 0) + FINAL_STEPS
-
-
-def skipped_by_gate(gate: dict) -> int:
-    """Сколько вопросов темы сняли ворота (поле есть и `false`)."""
-    return sum(1 for f in GATE_FIELDS if f in gate and not gate.get(f))
 
 
 def progress(session_id: str, **fields) -> None:

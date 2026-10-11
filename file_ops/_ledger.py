@@ -42,10 +42,36 @@ import io
 import json
 import logging
 import re
+import sys
+import threading
 import time
+import types
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _shared_lock():
+    """ONE lock for every writer of the journal and its counters in this process.
+
+    Live 2026-10-06 (`deferred/20`, session `823f72`): five parallel `read_file`
+    appended in the same millisecond, mode `"a"` on Windows is seek-to-end THEN
+    write, and `0042` landed on top of `0041` — the record was lost, its last
+    bytes (`4"}`) stayed as a torn line. Parallel tool calls and subagents are
+    THREADS of the gateway (their `DaemonThreadPoolExecutor`); one journal is
+    never written by two processes (owner), so a process lock is enough.
+
+    Shared through `sys.modules`, not a module global: this file lives in the
+    process TWICE (the engine imports it as a package, the panel loads it by
+    path — see `_bump`), and two globals would be two locks guarding nothing.
+    Reentrant so a writer can never deadlock on itself.
+    """
+    holder = sys.modules.setdefault("hermes_filetools_ledger_lock",
+                                    types.ModuleType("hermes_filetools_ledger_lock"))
+    return holder.__dict__.setdefault("lock", threading.RLock())
+
+
+_WRITE_LOCK = _shared_lock()
 
 
 def _home_module():
@@ -524,13 +550,17 @@ def _bump(key: str, kind: str, reread: bool = False) -> int:
     и экземпляр с отставшим кешем выдал бы номер, уже названный другим. Поймано
     тестом `test_r3b` 2026-09-09: второй проход маршрута выдал `m000a` там, где
     в файле стояла единица.
+
+    Read-increment-write under `_WRITE_LOCK`: parallel calls of one turn are
+    threads, and two of them between the read and the write take ONE number.
     """
-    number = _counters.get((kind, key))
-    if number is None or reread:
-        number = max(number or 0, _read_counter(key, kind))
-    number += 1
-    _counters[(kind, key)] = number
-    _write_counter(key, number, kind)
+    with _WRITE_LOCK:
+        number = _counters.get((kind, key))
+        if number is None or reread:
+            number = max(number or 0, _read_counter(key, kind))
+        number += 1
+        _counters[(kind, key)] = number
+        _write_counter(key, number, kind)
     return number
 
 
@@ -663,12 +693,18 @@ EVENT_ABSORBED = "absorbed"
 
 
 def note_absorbed(session: str | None, summary: str, members,
-                  by: str = "compact") -> bool:
+                  by: str = "compact", sets=None, preset=None, wrap=None) -> bool:
     """Записать, что сводка `summary` поглотила сообщения `members`. Никогда не бросает.
 
     `summary` и `members` — АДРЕСА сообщений (`m0015`, `["m0002", …]`), не `id` базы: `id`
     пересоздаётся при каждой правке истории, адрес её переживает — тот же довод, по которому
     вся адресация построена на координате.
+
+    `sets` — классификация опроса компакции: `[{"topic", "set"}]`, какой набор вопросов модель
+    выбрала каждой теме (поправка 9 контракта журнала). Нет — поля нет.
+
+    `preset`, `wrap` — у вставки окна LLMOps: ключ пресета окна в момент `Replace` (`dedup`,
+    `summarise`, …) и обёртка, выбранная в окне (`as-it-was`, …) — поправка 10. Нет — полей нет.
     """
     try:
         summary = str(summary or "").strip()
@@ -684,6 +720,10 @@ def note_absorbed(session: str | None, summary: str, members,
             # Каким действием. Сегодня одно (`compact`), но у надгробий это поле уже
             # пригодилось, когда действий стало три.
             "by": str(by or "compact"),
+            **({"sets": [{"topic": str(x.get("topic", "")), "set": str(x.get("set", ""))}
+                         for x in sets if isinstance(x, dict)]} if sets else {}),
+            **({"preset": str(preset)} if preset else {}),
+            **({"wrap": str(wrap)} if wrap else {}),
         }, session)
     except Exception as e:  # noqa: BLE001 — свидетельство не отменяет работы
         logger.debug("filetools ledger: skipped an absorption record for %r: %s",
@@ -751,7 +791,7 @@ def _append(entry: dict, session: str | None) -> bool:
         target = ledger_path(session)
         target.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(entry, ensure_ascii=False)
-        with io.open(target, "a", encoding="utf-8", newline="") as fh:
+        with _WRITE_LOCK, io.open(target, "a", encoding="utf-8", newline="") as fh:
             fh.write(line + "\n")
         return True
     except Exception as e:
@@ -889,9 +929,15 @@ def note_op(
     counts: dict | None = None,
     op: str = "",
     body=None,
+    parts=None,
 ) -> None:
     """Append one entry for a successful operation. Never raises, never returns
     anything the caller could be tempted to put in the model's answer.
+
+    `parts` — when ONE read showed several separate ranges (Plan30: `--line 120,450`, block
+    queries): `[[from, to], ...]`, sorted, not touching. `from`/`to` then span them all, so a
+    reader that knows nothing of `parts` still sees where the read happened (ledger
+    amendment 8); written only for two or more.
 
     `body` — the file lines a read returned, from `from_line` on. Never stored: inside
     execute_code it is what `flush_sandbox` compares against the script's answer.
@@ -931,6 +977,8 @@ def note_op(
         # is a fact, and an empty string that looks like an id is worse.
         if op:
             entry["op"] = op
+        if parts and len(parts) > 1:
+            entry["parts"] = [[int(a), int(b)] for a, b in parts]
 
         # ── Plan11-Task02: the three facts the panel cannot derive ──────────
         #
@@ -1007,8 +1055,8 @@ def _write_entry(entry: dict) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(entry, ensure_ascii=False)
     # newline="" keeps Windows from turning our "\n" into "\r\n": the file
-    # must read back byte-identical wherever it was written.
-    with io.open(target, "a", encoding="utf-8", newline="") as fh:
+    # must read back byte-identical wherever it was written. The lock: `_shared_lock`.
+    with _WRITE_LOCK, io.open(target, "a", encoding="utf-8", newline="") as fh:
         fh.write(line + "\n")
 
 

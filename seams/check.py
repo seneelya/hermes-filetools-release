@@ -123,6 +123,12 @@ def run(root: str, registry: dict, tests: dict | None = None) -> dict:
             if status == "failed":
                 row["verdict"] = FAIL
                 row["note"] = (note + " · " if note else "") + f"test FAILED: {asserted}"
+            elif status == "not run":
+                # Доказательство НЕ получено — это не «зелёно» (2026-10-11: тест шва удалили, pytest
+                # из-за одного ненайденного узла не прогнал НИЧЕГО, а итог гласил «тесты прошли»).
+                row["verdict"] = FAIL
+                row["note"] = ((note + " · " if note else "")
+                               + f"test NOT RUN (missing, not collected, or pytest failed): {asserted}")
             elif status == "passed" and verdict == MANUAL:
                 row["verdict"] = TEST_OK
                 row["note"] = f"test passed: {asserted}"
@@ -220,6 +226,16 @@ def run_tests(plugin_root: str, ids: list, *, python: str | None = None,
         return {"ran": False, "error": f"cannot start pytest: {exc}", "by_node": {},
                 "seconds": time.time() - started, "summary": {}}
     seconds = time.time() - started
+    # 0 и 1 — тесты прошли / какие-то упали. Прочее (2 прерван, 3 внутренняя ошибка, 4 узел не
+    # найден, 5 ничего не собрано) — прогона по сути НЕ было, даже если junit-файл записан пустым.
+    if proc.returncode not in (0, 1):
+        tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-3:]
+        try:
+            os.remove(junit)
+        except OSError:
+            pass
+        return {"ran": False, "error": f"pytest exit {proc.returncode}: " + " | ".join(tail),
+                "by_node": {}, "seconds": seconds, "summary": {}}
     by_node, summary = {}, {"passed": 0, "failed": 0, "skipped": 0, "error": 0}
     failures: list = []
     try:

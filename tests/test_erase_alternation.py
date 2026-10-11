@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_filetools.context_ctl import _alternation, _compact, _pairs, _prompts
+from hermes_filetools.context_ctl import _alternation, _compact, _insert, _pairs, _prompts
 
 
 def _m(role, text, t):
@@ -29,7 +29,7 @@ def _call(call_id):
 def _erase(rows, picked):
     """Путь `_command._erase_places` до коммита: владение, пересборка, чередование."""
     decision = _pairs.settle(rows, set(picked))
-    new_rows, _h, _e = _compact._rebuild(rows, [], [], [], decision["patch"], decision["eaten"])
+    new_rows, _h, _e = _insert._rebuild(rows, [], [], [], decision["patch"], decision["eaten"])
     return _alternation.fit(new_rows, rows, kind="erase")
 
 
@@ -118,7 +118,7 @@ def test_e7_bridges_never_reach_the_model_as_data():
 def test_e8_their_check_is_not_worse_with_bridges():
     rows = [_m("user", "a", 1), _m("assistant", "b", 2), _m("user", "c", 3)]
     decision = _pairs.settle(rows, {1})
-    plain, _h, _e = _compact._rebuild(rows, [], [], [], decision["patch"], decision["eaten"])
+    plain, _h, _e = _insert._rebuild(rows, [], [], [], decision["patch"], decision["eaten"])
     was = _alternation.their_repairs(rows)
     if was is None:
         pytest.skip("их repair_message_sequence не импортируется — проверять нечем")

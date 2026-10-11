@@ -5,6 +5,7 @@
   L3  структурный вопрос собран как у Hermes (`_build_structured_messages`) и разобран по схеме
   L4  ответ вне схемы — `ok: False` с причиной, не исключение
   L5  прогрев не прошёл — данные сессии в модель не уходят
+  L6  думание — флаг вопроса: по умолчанию «не думай», `think=True` поле не шлёт
 """
 from __future__ import annotations
 
@@ -114,3 +115,18 @@ def test_l5_failed_warmup_sends_no_data(monkeypatch, tmp_path):
     out = _distill.interrogate("s", rows, [0, 1], {0: "m0001", 1: "m0002"})
     assert asked == ["ok"], "после неудачного прогрева данные не уходили"
     assert not out["ok"] and "прогрев" in out["error"]
+
+
+def test_l6_think_reaches_the_request(monkeypatch):
+    """Plan32.1: думание задаётся НА ВОПРОСЕ. По умолчанию поле «не думай» уходит; `think=True`
+    его не шлёт — у обеих дверей."""
+    sent = []
+    _fake_server(monkeypatch, '{"count": 1}', sent)
+    schema = {"type": "object", "properties": {"count": {"type": "integer"}}}
+    with _llm.use_route(_Agent()):
+        _llm.ask("q")
+        _llm.ask("q", think=True)
+        _llm.ask_structured("D", "q", schema)
+        _llm.ask_structured("D", "q", schema, think=True)
+    off = {"enable_thinking": False}
+    assert [s["body"].get("chat_template_kwargs") for s in sent] == [off, None, off, None]

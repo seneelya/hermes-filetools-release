@@ -5,13 +5,14 @@
 Кнопка, шторки с галочками и цифры у галочек — рабочая версия, следующим шагом; команда
 останется как опция.
 
-АДРЕСА — НАШИ `Operation ID`, не сырые `tool_call_id`. Человек называет то, что видит в
-стакане и в ответах тулов. Перевод номер → адрес идёт двумя источниками: сначала САМА
-ИСТОРИЯ (наш номер напечатан в тексте ответа тула, а у tool-сообщения есть свой
-`tool_call_id` — то есть история содержит обе половины связи), затем леджер.
+ИМЕНА — `Operation ID` (`0015`, `op0015`) и m-адреса (`m0042`). Номер — то, что видят
+человек и МОДЕЛЬ в ответах тулов (m-адресов модель не видит). Транспорт ОДИН (Plan23,
+владелец 2026-10-06): номер переводится в m-адрес (номер → `tool_call_id` → строка → адрес;
+номер → `tool_call_id` двумя источниками — сначала САМА ИСТОРИЯ, затем леджер) и дальше
+идёт той же дверью, что и панель, — `run_addresses`.
 
-БЕЗ АРГУМЕНТОВ — НИЧЕГО НЕ ДЕЛАЕТ, только показывает. Команда меняет живой контекст, и
-пустой ввод не должен означать «сделай что-нибудь».
+БЕЗ АРГУМЕНТОВ — НИЧЕГО НЕ ДЕЛАЕТ, только подсказывает формат. Команда меняет живой
+контекст, и пустой ввод не должен означать «сделай что-нибудь».
 
 ОТВЕТ ОБЯЗАТЕЛЬНО НЕПУСТ И ЗАКАНЧИВАЕТСЯ СТРОКОЙ «ИТОГ:». Требование владельца после
 живого прогона 2026-09-08, где случилось худшее из возможного: команда сработала МОЛЧА, и
@@ -21,14 +22,15 @@
 
 from __future__ import annotations
 
-from . import _apply, _select, _signal, _stubs
+from . import _apply, _signal, _stubs
+from . import _insert
 
 _MARK = "── ctx-drop ──"
 NL = "\n"
 
 
 def _split_ops(raw: str) -> list:
-    """Номера из строки. Принимаем и запятую, и пробел: человек напишет как придётся."""
+    """Имена из строки. Принимаем и запятую, и пробел: человек напишет как придётся."""
     out, seen = [], set()
     for chunk in (raw or "").replace(",", " ").split():
         token = chunk.strip().lstrip("#")
@@ -36,6 +38,19 @@ def _split_ops(raw: str) -> list:
             seen.add(token.lower())
             out.append(token)
     return out
+
+
+def _split_names(names) -> tuple:
+    """`(m-адреса, номера операций)`. `m` не шестнадцатеричная цифра — адрес от номера
+    отличается без догадок; `op` перед номером снимается (`op0015` = `0015`)."""
+    addrs, ops = [], []
+    for name in names or []:
+        low = str(name).strip().lower()
+        if low.startswith("m") and low[1:].isalnum() and low[1:]:
+            addrs.append(low)
+        else:
+            ops.append(low[2:] if low.startswith("op") and len(low) > 2 else low)
+    return addrs, ops
 
 
 def handle(raw_args: str = "") -> str:
@@ -73,16 +88,17 @@ def _handle(raw_args: str) -> str:
     if engine is None:
         return NL.join([_MARK, why, "ИТОГ: контекст не тронут"])
 
-    ops = _split_ops(args)
-    if not ops:
-        agent = engine.live_agent()
-        session, session_why = _apply.find_gateway_session(agent)
-        if session is None:
-            return NL.join([_MARK, why, f"применить нечем — {session_why}",
-                            "ИТОГ: контекст не тронут"])
-        return _show(agent, _apply.history_of(session), session_id, why)
+    names = _split_ops(args)
+    if not names:
+        return NL.join([_MARK, why, _FORMAT, "ИТОГ: ничего не задано, контекст не тронут"])
 
-    return NL.join([_MARK, why] + run(session_id, engine, ops)["lines"])
+    addrs, ops = _split_names(names)
+    return NL.join([_MARK, why]
+                   + run_addresses(session_id, engine, addrs, OP_CONTENT, ops=ops)["lines"])
+
+
+_FORMAT = ("Формат: `/ctx-drop 0156,0157` — номера операций (`Operation ID`) из ответов наших "
+           "тулов; можно `op0156` и m-адреса панели (`m0042`).")
 
 
 def _facts(facts: dict, lines: list, summary: str = "") -> dict:
@@ -103,123 +119,19 @@ def _facts(facts: dict, lines: list, summary: str = "") -> dict:
     return facts
 
 
-# Английские имена действий для сводки — те же слова, что на кнопках панели
-# (`desktop/src/core.js::CONTEXT_ACTIONS`). Один словарь на все слои.
-_ACTION_LABEL = {_select.MODE_CONTENT: "drop content", _select.MODE_TOOL: "erase tool",
-                 _select.MODE_TURN: "erase turn"}
-
-
-def _summary_of(mode: str, ok: bool, applied, tokens_dropped: int) -> str:
+def _summary_of(applied, tokens_dropped: int) -> str:
     """Короткая английская фраза для панели. Из ФАКТОВ, а не из прозы команды."""
-    verb = "dropped" if mode == _select.MODE_CONTENT else "erased"
-    if not ok:
-        return "not applied"
     freed = f" · freed ~{tokens_dropped} tk" if tokens_dropped > 0 else ""
-    return f"{verb} {len(applied)} ops{freed}"
+    return f"dropped {len(applied)} ops{freed}"
 
 
-def _mechanism(mode: str):
-    """Функция механизма по режиму. `None` — режим не реализован, и это отказ, не подмена.
-
-    Подменять неизвестный режим на `content` нельзя ни при каких условиях: человек нажал
-    кнопку с определённым именем, а операции необратимы. Лучше отказ с именем режима.
-    """
-    return {
-        _select.MODE_CONTENT: _stubs.apply_stubs,
-        _select.MODE_TOOL: _stubs.erase_tools,
-        _select.MODE_TURN: _stubs.erase_turn,
-    }.get(str(mode or ""))
-
-
-def run(session_id: str, engine, ops: list, mode: str = _select.MODE_CONTENT) -> dict:
-    """Применить действие к названным операциям сессии. ОДНА реализация на два вызывающих.
-
-    `mode` — ОБЪЕКТ действия, тем же словом, каким оно названо на кнопке в панели и в файле
-    выбора (`_select.MODES`): `content` — выбросить содержимое, оставив заголовок; `tool` —
-    удалить пару вызов+результат целиком. Различается только шаг «посчитать новую историю»,
-    всё остальное — поиск сессии, адресация, линт, коммит, сигнал — общее, и разводить это
-    по двум почти одинаковым функциям значило бы получить два места, где чинить одно и то же.
-
-    Зовут отсюда двое: слеш-команда (печатает `lines` человеку) и маршрут панели
-    `POST /context-apply` — кнопка «применить». Кнопка — ОСНОВНОЙ путь по решению
-    владельца 2026-09-09 («панель это место исполнения действий работы с контекстом,
-    команды это гипер неудобно»); команда осталась фолбэком.
-
-    Поэтому здесь только факты и готовые строки отчёта, без рамки `── ctx-drop ──` и без
-    пояснения, КАК выбрана сессия: у панели сессия не выбирается — она её сама и назвала,
-    и печатать ей «выбрана самая активная из живых» было бы неправдой.
-
-    Ключ `ok` означает ровно одно: контекст ИЗМЕНЁН. Все прочие исходы (адресов нет, линт
-    нашёл разрыв, коммит отказал) — `ok: False` и объяснение в строках. Кнопке этого
-    достаточно, чтобы не соврать зелёным, когда ничего не произошло.
-    """
-    facts = {"ok": False, "session": session_id, "ops": list(ops), "mode": mode,
-             "applied": [], "tokens_before": 0, "tokens_after": 0, "chars_saved": 0}
-
-    mechanism = _mechanism(mode)
-    if mechanism is None:
-        return _facts(facts, [f"режим {mode!r} не реализован — умеем "
-                              f"{_select.MODES_IMPLEMENTED}",
-                              "ИТОГ: контекст не тронут"],
-                      f"action {mode!r} is not implemented")
-
-    agent = engine.live_agent()
-    session, session_why = _apply.find_gateway_session(agent)
-    if session is None:
-        return _facts(facts, [f"применить нечем — {session_why}",
-                              "ИТОГ: контекст не тронут"],
-                      "no live session to apply to")
-    history = _apply.history_of(session)
-
-    # Правим ДВЕ истории одной сессии: строки базы (их мы отдаём в `replace_messages`) и
-    # снимок памяти гейтвея (из него собирается следующий запрос). Адреса ищем по базе:
-    # именно её набор полон, а снимок гейтвея — нет (потеря данных 2026-09-08).
-    rows, rows_why = _apply.db_history(agent)
-    if rows_why:
-        return _facts(facts, [rows_why, "ИТОГ: контекст не тронут"],
-                      "the session database is unreachable")
-
-    # Адресация сообщений (Plan14-Task03) — ДО правки. После `erase` строки не будет,
-    # а с ней исчезнет и координата, по которой адрес выдаётся: неадресованное в этот
-    # момент останется безымянным навсегда.
-    facts["indexed"] = _stubs.index_messages(session_id, rows)
-
-    items, missing, no_address = _stubs.ops_to_call_ids(session_id, ops, rows)
-    tool_msgs = sum(1 for m in rows if isinstance(m, dict) and m.get("role") == "tool")
-    lines = [f"номеров задано: {len(ops)} | база: {len(rows)} активных строк, из них "
-             f"тул-ответов {tool_msgs} | память гейтвея: {len(history)} сообщений"]
-    if items:
-        lines.append("адреса найдены: " + ", ".join(
-            f"{i.get('op')} (из {i.get('src')})" for i in items))
-    if missing:
-        lines.append(f"нет ни в истории, ни в леджере: {', '.join(missing)} — номера живут "
-                     "per-session, номер из другого чата тут не найдётся")
-    if no_address:
-        # «Нечем НАЙТИ», а не «нечего удалять» — разница существенная, и прежняя
-        # формулировка врала. У записи содержимое лежит в АРГУМЕНТАХ вызова, и они могут
-        # быть целы; мы просто не находим строку. Оба пути адресации мертвы одновременно:
-        # номера в тексте нет (их компакция переписала ответ), а `tool_call_id` в леджере
-        # нет — сессии из окна, когда их contextvars переехали, писались без него.
-        lines.append(f"операция была, но НАЙТИ её нечем: {', '.join(no_address)} — номера в "
-                     "тексте ответа нет (его переписала их компакция), а tool_call_id в "
-                     "леджере не записан. Если это была запись, её содержимое могло "
-                     "остаться в аргументах вызова, но добраться до них нечем")
-    if not items:
-        lines.append("ИТОГ: контекст не тронут — ни один номер применить нельзя")
-        _note(engine, "не применено: адресов нет", ops=ops, missing=missing,
-              no_address=no_address)
-        return _facts(facts, lines, "no operation could be addressed")
-
-    return _apply_items(session_id, engine, agent, session, history, rows, items, mode,
-                        mechanism, facts, lines, missing, no_address, tool_msgs, ops)
-
-
-def _apply_items(session_id, engine, agent, session, history, rows, items, mode, mechanism,
+def _apply_items(session_id, engine, agent, session, history, rows, items,
                  facts, lines, missing, no_address, tool_msgs, ops) -> dict:
-    """Хвост применения по готовому списку целей `{op, tool_call_id}`: механизм, линт, коммит,
-    надгробия, сигнал, отчёт. Общий у `run` (цели — номера операций) и `run_addresses`
-    (цели — m-адреса, Plan16-Task08): различается только то, КАК собраны цели.
+    """`drop content` по готовому списку целей `{op, tool_call_id}`: заглушки, линт, коммит,
+    сигнал, отчёт. Зовёт только `run_addresses` (Plan23: путь номеров снят, номера команды
+    переводятся в m-адреса до этого места).
     """
+    mechanism = _stubs.apply_stubs
     index = _stubs.ledger_index(session_id)
     new_rows, report = mechanism(rows, items, index)
     new_rows = _apply.drop_stale_api_content(rows, new_rows)
@@ -271,9 +183,6 @@ def _apply_items(session_id, engine, agent, session, history, rows, items, mode,
             f"{len(gw_stubbed)} — снимок памяти неполон. База будет верна, а промпт "
             "следующего запроса может ещё нести выброшенное; перезапуск сессии сравняет")
 
-    # Режим в файл выбора кладём ТОТ, которым применяем: `ops_to_call_ids` про режим не
-    # знает и ставит default, а файл читает фолбэк-команда и показывает по нему предпросмотр.
-    _select.write_selection(session_id, [{**item, "mode": mode} for item in items])
     # `removed` — то, что механизм удалил нарочно. Берём из отчёта ПО БАЗЕ: именно её
     # строки сверяет предохранитель, и отчёт памяти гейтвея тут не при чём.
     ok, applied_why = _apply.commit_replacement(session, agent, new_rows,
@@ -283,17 +192,8 @@ def _apply_items(session_id, engine, agent, session, history, rows, items, mode,
         _note(engine, f"не применено: {applied_why}", ops=ops)
         return _facts(facts, lines, "refused at commit, context untouched")
 
-    # НАДГРОБИЯ. Только для стирания: у `drop content` операция в контексте осталась, у неё
-    # живой заголовок, и надгробие соврало бы. Пишем ПОСЛЕ успешного коммита и ДО сигнала —
-    # панель перечитывает данные по бампу ревизии, и надгробие должно уже лежать на диске.
-    #
-    # Исход записи на `ok` НЕ влияет (правило записано в `_ledger.note_erased`): контекст уже
-    # изменён необратимо, и превращать состоявшуюся правку в «не сработало» из-за
-    # недоступного журнала нельзя.
-    if mode in (_select.MODE_TOOL, _select.MODE_TURN):
-        facts["tombstones"] = _stubs.note_erased(
-            session_id, [row.get("op") for row in stubbed],
-            _ACTION_LABEL.get(mode, mode))
+    # Надгробий здесь нет: у `drop content` операция в контексте осталась, у неё живой
+    # заголовок, и надгробие соврало бы. Стирание пишет их само (`_erase_places`).
 
     # Панель узнаёт об изменении только отсюда: их события `compacted` у нашего пути нет,
     # а процессы разные. Бампаем ПОСЛЕ успешного коммита — сигнал обещает факт, не намерение.
@@ -338,32 +238,68 @@ def _apply_items(session_id, engine, agent, session, history, rows, items, mode,
                   "tokens_dropped": max(0, before - after),
                   "chars_saved": report.get("chars_saved", 0),
                   "revision": _signal.read_signal(session_id).get("revision", 0)})
-    return _facts(facts, lines,
-                  _summary_of(mode, True, facts["applied"],
-                              facts["tokens_dropped"]))
+    return _facts(facts, lines, _summary_of(facts["applied"], facts["tokens_dropped"]))
 
 
-
-
-# ── Операции над m-АДРЕСАМИ (Plan16-Task08) ──────────────────────────────────────────────
+# ── Операции над m-АДРЕСАМИ (Plan16-Task08) — ЕДИНСТВЕННЫЙ транспорт (Plan23) ─────────────
 #
-# Одна дверь на все операции, чей предмет — сообщения (владелец, 2026-09-29):
+# Одна дверь на все операции, чей предмет — сообщения (владелец, 2026-09-29). С 2026-10-06
+# другой нет: путь номеров операций (`/context-apply`, выбор панели, механизмы стирания по
+# номерам) снят, номера команды `/ctx-drop` переводятся в адреса здесь же (`ops=`).
 #
 #   content  тело результатов тулов — НАШИХ И ЧУЖИХ. Цели собираются по адресу: строка
-#            результата → её `tool_call_id`, дальше прежний `apply_stubs` и прежний коммит.
-#            У чужого номера операции нет, поэтому `/context-apply` до них не доставал.
+#            результата → её `tool_call_id`, дальше `apply_stubs` и коммит.
 #   erase    любое сообщение, по правилу владения (`_pairs.settle`, как у компакции):
 #            результат уносит свой вызов, реплика без прозы и вызовов уходит, реплика с
 #            прозой теряет прозу, но живёт, пока в ней есть вызов. Это компакция без
 #            дистиллята. Надгробия пишутся нашим стёртым операциям (решение владельца).
-OPERATIONS = ("content", "erase")
+OP_CONTENT, OP_ERASE = "content", "erase"
+OPERATIONS = (OP_CONTENT, OP_ERASE)
 
 
-def run_addresses(session_id: str, engine, addrs: list, operation: str) -> dict:
-    """Применить операцию к названным m-адресам сессии. Отчёт той же формы, что у `run`."""
+def _addresses_of_ops(session_id, ops, rows, by_msg) -> tuple:
+    """Номера операций → m-адреса их строк-результатов. `(адреса, строки отчёта, нет нигде,
+    нет адреса)`. Номер → `tool_call_id` — `_stubs.ops_to_call_ids` (история, потом леджер);
+    `tool_call_id` → адрес — по той же ленте, что и всё остальное в двери."""
+    addr_of_call = {}
+    for addr, row in by_msg.items():
+        if isinstance(row, dict) and row.get("role") == "tool" and row.get("tool_call_id"):
+            addr_of_call[str(row["tool_call_id"])] = addr
+    items, missing, no_address = _stubs.ops_to_call_ids(session_id, ops, rows)
+    addrs, found = [], []
+    for item in items:
+        addr = addr_of_call.get(str(item.get("tool_call_id") or ""))
+        if addr:
+            addrs.append(addr)
+            found.append(f"{item.get('op')} → {addr} (из {item.get('src')})")
+        else:
+            # Вызов известен, а строки в активной ленте нет — той же природы, что «нет адреса».
+            no_address.append(str(item.get("op") or ""))
+    lines = []
+    if found:
+        lines.append("номера найдены: " + ", ".join(found))
+    if missing:
+        lines.append(f"нет ни в истории, ни в леджере: {', '.join(missing)} — номера живут "
+                     "per-session, номер из другого чата тут не найдётся")
+    if no_address:
+        # «Нечем НАЙТИ», а не «нечего удалять»: номера в тексте ответа нет (его переписала
+        # их компакция) и строки с его `tool_call_id` в активной ленте тоже нет.
+        lines.append(f"операция была, но НАЙТИ её строку нечем: {', '.join(no_address)} — "
+                     "номера в тексте ответа нет, а строки с её tool_call_id в активной "
+                     "ленте нет")
+    return addrs, lines, missing, no_address
+
+
+def run_addresses(session_id: str, engine, addrs: list, operation: str, ops=()) -> dict:
+    """Применить операцию к названным m-адресам сессии. `ops` — номера операций (команда
+    `/ctx-drop`): переводятся в адреса и идут тем же путём."""
+    addrs = [str(a).strip().lower() for a in (addrs or []) if str(a).strip()]
+    ops = [str(o).strip() for o in (ops or []) if str(o).strip()]
     facts = {"ok": False, "session": session_id, "msgs": list(addrs), "operation": operation,
              "mode": operation, "applied": [], "tokens_before": 0, "tokens_after": 0,
              "chars_saved": 0}
+    if ops:
+        facts["ops"] = list(ops)
     if operation not in OPERATIONS:
         return _facts(facts, [f"операция {operation!r} не реализована — умеем {OPERATIONS}",
                               "ИТОГ: контекст не тронут"],
@@ -383,7 +319,18 @@ def run_addresses(session_id: str, engine, addrs: list, operation: str) -> dict:
 
     # Адрес → позиция строки. Тот же индекс, что у компакции: адрес — личность сообщения.
     from . import _compact
-    by_msg = _compact._index(session_id, rows)
+    by_msg = _insert._index(session_id, rows)
+    tool_msgs = sum(1 for m in rows if isinstance(m, dict) and m.get("role") == "tool")
+    lines = [f"задано: адресов {len(addrs)}, номеров {len(ops)} | база: {len(rows)} активных "
+             f"строк, из них тул-ответов {tool_msgs} | память гейтвея: {len(history)} сообщений"]
+    ops_missing, no_address = [], []
+    if ops:
+        from_ops, op_lines, ops_missing, no_address = _addresses_of_ops(session_id, ops, rows,
+                                                                        by_msg)
+        lines += op_lines
+        addrs += [a for a in from_ops if a not in addrs]
+        facts["msgs"] = list(addrs)
+
     order = {id(row): i for i, row in enumerate(rows)}
     places, missing = {}, []
     for addr in addrs:
@@ -393,16 +340,15 @@ def run_addresses(session_id: str, engine, addrs: list, operation: str) -> dict:
             missing.append(addr)
         else:
             places[addr] = place
-    tool_msgs = sum(1 for m in rows if isinstance(m, dict) and m.get("role") == "tool")
-    lines = [f"адресов задано: {len(addrs)} | база: {len(rows)} активных строк, из них "
-             f"тул-ответов {tool_msgs} | память гейтвея: {len(history)} сообщений"]
     if missing:
-        lines.append(f"адреса не найдены: {', '.join(missing)} — номера живут per-session")
+        lines.append(f"адреса не найдены: {', '.join(missing)} — адреса живут per-session")
     if not places:
         lines.append("ИТОГ: контекст не тронут — ни один адрес не найден")
+        _note(engine, "не применено: адресов нет", msgs=addrs, ops=ops,
+              missing=missing + ops_missing, no_address=no_address)
         return _facts(facts, lines, "no message could be addressed")
 
-    if operation == "content":
+    if operation == OP_CONTENT:
         items, not_results = [], []
         for addr, place in places.items():
             row = rows[place]
@@ -418,8 +364,8 @@ def run_addresses(session_id: str, engine, addrs: list, operation: str) -> dict:
             lines.append("ИТОГ: контекст не тронут — ни одного результата тула")
             return _facts(facts, lines, "no tool result among the ticked messages")
         return _apply_items(session_id, engine, agent, session, history, rows, items,
-                            _select.MODE_CONTENT, _stubs.apply_stubs, facts, lines,
-                            missing, [], tool_msgs, list(addrs))
+                            facts, lines, missing + ops_missing, no_address, tool_msgs,
+                            list(addrs))
 
     return _erase_places(session_id, engine, agent, session, history, rows, places, facts,
                          lines, _compact)
@@ -536,7 +482,7 @@ def run_edit(session_id: str, engine, addr: str, content: str) -> dict:
     Два правила из Vision09, иначе сломается тихо:
       1. из буфера приходит ТОЛЬКО `content` — `role`, `tool_calls`, `tool_call_id` и прочие
          поля строки переносятся не глядя; тул-строки не правятся вовсе;
-      2. новая строка встаёт НА МЕСТО старой (`_compact._rebuild` с `patch`), старая уходит в
+      2. новая строка встаёт НА МЕСТО старой (`_insert._rebuild` с `patch`), старая уходит в
          `removed` — ровно путь коммита дистиллята.
     `api_content` не переносится (видно в панели = видно модели). Время — новое: адрес правленого
     сообщения меняется НАРОЧНО, и правка видна в ленте. После коммита — запись `edited`.
@@ -564,7 +510,7 @@ def run_edit(session_id: str, engine, addr: str, content: str) -> dict:
         return _facts(facts, [rows_why, "ИТОГ: контекст не тронут"],
                       "the session database is unreachable")
     facts["indexed"] = _stubs.index_messages(session_id, rows)
-    by_msg = _compact._index(session_id, rows)
+    by_msg = _insert._index(session_id, rows)
     row = by_msg.get(addr)
     place = next((i for i, r in enumerate(rows) if r is row), None) if row is not None else None
     if place is None:
@@ -583,7 +529,7 @@ def run_edit(session_id: str, engine, addr: str, content: str) -> dict:
     new_row = {k: v for k, v in row.items() if k not in ("id", "api_content", "_row_id")}
     new_row["content"] = text
     new_row["timestamp"] = time.time()
-    new_rows, new_history, _eaten = _compact._rebuild(rows, history, [], [], {place: new_row}, ())
+    new_rows, new_history, _eaten = _insert._rebuild(rows, history, [], [], {place: new_row}, ())
     new_rows = _apply.drop_stale_api_content(rows, new_rows)
 
     before = _apply._estimate(agent, history)
@@ -597,7 +543,7 @@ def run_edit(session_id: str, engine, addr: str, content: str) -> dict:
         return _facts(facts, lines, "refused at commit, context untouched")
 
     fresh, _ = _apply.db_history(agent)
-    fresh_by_msg = _compact._index(session_id, fresh) if fresh else {}
+    fresh_by_msg = _insert._index(session_id, fresh) if fresh else {}
     target = _msgindex.place(new_row)
     now = next((a for a, r in fresh_by_msg.items() if _msgindex.place(r) == target), "")
     facts["edited"] = bool(now and _ledger.note_edited(session_id, addr, now))
@@ -624,7 +570,7 @@ def _erase_places(session_id, engine, agent, session, history, rows, places, fac
     for note in decision["notes"]:
         lines.append("пары: " + note)
 
-    new_rows, new_history, eaten_rows = _compact._rebuild(rows, history, [], [], patch, eaten)
+    new_rows, new_history, eaten_rows = _insert._rebuild(rows, history, [], [], patch, eaten)
     new_rows = _apply.drop_stale_api_content(rows, new_rows)
 
     # ЧЕРЕДОВАНИЕ (2026-09-30): стирание рождает стыки одной роли — ответ между двумя репликами
@@ -687,26 +633,3 @@ def _erase_places(session_id, engine, agent, session, history, rows, places, fac
                   "revision": _signal.read_signal(session_id).get("revision", 0)})
     freed = f" · freed ~{facts['tokens_dropped']} tk" if facts["tokens_dropped"] > 0 else ""
     return _facts(facts, lines, f"erased {len(eaten_rows)} messages{freed}")
-
-
-def _show(agent, history, session_id, why) -> str:
-    """Пустой ввод: что отмечено и что будет, если применить. Ничего не меняет."""
-    items = _apply.selection_for(session_id)
-    if not items:
-        return NL.join([
-            _MARK, why,
-            "Формат: `/ctx-drop 0156,0157` — номера операций (`Operation ID`) из ответов "
-            "наших тулов.",
-            "ИТОГ: ничего не отмечено, контекст не тронут",
-        ])
-    look = _apply.preview(agent, history, items, session_id)
-    lines = [
-        _MARK, why,
-        f"отмечено: {len(items)} — {', '.join(i.get('op') or '?' for i in items)}",
-        f"если применить: освободится ~{look['tokens_dropped']} токенов, "
-        f"останется ~{look['tokens_after']}",
-    ]
-    if look["not_found"]:
-        lines.append(f"из них в живой истории нет: {len(look['not_found'])}")
-    lines.append("ИТОГ: это просмотр, ничего не применено")
-    return NL.join(lines)

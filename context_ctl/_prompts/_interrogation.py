@@ -9,17 +9,14 @@ def q1_count() -> str:
         "separate pass of processing? Do not count examples, metaphors or asides as "
         "separate topics. Do not split one piece of work into its sub-aspects. One topic "
         "is a perfectly normal answer.\n\n"
-        "Reply with JSON only: a single integer in the field count."
+        "Reply with JSON only: a single integer in the field {key}."
     )
-    out__q1_count = C_Q1_COUNT
+    out__q1_count = C_Q1_COUNT.format(key=COUNT_KEY)
     return out__q1_count
 COUNT_KEY = "how_many_independent_topics_the_work_zone_contains"
 def s1_count() -> tuple:
     """Схема к q1_count. Целое — жёсткий запрет, модель не может ответить иначе."""
     C_S1_NAME = "filetools_topic_count"
-    C_S1_COUNT = {"type": "object",
-                  "properties": {"count": {"type": "integer"}},
-                  "required": ["count"]}
     C_S1_COUNT2 = {"type": "object",
                    "properties": {COUNT_KEY: {"type": "integer"}},
                    "required": [COUNT_KEY]}
@@ -221,7 +218,7 @@ def q7_pack(kind: str, settled: str, open_text: str) -> str:
         "Which rules, preferences and prohibitions were stated here? Quote each one "
         "verbatim - a paraphrase of a rule is not the rule - and say what it applies to.")
     packs = {"work": C_PACK_CODE, "recon": C_PACK_RECON, "design": C_PACK_PLAN,
-             "rules": C_PACK_RULES, "other": C_PACK_CODE,
+             "rules": C_PACK_RULES, "general": C_PACK_CANON,
              "code": C_PACK_CODE, "canon": C_PACK_CANON, "plan": C_PACK_PLAN}
     out__q7_pack = C_PACK_HEAD.format(settled=frame_block("SETTLED", settled), open=frame_block("OPEN", open_text)) \
         + packs.get(str(kind or "").strip().lower(), C_PACK_CODE) + answer_style()
@@ -235,17 +232,6 @@ def q10_selfcheck(glue: str) -> str:
     Заведомо ложная канарейка выброшена (ловит только грубую поломку). Владелец,
     2026-09-21: модели почти всегда ловят собственные выдумки, если спросить прямо.
     """
-    C_Q10_SELFCHECK = (
-        "Below is the distillate we assembled from your answers about the session "
-        "above.\n\n{glue}\n\n"
-        "Does it state anything the transcript does not support - a fact, a number, a "
-        "name, a decision that is not actually there?\n\n"
-        "Flag only what would MISLEAD the agent continuing this work: an invented fact, a "
-        "wrong number, a decision nobody took. Condensing several statements into one is "
-        "not a problem, and neither is wording tighter than the original.\n\n"
-        "Reply with JSON only: unsupported (boolean) first, then what (a short list in "
-        "one string, empty if none)."
-    )
     # ПОРОГ ПОДНЯТ И ОТКАЗ РАЗРЕШЁН (владелец, 2026-09-22, по живому прогону: ответ был
     # `true` всегда). Кроме имени ключа этому мешало и отсутствие явного разрешения
     # ответить «нет»: вопрос звучал как поручение что-нибудь найти.
@@ -267,16 +253,10 @@ def q10_selfcheck(glue: str) -> str:
     out__q10_selfcheck = (C_Q10_SELFCHECK2.format(glue=frame_block("DISTILLATE", glue))
                           + lang_note())
     return out__q10_selfcheck
-C_S10_KEY = "unsupported"
 C_S10_KEY2 = "this_section_states_things_the_transcript_does_not_support"
 def s10_selfcheck() -> tuple:
     """Булево ПЕРВЫМ полем: измерено, что булево модель держит намертво (`Vision06`)."""
     C_S10_NAME = "filetools_selfcheck"
-    C_S10_SELFCHECK = {
-        "type": "object",
-        "properties": {"unsupported": {"type": "boolean"}, "what": {"type": "string"}},
-        "required": ["unsupported"],
-    }
     C_S10_SELFCHECK2 = {
         "type": "object",
         "properties": {C_S10_KEY2: {"type": "boolean"},
@@ -322,11 +302,12 @@ def q12_additions(document: str, known: str = "") -> str:
         "text under review, and re-arguing its wording makes it worse, not better.\n\n"
         "A good document deserves false. That is the expected answer for a good document, "
         "not a failure to find something.\n\n"
-        "Reply with JSON only: has_additions (boolean) first, then text. If there is "
+        "Reply with JSON only: {key} (boolean) first, then text. If there is "
         "nothing to add, answer false and leave text empty - the closing line is written "
         "by us, not by you."
     )
     out__q12_additions = C_Q12_ADDITIONS.format(
+        key=ADDITIONS_KEY,
         document=frame_block("DOCUMENT", document),
         known_block=C_Q12_KNOWN.format(known=known) if str(known or "").strip() else ""
     ) + lang_note()
@@ -334,11 +315,6 @@ def q12_additions(document: str, known: str = "") -> str:
 ADDITIONS_KEY = "this_document_is_missing_or_gets_wrong_something_that_matters"
 def s12_additions() -> tuple:
     C_S12_NAME = "filetools_additions"
-    C_S12_ADDITIONS = {
-        "type": "object",
-        "properties": {"has_additions": {"type": "boolean"}, "text": {"type": "string"}},
-        "required": ["has_additions"],
-    }
     C_S12_ADDITIONS2 = {
         "type": "object",
         "properties": {ADDITIONS_KEY: {"type": "boolean"}, "text": {"type": "string"}},
@@ -356,11 +332,6 @@ def s12_additions() -> tuple:
 
 def answer_style() -> str:
     """Общий хвост ко всем вопросам разбора. Без него модель объясняет, а не отвечает."""
-    C_ANSWER_STYLE = (
-        "\n\nAnswer compactly but completely: facts, not explanations. Do not justify your "
-        "reasoning and do not describe what you are about to do. Other aspects of this "
-        "topic are covered by other questions - stay strictly on this one."
-    )
     # ЯЗЫК И ЗАЧИН — В ХВОСТЕ КАЖДОГО ВОПРОСА (живой прогон 2026-09-21). Правило языка стояло
     # только в системном промте, и два раздела из шести вернулись по-английски: вопрос
     # английский и стоит последним, а побеждает ближнее. Туда же запрет на преамбулу —
@@ -415,7 +386,7 @@ def topic_banner(title: str, index: int = 0, total: int = 0) -> str:
     pos = f" {index} OF {total}" if index and total else ""
     out__topic_banner = C_TOPIC_BANNER.format(title=title, pos=pos)
     return out__topic_banner
-def q_gate(title: str, index: int = 0, total: int = 0) -> str:
+def q_gate(title: str, index: int = 0, total: int = 0, fields=None) -> str:
     """ВОРОТА: какие секции вообще есть смысл заполнять по этой теме.
 
     Замысел владельца 2026-09-21. Дешёвые булевы (измерено: держатся намертво) решают, какие
@@ -431,16 +402,14 @@ def q_gate(title: str, index: int = 0, total: int = 0) -> str:
         "For each section below, answer whether the transcript actually contains material "
         "for it ON THIS TOPIC. Answer false freely: a false simply means we will not create "
         "that section and will not ask you about it. Do not answer true out of politeness.\n\n"
-        "  pending_task    - a request, question or decision from the user that was never "
-        "fulfilled, or (if there is no user) an objective the work was heading towards;\n"
-        "  open_items      - unfinished work, unresolved disagreement, things to return to;\n"
-        "  errors_fixes    - errors that were hit, and how they were resolved;\n"
-        "  critical_values - exact values, paths, numbers, error texts, configuration that "
-        "would be lost if someone paraphrased this topic;\n"
-        "  class_details   - substantial material for the extra pack chosen for this topic.\n\n"
-        "Reply with JSON only: five booleans."
+        "{fields}\n"
+        "Reply with JSON only: one boolean per field above."
     )
-    out__q_gate = C_Q_GATE.format(banner=topic_banner(title, index, total))
+    # Поля — те, что у опросника под воротами (`Plan32.1`): нейтральный набор не спрашивает
+    # про ошибки. Не указаны — все пять, как прежде.
+    names = list(fields) if fields else C_GATE_FIELDS
+    fields = "".join(f"  {gate_field(n)} - {C_GATE_MEANING[n]}\n" for n in names)
+    out__q_gate = C_Q_GATE.format(banner=topic_banner(title, index, total), fields=fields)
     return out__q_gate
 C_GATE_FIELDS = ["pending_task", "open_items", "errors_fixes",
                  "critical_values", "class_details"]
@@ -451,27 +420,31 @@ C_GATE_FIELDS2 = [
     "this_topic_carries_exact_values_worth_keeping",
     "this_topic_has_details_of_its_own_kind_worth_writing",
 ]
+# Что значит каждое поле — для текста вопроса; ключ в тексте тот же, что в схеме.
+C_GATE_MEANING = {
+    "pending_task": "a request, question or decision from the user that was never fulfilled, "
+                    "or (if there is no user) an objective the work was heading towards;",
+    "open_items": "unfinished work, unresolved disagreement, things to return to;",
+    "errors_fixes": "errors that were hit, and how they were resolved;",
+    "critical_values": "exact values, paths, numbers, error texts, configuration that would "
+                       "be lost if someone paraphrased this topic;",
+    "class_details": "substantial material for the extra pack chosen for this topic.",
+}
 # Старое имя → новое: код читает ворота по СМЫСЛУ поля, а не по его написанию.
 C_GATE_RENAMED = dict(zip(C_GATE_FIELDS, C_GATE_FIELDS2))
 def gate_field(name: str) -> str:
     """Смысловое имя поля ворот → ключ в схеме. Одно место на схему, чтение и тесты."""
     out__gate_field = C_GATE_RENAMED.get(name, name)
     return out__gate_field
-def s_gate() -> tuple:
+def s_gate(fields=None) -> tuple:
     """Схема ворот. Все поля обязательны: необязательные модель обрабатывает плохо, и
     молчание нельзя отличить от «нет» (`Vision06`)."""
     C_S_GATE_NAME = "filetools_sections_gate"
-    C_S_GATE_FIELDS = ["pending_task", "open_items", "errors_fixes",
-                       "critical_values", "class_details"]
-    C_S_GATE = {
-        "type": "object",
-        "properties": {f: {"type": "boolean"} for f in C_S_GATE_FIELDS},
-        "required": list(C_S_GATE_FIELDS),
-    }
+    keys = [gate_field(n) for n in fields] if fields else list(C_GATE_FIELDS2)
     C_S_GATE2 = {
         "type": "object",
-        "properties": {f: {"type": "boolean"} for f in C_GATE_FIELDS2},
-        "required": list(C_GATE_FIELDS2),
+        "properties": {f: {"type": "boolean"} for f in keys},
+        "required": list(keys),
     }
     out__s_gate = (C_S_GATE2, C_S_GATE_NAME)
     return out__s_gate
@@ -531,19 +504,14 @@ def q_constraints_verbatim() -> str:
         "Rules about how to work, what not to touch, what must always be done.\n\n"
         "Quote each one VERBATIM - a paraphrase of a prohibition is not a prohibition. Say "
         "nothing about topics, decisions or progress; only standing rules.\n\n"
-        "Reply with JSON only: has_constraints (boolean) first, then text. Answer false if "
+        "Reply with JSON only: {key} (boolean) first, then text. Answer false if "
         "the user stated no rules - we will simply not create that section."
     )
-    out__q_constraints_verbatim = C_Q_CONSTRAINTS
+    out__q_constraints_verbatim = C_Q_CONSTRAINTS.format(key=CONSTRAINTS_KEY)
     return out__q_constraints_verbatim
 CONSTRAINTS_KEY = "the_user_stated_a_rule_or_a_ban_somewhere_in_this_session"
 def s_constraints_verbatim() -> tuple:
     C_S_CONSTRAINTS_NAME = "filetools_constraints"
-    C_S_CONSTRAINTS = {
-        "type": "object",
-        "properties": {"has_constraints": {"type": "boolean"}, "text": {"type": "string"}},
-        "required": ["has_constraints"],
-    }
     C_S_CONSTRAINTS2 = {
         "type": "object",
         "properties": {CONSTRAINTS_KEY: {"type": "boolean"}, "text": {"type": "string"}},
@@ -567,8 +535,6 @@ def s_constraints_verbatim() -> tuple:
 # разбора, но человеческими вопросами.
 
 def kind_work() -> str:
-    C_KIND_WORK = ("This topic is hands-on work on the system: writing, changing or fixing "
-                   "something that runs.")
     # ВЫБОР ПАДАЕТ В ТОЧКУ РАСХОЖДЕНИЯ (владелец, 2026-09-21). Грамматика режет токен за
     # токеном и спокойно ветвится: одинаковый зачин у вариантов НЕ ошибка, решение просто
     # переезжает туда, где они расходятся. Ошибка была в другом — в этой точке у прежних
@@ -579,108 +545,80 @@ def kind_work() -> str:
     out__kind_work = C_KIND_WORK2
     return out__kind_work
 def kind_recon() -> str:
-    C_KIND_RECON = ("This topic is investigation: finding out how something already works, "
-                    "by reading, measuring or experimenting.")
     C_KIND_RECON2 = ("Investigation: finding out how something already works, by reading, "
                      "measuring or experimenting.")
     out__kind_recon = C_KIND_RECON2
     return out__kind_recon
 def kind_design() -> str:
-    C_KIND_DESIGN = ("This topic is design and decision-making: weighing options and "
-                     "settling on how something should be done.")
-    C_KIND_DESIGN2 = ("Design: weighing options and settling on how something should be "
-                      "done.")
+    # «…в системе или в работе» (2026-10-11): без этого «как устроен выдуманный мир» тоже
+    # выглядело как проектирование, и тема ехала в технические вопросы.
+    C_KIND_DESIGN2 = ("Design: weighing options and settling on how something in the system "
+                      "or the work should be done.")
     out__kind_design = C_KIND_DESIGN2
     return out__kind_design
 def kind_rules() -> str:
-    C_KIND_RULES = ("This topic is about how we work together: rules, preferences and "
-                    "prohibitions the user stated.")
     C_KIND_RULES2 = ("Rules: preferences and prohibitions the user stated about how we "
                      "work together.")
     out__kind_rules = C_KIND_RULES2
     return out__kind_rules
 def kind_talk() -> str:
-    C_KIND_TALK = ("This topic is conversation outside the work itself: life, examples, "
-                   "digressions, nothing about the system.")
     C_KIND_TALK2 = ("Conversation outside the work: life, examples, digressions, nothing "
                     "about the system.")
     out__kind_talk = C_KIND_TALK2
     return out__kind_talk
-def kind_other() -> str:
-    """ЗАПАСНОЙ ВАРИАНТ, и он намеренно ТОЙ ЖЕ ФОРМЫ И ДЛИНЫ, что остальные.
+def kind_general() -> str:
+    """НЕЙТРАЛЬНЫЙ НАБОР — он же запасной (владелец, 2026-10-11, по живому случаю: сессию, где
+    придумывали мир — наклон оси планеты, религию от «ока» в небе, — их компактор опросил как
+    код). Всё, что не работа над системой, спрашивается простыми словами, без инженерного словаря.
 
-    Измерено (`Vision06`) и объяснено владельцем 2026-09-21: грамматика обязывает выбрать из
-    списка, а модель берёт то, что больше похоже на ФОРМУ запрошенного. Просят номер — она
-    даст номер, пусть несуществующий, потому что «нет подходящего варианта» на номер не
-    похоже. Короткий отказ среди длинных описаний не выигрывает никогда.
+    Запасной вариант ТОЙ ЖЕ ФОРМЫ И ДЛИНЫ, что остальные (`Vision06`, владелец 2026-09-21):
+    модель берёт то, что больше похоже на ФОРМУ запрошенного, и короткий отказ среди длинных
+    описаний не выигрывает никогда. Первое слово — сильное, как у остальных.
     """
-    C_KIND_OTHER = "This topic is none of the above - it is something else entirely."
-    # Отказу тоже нужно СИЛЬНОЕ первое слово: `none` проигрывало всему подряд, потому что
-    # ничего не называет. `Unclassified` — такой же категорийный зачин, как у остальных.
-    C_KIND_OTHER2 = ("Unclassified: this topic matches none of the descriptions above and "
-                     "is something else.")
-    out__kind_other = C_KIND_OTHER2
-    return out__kind_other
-def kinds_all() -> list:
-    """Порядок = порядок в `enum`. Отказ последним, как и положено запасному."""
-    C_KINDS_ALL = [kind_work(), kind_recon(), kind_design(), kind_rules(), kind_talk(),
-                   kind_other()]
-    out__kinds_all = C_KINDS_ALL
-    return out__kinds_all
-def kind_of(sentence: str) -> str:
-    """Предложение из `enum` → наше короткое имя. Незнакомое (или отказ) → `other`."""
-    # Старые формулировки узнаются наравне с новыми: ответ мог прийти от прогона, начатого
-    # до правки, и падать на этом незачем.
-    C_KIND_NAMES = {kind_work(): "work", kind_recon(): "recon", kind_design(): "design",
-                    kind_rules(): "rules", kind_talk(): "talk", kind_other(): "other",
-                    "This topic is hands-on work on the system: writing, changing or fixing "
-                    "something that runs.": "work",
-                    "This topic is investigation: finding out how something already works, "
-                    "by reading, measuring or experimenting.": "recon",
-                    "This topic is design and decision-making: weighing options and "
-                    "settling on how something should be done.": "design",
-                    "This topic is about how we work together: rules, preferences and "
-                    "prohibitions the user stated.": "rules",
-                    "This topic is conversation outside the work itself: life, examples, "
-                    "digressions, nothing about the system.": "talk"}
-    out__kind_of = C_KIND_NAMES.get(str(sentence or "").strip(), "other")
-    return out__kind_of
-def q_kinds(titles_block: str) -> str:
-    """Вопрос классификации тем. Формулировка владельца: ты выбрала такие темы — для каждой
-    выбери ровно один тип из списка."""
-    C_Q_KINDS = (
+    C_KIND_GENERAL = ("General: anything that is not work on a system - a story, a made-up "
+                      "world, a plan or an idea being developed; asked in plain words, not as "
+                      "engineering.")
+    out__kind_general = C_KIND_GENERAL
+    return out__kind_general
+def kind_brief() -> str:
+    """Короткий опросник (`Plan32.1`): небольшой простой обмен, где хватает «чем кончилось» и
+    «что открыто» — владелец: «на 20 простых сообщениях нет смысла прогонять весь цикл»."""
+    C_KIND_BRIEF = ("Brief: a small, simple exchange where it is enough to say where it landed "
+                    "and what is still open.")
+    out__kind_brief = C_KIND_BRIEF
+    return out__kind_brief
+def q_which_set(titles_block: str, menu: str) -> str:
+    """УЗЕЛ ВЫБОРА ОПРОСНИКА (`Plan32.1`, замысел владельца 2026-10-11): модели показываем ВСЕ
+    наборы вопросов, которые можем задать, — что каждый спросит, — и она выбирает набор для
+    каждой темы. Заменил `q_kinds`: тот выбирал «вид темы», и от вида зависела одна пачка;
+    теперь выбор — это рельсы, по которым пойдёт весь опрос темы.
+
+    Варианты ответа строит генератор (`_scenario.Choice`): фраза-разгон, ведущая по токенам до
+    имени набора, — `which_set_lead()`.
+    """
+    C_Q_WHICH_SET = (
         "We are turning the session above into a distillate, and we ask about each topic "
-        "separately. Before we do, we need to know what KIND of thing each topic was, "
-        "because the questions worth asking differ: what makes sense for work on a system "
-        "is useless, even harmful, for a conversation that was not about the system at "
-        "all.\n\n"
+        "separately. Before we do, we need to choose WHICH SET OF QUESTIONS to ask about each "
+        "topic, because the questions worth asking differ: what makes sense for work on a "
+        "system is useless, even harmful, for a conversation that was not about the system "
+        "at all, and a small simple exchange does not need the full set.\n\n"
+        "These are the sets we can ask. Each one says what it is for and lists what it will "
+        "ask:\n\n{menu}\n\n"
         "These are the topics you identified:\n\n{titles}\n\n"
-        "For each topic, choose exactly ONE description that fits it best. Choose the last "
-        "option if none of them really fits - that is a normal answer, not a failure.\n\n"
+        "For each topic, weigh the sets against what the topic actually contains and choose "
+        "the ONE set whose questions fit it best. Choose the last option if none of them "
+        "really fits - that is a normal answer, not a failure.\n\n"
         "Reply with JSON only: one field per topic title, its value one of the given "
-        "descriptions, copied exactly."
+        "options, copied exactly."
     )
-    out__q_kinds = C_Q_KINDS.format(titles=titles_block)
-    return out__q_kinds
-def s_kinds(titles) -> tuple:
-    """Схема классификации: КЛЮЧИ — сами названия тем, значения — `enum` описаний.
-
-    Почему не массив пар (обсуждено с владельцем 2026-09-21): у массива уплывает длина, что
-    мы уже видели живьём — на ОДНОЙ теме модель вернула три класса подряд. Явные ключи
-    обязывают дать ровно по одной записи на тему, перепутать порядок физически нельзя.
-
-    `propertyNames` с энамкой не зовём: llama.cpp его может не поддержать, а обычные
-    свойства объекта грамматика строит наверняка.
-    """
-    C_S_KINDS_NAME = "filetools_topic_kinds"
-    live = [str(t) for t in titles]
-    C_S_KINDS = {
-        "type": "object",
-        "properties": {t: {"enum": kinds_all()} for t in live},
-        "required": live,
-    }
-    out__s_kinds = (C_S_KINDS, C_S_KINDS_NAME)
-    return out__s_kinds
+    out__q_which_set = C_Q_WHICH_SET.format(titles=titles_block, menu=menu)
+    return out__q_which_set
+def which_set_lead() -> str:
+    """Зачин каждого варианта выбора набора: общий разгон, точка расхождения — имя набора в
+    скобке (владелец: «оценив все вопросы, я считаю, что лучше всего подойдёт набор (название»)."""
+    C_WHICH_SET_LEAD = "Having weighed every set of questions above, the set that fits this topic best is ("
+    out__which_set_lead = C_WHICH_SET_LEAD
+    return out__which_set_lead
 def q_talk() -> str:
     """Разговор вне работы. ОДИН вопрос и ни одного технического слова.
 

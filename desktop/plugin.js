@@ -3,31 +3,6 @@ import * as sdk from "@hermes/plugin-sdk";
 
 // desktop/src/core-format.js
 var KIND_TONE = { ok: "good", "no-change": "muted", error: "bad" };
-var CAPTION_MAX_LINES = 2;
-var CAPTION_MAX_CHARS = 180;
-function interimCaption(text) {
-  if (typeof text !== "string") return "";
-  const lines = stripThink(text).split("\n").map((l) => l.trim()).filter((l) => l !== "");
-  if (lines.length === 0) return "";
-  let out = lines.slice(0, CAPTION_MAX_LINES).join(" ");
-  if (out.length > CAPTION_MAX_CHARS) out = out.slice(0, CAPTION_MAX_CHARS - 1).trimEnd() + "\u2026";
-  return out;
-}
-function stripThink(text) {
-  if (typeof text !== "string") return "";
-  return text.replace(/<think>[\s\S]*?<\/think>/g, " ").replace(/<think>[\s\S]*$/g, " ");
-}
-function boxOf(action) {
-  const label = action && typeof action.label === "string" ? action.label : "";
-  const verb = label.split(" ")[0] || "";
-  if (!verb) return "";
-  let sharing = 0;
-  for (const key of Object.keys(CONTEXT_ACTIONS)) {
-    const other = CONTEXT_ACTIONS[key].label || "";
-    if (other.split(" ")[0] === verb) sharing += 1;
-  }
-  return sharing > 1 ? label : verb;
-}
 function tokensLabel(tokens) {
   const n2 = typeof tokens === "number" && isFinite(tokens) ? Math.max(0, Math.round(tokens)) : 0;
   if (n2 < 1e3) return String(n2);
@@ -205,12 +180,6 @@ function built() {
 function ownMarkerRe() {
   return built().own;
 }
-function exitCodeRe() {
-  return built().exitCode;
-}
-function successRe() {
-  return built().success;
-}
 function patchLinesRe() {
   return built().patchLines;
 }
@@ -225,30 +194,9 @@ function blockTagRe() {
 }
 
 // desktop/src/core.js
-var OUR_TOOLS = [
-  "read_file",
-  "write_file",
-  "patch",
-  "search_files",
-  "terminal",
-  "execute_code",
-  "vision_analyze"
-];
 var COMMAND_TOOLS = ["terminal", "execute_code"];
 function isCommandTool(name) {
   return COMMAND_TOOLS.includes(name);
-}
-function isOurTool(name) {
-  return typeof name === "string" && OUR_TOOLS.includes(name);
-}
-function coerceBody(result) {
-  if (result == null) return "";
-  if (typeof result === "string") return result;
-  try {
-    return JSON.stringify(result, null, 2);
-  } catch {
-    return String(result);
-  }
 }
 function asRecord(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : null;
@@ -302,37 +250,6 @@ function brickTitles(tool, args) {
       return null;
   }
 }
-var EXIT_CODE_TOOLS = ["terminal", "execute_code"];
-function terminalExitCode(body) {
-  const m = typeof body === "string" ? body.match(exitCodeRe()) : null;
-  return m ? Number(m[1]) : null;
-}
-function kindFromExitCode(body) {
-  const code = terminalExitCode(body);
-  if (code == null) return null;
-  return code === 0 ? "ok" : "error";
-}
-function kindFromSuccess(body) {
-  const m = typeof body === "string" ? body.match(successRe()) : null;
-  if (!m) return null;
-  return m[1] === "True" ? "ok" : "error";
-}
-var OP_RE = /Operation ID:\s*([0-9a-fA-F]{4,}(?:x[0-9a-fA-F]{2,4})?)/;
-function opFromHeader(body) {
-  if (typeof body !== "string") return null;
-  const head = body.split("\n", 4);
-  for (const line of head) {
-    const m = line.match(OP_RE);
-    if (m) return m[1];
-  }
-  return null;
-}
-function toMs(v) {
-  if (!Number.isFinite(v)) return null;
-  v = Number(v);
-  if (v <= 0) return null;
-  return v > 1e12 ? Math.round(v) : Math.round(v * 1e3);
-}
 function countLines(text) {
   if (typeof text !== "string" || text === "") return 0;
   const n2 = text.split("\n").length;
@@ -348,198 +265,16 @@ function diffFromArgs(tool, args) {
   }
   return null;
 }
-var NOTHING_WRITTEN_RE = /^\W*(Unchanged|Dry run):/m;
-function buildBrick(event) {
-  const p = asRecord(event && event.payload || {}) || {};
-  const tool = typeof p.name === "string" ? p.name : "";
-  if (!isOurTool(tool)) return null;
-  const rawError = p.error == null || p.error === false ? null : p.error;
-  const isError = rawError != null && (typeof rawError !== "string" || rawError.trim() !== "");
-  const body = coerceBody(p.result);
-  const finalBody = !isError || body !== "" ? body : String(rawError);
-  const { facts, rest } = parseEnvelope(finalBody);
-  const args = asRecord(p.args ?? p.arguments);
-  const t = brickTitles(tool, args) || { title: tool, subtitle: "" };
-  const kind = isError ? "error" : EXIT_CODE_TOOLS.includes(tool) && kindFromExitCode(rest) || tool === "vision_analyze" && kindFromSuccess(rest) || kindFromFacts(facts, rest);
-  const guess = !facts && kind === "ok" && !NOTHING_WRITTEN_RE.test(rest) ? diffFromArgs(tool, args) : null;
-  return {
-    tool,
-    ts: toMs(p.timestamp) || Date.now(),
-    session_id: event && event.session_id || p.session_id || "",
-    tool_id: typeof p.tool_id === "string" ? p.tool_id : "",
-    title: t.title,
-    subtitle: t.subtitle,
-    body: rest,
-    kind,
-    meta: {
-      duration_s: Number.isFinite(p.duration_s) ? p.duration_s : null,
-      // Счётчики показываем в подзаголовке: «что именно сделано» без раскрытия карточки.
-      replacements: facts && Number.isFinite(facts.replacements) ? facts.replacements : null,
-      added: facts && Number.isFinite(facts.added) ? facts.added : guess ? guess.added : null,
-      removed: facts && Number.isFinite(facts.removed) ? facts.removed : guess ? guess.removed : null,
-      // Адрес, которым человек и модель могут СОСЛАТЬСЯ на этот вызов (Plan09).
-      // null у отказов (адрес не печатается) и у карточек, снятых до его появления.
-      op: opFromHeader(rest)
-    }
-  };
-}
 var LIVE_PREFIX = "_live:";
-function writeKeyFor(storedId, liveKey2, eventSid) {
-  if (storedId) return { key: storedId, liveKey: liveKey2 };
-  if (eventSid) {
-    const next = LIVE_PREFIX + eventSid;
-    return { key: next, liveKey: next };
-  }
-  return { key: liveKey2, liveKey: liveKey2 };
-}
-function viewKeyFor(storedId, liveKey2) {
-  return storedId || liveKey2 || null;
+function viewKeyFor(storedId, liveKey) {
+  return storedId || liveKey || null;
 }
 function isPersistableKey(key) {
   return typeof key === "string" && key !== "" && !key.startsWith(LIVE_PREFIX);
 }
-function parseEnvelope(body) {
-  if (typeof body !== "string" || body === "" || body[0] !== "{") return { facts: null, rest: body || "" };
-  const nl = body.indexOf("\n");
-  const head = nl === -1 ? body : body.slice(0, nl);
-  try {
-    const facts = JSON.parse(head);
-    if (!facts || typeof facts !== "object" || Array.isArray(facts)) return { facts: null, rest: body };
-    return { facts, rest: nl === -1 ? "" : body.slice(nl + 1) };
-  } catch {
-    return { facts: null, rest: body };
-  }
-}
-function kindFromFacts(facts, body) {
-  const text = typeof body === "string" ? body.replace(/^\s+/, "") : "";
-  if (facts) {
-    if (facts.success === false || facts.error) return "error";
-    if (facts.no_change === true) return "no-change";
-    if (facts.replacements === 0 && facts.added === 0 && facts.removed === 0) return "no-change";
-    return "ok";
-  }
-  return text.startsWith("ERROR") || text.startsWith('{"error"') ? "error" : "ok";
-}
-function normalizeHistoryOp(op) {
-  if (!op || typeof op !== "object") return null;
-  const tool = typeof op.tool === "string" ? op.tool : "";
-  if (!isOurTool(tool)) return null;
-  return {
-    tool,
-    ts: toMs(op.ts) || 0,
-    session_id: typeof op.session_id === "string" ? op.session_id : "",
-    tool_id: typeof op.tool_id === "string" ? op.tool_id : "",
-    title: typeof op.title === "string" && op.title ? op.title : tool,
-    subtitle: typeof op.subtitle === "string" ? op.subtitle : "",
-    body: coerceBody(op.body),
-    kind: op.kind === "error" || op.kind === "no-change" ? op.kind : "ok",
-    meta: Object.assign({ from_history: true }, op.meta && typeof op.meta === "object" ? op.meta : {})
-  };
-}
-function mergeBricks(history, live) {
-  live = (live || []).filter((b) => !isErasedBrick(b));
-  const liveIds = new Set((live || []).map((b) => b && b.tool_id).filter(Boolean));
-  const kept = (history || []).filter((o) => o && (!o.tool_id || !liveIds.has(o.tool_id)));
-  const histMeta = /* @__PURE__ */ new Map();
-  for (const o of history || []) {
-    if (!o || !o.tool_id || !liveIds.has(o.tool_id)) continue;
-    if (!o.meta || typeof o.meta !== "object") continue;
-    const rest = Object.assign({}, o.meta);
-    delete rest.from_history;
-    histMeta.set(o.tool_id, rest);
-  }
-  const merged = (live || []).map((b) => {
-    const extra = b && b.tool_id ? histMeta.get(b.tool_id) : null;
-    if (!extra) return b;
-    return Object.assign({}, b, { meta: Object.assign({}, extra, b.meta || {}) });
-  });
-  const all = kept.concat(merged);
-  all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
-  return all;
-}
-var CONTEXT_ACTIONS = {
-  content: { mode: "content", label: "drop content" },
-  tool: { mode: "tool", label: "erase tool" },
-  // Уносит ШАГ: реплику модели со всеми её вызовами и ответами. Не полный turn — тот
-  // кончается возвратом управления человеку, и это другое.
-  turn: { mode: "turn", label: "erase turn" }
-};
-var SPREADS_TO_STEP = { turn: true };
-function actionOf(mode) {
-  return CONTEXT_ACTIONS[String(mode || "")] || CONTEXT_ACTIONS.content;
-}
-function stepMates(bricks, op) {
-  const list = Array.isArray(bricks) ? bricks : [];
-  const self = list.find((b) => b && b.meta && b.meta.op === op);
-  if (!self) return [];
-  const key = self.meta.step;
-  if (!key) return [{ op, toolId: self.tool_id || "" }];
-  return list.filter((b) => b && b.meta && b.meta.step === key && b.meta.op).map((b) => ({ op: b.meta.op, toolId: b.tool_id || "" }));
-}
-function opTokens(brick) {
-  const meta = brick && brick.meta || {};
-  if (typeof meta.tokens === "number" && isFinite(meta.tokens) && meta.tokens >= 0) {
-    return { tokens: Math.round(meta.tokens), exact: true };
-  }
-  const body = brick && typeof brick.body === "string" ? brick.body : "";
-  if (!body) return { tokens: 0, exact: false };
-  const bytes = typeof TextEncoder === "function" ? new TextEncoder().encode(body).length : Buffer.byteLength(body, "utf8");
-  return { tokens: Math.ceil(bytes / 4), exact: false };
-}
-function indexReadsByToolId(reads) {
-  const byId = /* @__PURE__ */ new Map();
-  for (const r of reads || []) {
-    if (!r || typeof r !== "object") continue;
-    const id = r.meta && typeof r.meta.tool_call_id === "string" ? r.meta.tool_call_id : "";
-    if (!id) continue;
-    const state = READ_STATE_TONE[r.state] ? r.state : "unknown";
-    const prev = byId.get(id);
-    if (!prev || READ_STATE_RANK[state] > READ_STATE_RANK[prev.state]) {
-      byId.set(id, { state, reason: r.reason || "" });
-    }
-  }
-  return byId;
-}
-var READ_STATE_RANK = {
-  verbatim: 0,
-  unknown: 1,
-  compacted: 2,
-  removed_from_context: 3,
-  evicted: 4
-};
-function attachReadState(bricks, byId) {
-  if (!byId || byId.size === 0) return bricks || [];
-  return (bricks || []).map((b) => {
-    const found = b && b.tool_id ? byId.get(b.tool_id) : null;
-    return found ? Object.assign({}, b, { read: found }) : b;
-  });
-}
-function sessionKey(sessionId) {
-  return "bricks:" + String(sessionId || "");
-}
-function appendBrick(store, sessionId, brick) {
-  const k2 = sessionKey(sessionId);
-  const list = Array.isArray(store[k2]) ? store[k2] : [];
-  list.push(brick);
-  store[k2] = list;
-  return list;
-}
-function readBricks(store, sessionId) {
-  const v = store[sessionKey(sessionId)];
-  return Array.isArray(v) ? v : [];
-}
 function opIsGone(fact) {
   if (!fact) return false;
   return fact.missing_row === true || fact.state === ERASED_STATE;
-}
-function ghostOps(contextOps2) {
-  const out = /* @__PURE__ */ new Set();
-  for (const fact of contextOps2 || []) {
-    if (!opIsGone(fact)) continue;
-    const op = typeof fact.op === "string" ? fact.op : "";
-    if (op) out.add(op);
-  }
-  return out;
 }
 var ERASED_STATE = "erased";
 function isErasedBrick(brick) {
@@ -553,21 +288,6 @@ function visibleBricks(bricks, showErased) {
 }
 function liveContextOps(contextOps2) {
   return (contextOps2 || []).filter((fact) => !opIsGone(fact));
-}
-function removeBricksByOp(store, sessionId, ops) {
-  const kill = new Set((ops || []).filter(Boolean).map(String));
-  if (kill.size === 0) return 0;
-  const k2 = sessionKey(sessionId);
-  const list = Array.isArray(store[k2]) ? store[k2] : null;
-  if (!list) return 0;
-  const kept = list.filter((b) => {
-    if (isErasedBrick(b)) return true;
-    const op = b && b.meta && typeof b.meta.op === "string" ? b.meta.op : "";
-    return !op || !kill.has(op);
-  });
-  const gone = list.length - kept.length;
-  if (gone > 0) store[k2] = kept;
-  return gone;
 }
 var SEGMENT_TOOLS = /* @__PURE__ */ new Set(["read_file", "patch", "write_file"]);
 var GONE_STATES = /* @__PURE__ */ new Set(["compacted", "removed_from_context"]);
@@ -609,6 +329,12 @@ function shadows(op, total) {
 }
 function hasPosition(op) {
   return (op.from || 0) >= 1 && (op.to || 0) >= (op.from || 0);
+}
+function readParts(op) {
+  const ok = Array.isArray(op.parts) && op.parts.length > 1 && op.parts.every(
+    (p) => Array.isArray(p) && p[0] >= 1 && p[1] >= p[0]
+  );
+  return ok ? op.parts.map(([a, b]) => [a, b]) : [[op.from, op.to]];
 }
 function foldParts(parts, at, delta) {
   const out = [];
@@ -661,8 +387,9 @@ function buildContextView(ops) {
     }
     file.folded.push({
       // Диапазон — НАБОР кусков, а не одна пара чисел: вставка внутрь прочитанного разрывает его
-      // надвое (см. foldParts). Обычный случай — один кусок.
-      parts: positioned ? [[op.from, op.to]] : [],
+      // надвое (см. foldParts). Обычный случай — один кусок. Чтение нескольких кусков разом
+      // (`--line 120,450`, Plan30) приносит их в `parts`, а `from`/`to` — их общий охват.
+      parts: positioned ? readParts(op) : [],
       pos: positioned,
       op: op.op,
       tool: op.tool,
@@ -876,8 +603,6 @@ function sameMessages(cur, res) {
 }
 
 // desktop/src/adapter.js
-var CONTENT_MODE = CONTEXT_ACTIONS.content.mode;
-var ACTION_MODES = Object.keys(CONTEXT_ACTIONS);
 function makeAtom(initial) {
   const mk = typeof sdk.atom === "function" ? sdk.atom : null;
   if (mk) return mk(initial);
@@ -887,13 +612,7 @@ function makeAtom(initial) {
   }, listen: () => () => {
   } };
 }
-var VIEW_INITIAL = {
-  sessionId: null,
-  bricks: [],
-  note: "",
-  mode: "mirror",
-  showErased: false
-};
+var VIEW_INITIAL = { sessionId: null, mode: "mirror", showErased: false };
 var $view = makeAtom(VIEW_INITIAL);
 function useView() {
   const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
@@ -903,24 +622,10 @@ function setShowErased(on) {
   const cur = $view.get() || VIEW_INITIAL;
   $view.set(Object.assign({}, cur, { showErased: !!on }));
 }
-var $fileContext = makeAtom({ ops: [], selectedOp: null });
+var $fileContext = makeAtom({ ops: [] });
 function useFileContext() {
   const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
-  return hook($fileContext) || { ops: [], selectedOp: null };
-}
-var DROP_INITIAL = {
-  open: false,
-  mode: false,
-  action: CONTENT_MODE,
-  picked: {},
-  busy: false,
-  note: "",
-  ok: null
-};
-var $drop = makeAtom(DROP_INITIAL);
-function useDrop() {
-  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
-  return hook($drop) || DROP_INITIAL;
+  return hook($fileContext) || { ops: [] };
 }
 var COMPACT_INITIAL = {
   open: false,
@@ -957,8 +662,6 @@ function pollCompactRun(sid) {
   }).catch(() => {
   });
 }
-var memStore = /* @__PURE__ */ Object.create(null);
-var hydrated = /* @__PURE__ */ new Set();
 var adapter = { hasEvents: false, state: null, storageGet: () => Promise.resolve(void 0), storageSet: () => {
 }, onDispose: () => {
 } };
@@ -1027,13 +730,8 @@ function createAdapter(ctx) {
 }
 function initAdapter(ctx) {
   adapter = createAdapter(ctx);
-  historyFetched.clear();
-  readsFetched.clear();
   contextFetched.clear();
   return adapter;
-}
-function hasEvents() {
-  return adapter.hasEvents;
 }
 function hasRest() {
   return adapter.hasRest;
@@ -1071,32 +769,8 @@ function storedSessionId() {
   }
   return null;
 }
-var liveKey = null;
-function writeKey(eventSid) {
-  const r = writeKeyFor(storedSessionId(), liveKey, eventSid);
-  liveKey = r.liveKey;
-  return r.key;
-}
 function viewKey() {
-  return viewKeyFor(storedSessionId(), liveKey);
-}
-var historyFetched = /* @__PURE__ */ new Set();
-var historyNote = {};
-var readsFetched = /* @__PURE__ */ new Set();
-var readsBySession = {};
-var readsIndex = {};
-function ensureReads(sid) {
-  if (!isPersistableKey(sid) || readsFetched.has(sid)) return;
-  readsFetched.add(sid);
-  if (!adapter.hasRest) return;
-  adapter.rest(`/reads?session=${encodeURIComponent(sid)}`).then((res) => {
-    readsBySession[sid] = res && Array.isArray(res.reads) ? res.reads : [];
-    readsIndex[sid] = indexReadsByToolId(readsBySession[sid]);
-    refresh();
-  }).catch(() => {
-    readsBySession[sid] = [];
-    refresh();
-  });
+  return viewKeyFor(storedSessionId(), null);
 }
 var contextFetched = /* @__PURE__ */ new Set();
 var contextOps = {};
@@ -1111,7 +785,6 @@ function ensureContextState(sid) {
     const { ops, note } = contextOpsFrom(res);
     contextOps[sid] = ops;
     if (note) console.info("[hermes-filetools] /context-state:", note);
-    dropGhostBricks(sid, ops);
     publishFileContext(sid);
   }).catch((err) => {
     contextOps[sid] = NO_OPS;
@@ -1273,9 +946,9 @@ function setExportMode(on, initialPicked) {
     ok: null,
     dir: ""
   });
-  setDropMode(false);
   setCompactMode(false);
   setAddrOpMode(false);
+  setLLMOpsMode(false);
 }
 function setExportPicks(picked) {
   const cur = $exportRail.get() || EXPORT_INITIAL;
@@ -1308,6 +981,123 @@ function applyExport() {
     const note = `exported ${written}` + (paired ? ` (+${paired} calls)` : "") + ` \u2192 ${String(r.dir || "")}` + (missing ? ` \xB7 ${missing} not found` : "");
     setExportRail(Object.assign({}, EXPORT_INITIAL, { note, ok: true, dir: String(r.dir || "") }));
   }).catch((err) => setExportRail({ busy: false, ok: false, note: `request failed: ${err && err.message || err}` }));
+}
+var LLMOPS_INITIAL = { mode: false, picked: {}, busy: false, note: "", ok: null };
+var $llmopsRail = makeAtom(LLMOPS_INITIAL);
+var $llmopsWin = makeAtom(null);
+var llmopsSeq = 0;
+function useLLMOpsRail() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($llmopsRail) || LLMOPS_INITIAL;
+}
+function useLLMOpsWin() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($llmopsWin) || null;
+}
+function llmopsWindowOpen() {
+  return !!$llmopsWin.get();
+}
+function setLLMOpsRail(patch) {
+  $llmopsRail.set(Object.assign({}, $llmopsRail.get() || LLMOPS_INITIAL, patch));
+}
+function setLLMOpsMode(on) {
+  if (!on) {
+    const prev = $llmopsRail.get() || LLMOPS_INITIAL;
+    setLLMOpsRail(Object.assign({}, LLMOPS_INITIAL, { note: prev.note, ok: prev.ok }));
+    return;
+  }
+  setLLMOpsRail({ mode: true, picked: {}, busy: false, note: "", ok: null });
+  setCompactMode(false);
+  setExportMode(false);
+  setAddrOpMode(false);
+}
+function setLLMOpsPicks(picked) {
+  const cur = $llmopsRail.get() || LLMOPS_INITIAL;
+  if (!cur.mode) return;
+  setLLMOpsRail({ picked: Object.assign({}, picked || {}) });
+}
+function openLLMOpsWindow(sid, addrs) {
+  if ($llmopsWin.get()) return false;
+  llmopsSeq += 1;
+  $llmopsWin.set({ sid: String(sid || ""), addrs: (addrs || []).slice(), seq: llmopsSeq });
+  return true;
+}
+function closeLLMOpsWindow() {
+  $llmopsWin.set(null);
+}
+function applyLLMOps() {
+  const cur = $llmopsRail.get() || LLMOPS_INITIAL;
+  if (!cur.mode) return;
+  const addrs = Object.keys(cur.picked || {});
+  const sid = viewKey();
+  if (!addrs.length) {
+    setLLMOpsRail({ note: "nothing ticked", ok: false });
+    return;
+  }
+  if (!isPersistableKey(sid)) {
+    setLLMOpsRail({ note: "this chat is not saved yet", ok: false });
+    return;
+  }
+  if (!openLLMOpsWindow(sid, addrs)) {
+    setLLMOpsRail({ note: "the LLMOps window is already open", ok: false });
+    return;
+  }
+  setLLMOpsMode(false);
+}
+var LLMOPS_POLL_MS = 1500;
+var LLMOPS_WAIT_MS = 15 * 60 * 1e3;
+function waitLLMOpsRun(sid) {
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const tick = () => {
+      adapter.rest(`/context-compact-status?session=${encodeURIComponent(sid)}`).then((res) => {
+        const r = asRecord(res);
+        if (r.running) {
+          if (Date.now() - started > LLMOPS_WAIT_MS) {
+            resolve({ ok: false, error: "no result after 15 min \u2014 see the status line" });
+            return;
+          }
+          setTimeout(tick, LLMOPS_POLL_MS);
+          return;
+        }
+        const lines = Array.isArray(r.lines) ? r.lines.map(String) : [];
+        const report = String(r.error || lines[lines.length - 1] || (r.ok ? "replaced" : "not replaced"));
+        setLLMOpsRail({ note: `llm ops: ${report}`, ok: r.ok === true });
+        if (r.ok) {
+          contextFetched.delete(sid);
+          refresh();
+          loadMessages();
+        }
+        resolve({ ok: r.ok === true, report, error: r.ok ? "" : report, lines });
+      }).catch(() => setTimeout(tick, LLMOPS_POLL_MS));
+    };
+    setTimeout(tick, LLMOPS_POLL_MS);
+  });
+}
+function llmopsTransport(sid, addrs) {
+  const s = encodeURIComponent(String(sid || ""));
+  const get = (path, what) => adapter.rest(path).then((res) => {
+    const r = asRecord(res);
+    if (r.ok === false || r.error) throw new Error(String(r.error || what));
+    return r;
+  });
+  return {
+    data: () => get(`/llmops-data?session=${s}&addrs=${encodeURIComponent((addrs || []).join(","))}`, "no data"),
+    models: () => get(`/llmops-models?session=${s}`, "no model list"),
+    presets: () => get(`/llmops-presets?session=${s}`, "no presets"),
+    chat: ({ messages, model, think }) => adapter.rest("/llmops-chat", { method: "POST", body: { session: sid, messages, model, think: !!think } }).then(asRecord),
+    replace: ({ addrs: eat, text, wrap, preset }) => {
+      setLLMOpsRail({ note: "llm ops: replacing\u2026", ok: null });
+      return adapter.rest("/llmops-replace", { method: "POST", body: { session: sid, addrs: eat, text, wrap, preset: preset || "" } }).then(asRecord).then((r) => {
+        if (r.ok !== true) {
+          const why = String(r.error || "not started");
+          setLLMOpsRail({ note: `llm ops: ${why}`, ok: false });
+          return { ok: false, error: why };
+        }
+        return waitLLMOpsRun(sid);
+      });
+    }
+  };
 }
 function copyExportDir() {
   const dir = String(($exportRail.get() || EXPORT_INITIAL).dir || "");
@@ -1432,9 +1222,9 @@ function setAddrOpMode(on, kind) {
     note: "",
     ok: null
   });
-  setDropMode(false);
   setCompactMode(false);
   setExportMode(false);
+  setLLMOpsMode(false);
 }
 function setAddrOpPicks(picked) {
   const cur = $addrOp.get() || ADDR_OP_INITIAL;
@@ -1462,14 +1252,8 @@ function applyAddrOp() {
       setAddrOp({ busy: false, ok: false, note: String(r.summary || r.error || "not applied") });
       return;
     }
-    if (cur.kind === "erase") {
-      const gone = removeBricksByOp(memStore, sid, Array.isArray(r.ops) ? r.ops : []);
-      if (gone > 0) adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
-    }
     setAddrOp(Object.assign({}, ADDR_OP_INITIAL, { ok: true, note: String(r.summary || "applied") }));
     contextFetched.delete(sid);
-    readsFetched.delete(sid);
-    historyFetched.delete(sid);
     refresh();
   }).catch((err) => setAddrOp({ busy: false, ok: false, note: `request failed: ${err && err.message || err}` }));
 }
@@ -1570,14 +1354,6 @@ function reloadMessagesQuietly() {
   }).catch(() => {
   });
 }
-function dropGhostBricks(sid, ops) {
-  const ghosts = ghostOps(ops);
-  if (ghosts.size === 0) return;
-  const gone = removeBricksByOp(memStore, sid, Array.from(ghosts));
-  if (gone > 0 && isPersistableKey(sid)) {
-    adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
-  }
-}
 function publishFileContext(sid) {
   if (sid !== viewKey()) return;
   const cur = $fileContext.get() || {};
@@ -1600,8 +1376,6 @@ function handleStatusUpdate(event) {
     const sid = viewKey();
     if (!isPersistableKey(sid)) return;
     contextFetched.delete(sid);
-    readsFetched.delete(sid);
-    historyFetched.delete(sid);
     refresh();
     scheduleMirrorReload();
   } catch (err) {
@@ -1622,9 +1396,8 @@ function handleSocketFrame(data) {
       if (!isPersistableKey(sid)) return;
       if (frame.session && frame.session !== sid) return;
       contextFetched.delete(sid);
-      readsFetched.delete(sid);
-      historyFetched.delete(sid);
       refresh();
+      scheduleMirrorReload();
     } catch (err) {
       console.error("[hermes-filetools] context-changed handler:", err);
     }
@@ -1662,8 +1435,6 @@ function pollRevision() {
     if (rev === revisionSeen[sid]) return;
     revisionSeen[sid] = rev;
     contextFetched.delete(sid);
-    readsFetched.delete(sid);
-    historyFetched.delete(sid);
     refresh();
     loadMessages();
   }).catch(() => {
@@ -1690,159 +1461,15 @@ function closeEventSocket() {
   }
   socketSid = null;
 }
-function ensureHistory(sid) {
-  if (!isPersistableKey(sid) || historyFetched.has(sid)) return;
-  historyFetched.add(sid);
-  if (!adapter.hasRest) {
-    historyNote[sid] = "this build gives the plugin no REST, so history is unavailable";
-    return;
-  }
-  adapter.rest(`/ops?session=${encodeURIComponent(sid)}&limit=200`).then((res) => {
-    const raw = res && Array.isArray(res.ops) ? res.ops : [];
-    const ops = raw.map(normalizeHistoryOp).filter(Boolean);
-    const k2 = sessionKey(sid);
-    memStore[k2] = mergeBricks(ops, memStore[k2] || []);
-    if (res && typeof res.note === "string" && ops.length === 0) historyNote[sid] = res.note;
-    if (res && typeof res.error === "string") historyNote[sid] = res.error;
-    refresh();
-  }).catch((err) => {
-    historyNote[sid] = `history unavailable: ${err && err.message || err}`;
-    refresh();
-  });
-}
 function refresh() {
   const sid = viewKey();
-  ensureHydration(sid);
-  ensureHistory(sid);
-  ensureReads(sid);
   ensureContextState(sid);
   ensureEventSocket(sid);
   ensureFocus(sid);
   startRevisionPoll();
   publishFileContext(sid);
   const cur = $view.get() || {};
-  $view.set(Object.assign({}, cur, {
-    sessionId: sid,
-    bricks: attachReadState(readBricks(memStore, sid || ""), readsIndex[sid] || null),
-    note: sid ? historyNote[sid] || "" : ""
-  }));
-}
-var DROP_EMPTY = DROP_INITIAL;
-function setDrop(patch) {
-  $drop.set(Object.assign({}, $drop.get() || DROP_EMPTY, patch));
-}
-function setStripOpen(on) {
-  if (on) {
-    setDrop({ open: true });
-    return;
-  }
-  const cur = $drop.get() || DROP_EMPTY;
-  $drop.set(Object.assign({}, DROP_EMPTY, { note: cur.note, ok: cur.ok }));
-}
-function setDropMode(on, action) {
-  const prev = $drop.get() || DROP_EMPTY;
-  if (!on) {
-    $drop.set(Object.assign({}, DROP_EMPTY, { open: prev.open, note: prev.note, ok: prev.ok }));
-    return;
-  }
-  const mode = ACTION_MODES.indexOf(String(action || "")) >= 0 ? String(action) : prev.action || CONTENT_MODE;
-  setDrop({ open: true, mode: true, action: mode, picked: {}, busy: false, note: "", ok: null });
-  setCompactMode(false);
-  setExportMode(false);
-  setAddrOpMode(false);
-  const sid = viewKey();
-  if (isPersistableKey(sid)) {
-    historyFetched.delete(sid);
-    refresh();
-  }
-}
-function toggleDropPick(op, toolId) {
-  if (!op) return;
-  const cur = $drop.get() || DROP_EMPTY;
-  if (!cur.mode) return;
-  const picked = Object.assign({}, cur.picked);
-  const mates = SPREADS_TO_STEP[cur.action] ? stepMates(readBricks(memStore, viewKey()), op) : [{ op, toolId: typeof toolId === "string" ? toolId : "" }];
-  const targets = mates.length ? mates : [{ op, toolId: toolId || "" }];
-  if (op in picked) for (const m of targets) delete picked[m.op];
-  else for (const m of targets) picked[m.op] = m.toolId;
-  setDrop({ picked, note: "", ok: null });
-  syncDropSelection(picked, cur.action);
-}
-function syncDropSelection(picked, action) {
-  const sid = viewKey();
-  if (adapter.hasRest && isPersistableKey(sid)) {
-    adapter.rest("/context-select", {
-      method: "POST",
-      body: {
-        session: sid,
-        items: Object.keys(picked).map((o) => ({ op: o, tool_call_id: picked[o], mode: action || CONTENT_MODE }))
-      }
-    }).catch(() => {
-    });
-  }
-}
-function applyDrop() {
-  const cur = $drop.get() || DROP_EMPTY;
-  const ops = Object.keys(cur.picked || {});
-  const sid = viewKey();
-  if (!ops.length) {
-    setDrop({ note: "nothing to apply \u2014 no operation is ticked", ok: false });
-    return Promise.resolve();
-  }
-  if (!adapter.hasRest || !isPersistableKey(sid)) {
-    setDrop({ note: "this chat is not saved yet \u2014 nothing to apply to", ok: false });
-    return Promise.resolve();
-  }
-  setDrop({ busy: true, note: "", ok: null });
-  return adapter.rest("/context-apply", { method: "POST", body: { session: sid, ops, mode: cur.action } }).then((res) => {
-    const r = res && typeof res === "object" ? res : {};
-    const ok = r.ok === true;
-    if (!ok && cur.action === CONTEXT_ACTIONS.tool.mode) {
-      const gone = removeBricksByOp(memStore, sid, eraseTouched(r));
-      if (gone > 0 && isPersistableKey(sid)) {
-        adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
-      }
-    }
-    setDrop({
-      busy: false,
-      ok,
-      note: dropNote(r),
-      // Применённое снимаем с отметок, остальное оставляем: если из четырёх номеров прошли
-      // два, галочки на непрошедших — единственное, что человеку осталось от его выбора.
-      picked: ok ? dropRest(cur.picked, r.applied) : cur.picked,
-      mode: ok ? false : cur.mode
-    });
-    if (ok) {
-      if (cur.action === CONTEXT_ACTIONS.tool.mode) {
-        const gone = removeBricksByOp(memStore, sid, eraseTouched(r));
-        if (gone > 0 && isPersistableKey(sid)) {
-          adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
-        }
-      }
-      contextFetched.delete(sid);
-      readsFetched.delete(sid);
-      historyFetched.delete(sid);
-      refresh();
-    }
-  }).catch((err) => {
-    setDrop({ busy: false, ok: false, note: `request failed: ${err && err.message || err}` });
-  });
-}
-function eraseTouched(r) {
-  const applied = Array.isArray(r.applied) ? r.applied : [];
-  const absent = Array.isArray(r.absent) ? r.absent : [];
-  return applied.concat(absent);
-}
-function dropRest(picked, applied) {
-  const done = new Set(Array.isArray(applied) ? applied : []);
-  const out = {};
-  for (const op of Object.keys(picked || {})) if (!done.has(op)) out[op] = picked[op];
-  return out;
-}
-function dropNote(r) {
-  if (typeof r.error === "string" && r.error) return r.error;
-  if (typeof r.summary === "string" && r.summary) return r.summary;
-  return r.ok === true ? "applied" : "not applied";
+  if (cur.sessionId !== sid) $view.set(Object.assign({}, cur, { sessionId: sid }));
 }
 function setCompact(patch) {
   $compact.set(Object.assign({}, $compact.get() || COMPACT_INITIAL, patch));
@@ -1886,9 +1513,9 @@ function setCompactMode(on, initialPicked) {
     note: "",
     ok: null
   });
-  setDropMode(false);
   setExportMode(false);
   setAddrOpMode(false);
+  setLLMOpsMode(false);
 }
 function applyCompactPick(addr, wantPicked) {
   if (!addr) return;
@@ -1958,8 +1585,6 @@ function pollCompactStatus(sid) {
     });
     if (r.ok) {
       contextFetched.delete(sid);
-      readsFetched.delete(sid);
-      historyFetched.delete(sid);
       refresh();
       loadMessages();
     }
@@ -1995,33 +1620,6 @@ function confirmCompact() {
   }).catch((err) => {
     setCompact({ busy: false, ok: false, note: `request failed: ${err && err.message || err}` });
   });
-}
-function ensureHydration(sid) {
-  if (!isPersistableKey(sid) || hydrated.has(sid)) return;
-  hydrated.add(sid);
-  adapter.storageGet(sessionKey(sid)).then((raw) => {
-    let list = raw;
-    if (typeof list === "string") {
-      try {
-        list = JSON.parse(list);
-      } catch {
-        list = null;
-      }
-    }
-    const k2 = sessionKey(sid);
-    if (Array.isArray(list) && list.length > 0 && !memStore[k2]) {
-      memStore[k2] = list;
-      refresh();
-    }
-  }).catch(() => {
-  });
-}
-var pendingCaption = "";
-var CAPTION_BUFFER_MAX = 4e3;
-var captionBuffer = "";
-function handleTurnStart() {
-  captionBuffer = "";
-  pendingCaption = "";
 }
 function handleTurnEnd() {
   scheduleMirrorReload();
@@ -2067,52 +1665,36 @@ function loadTokens(opts) {
     ));
   });
 }
-function handleDelta(event) {
-  try {
-    const p = asRecord(event && event.payload || {}) || {};
-    const chunk = typeof p.text === "string" ? p.text : "";
-    if (!chunk) return;
-    captionBuffer = (captionBuffer + chunk).slice(-CAPTION_BUFFER_MAX);
-  } catch (err) {
-    console.error("[hermes-filetools] message.delta handler:", err);
-  }
-}
-function handleInterim(event) {
-  try {
-    const p = asRecord(event && event.payload || {}) || {};
-    const caption = interimCaption(p.text);
-    if (caption) pendingCaption = caption;
-  } catch (err) {
-    console.error("[hermes-filetools] message.interim handler:", err);
-  }
+var LIVE_DURATIONS_MAX = 200;
+var $liveDurations = makeAtom({});
+function useLiveDurations() {
+  const hook = typeof sdk.useValue === "function" ? sdk.useValue : (a) => a && typeof a.get === "function" ? a.get() : void 0;
+  return hook($liveDurations) || {};
 }
 function handleToolComplete(event) {
   try {
     scheduleMirrorReload();
-    const brick = buildBrick(event);
-    if (!brick) return;
-    const sid = writeKey(brick.session_id || "unknown");
-    if (typeof sid !== "string" || sid === "") return;
-    brick.meta = Object.assign({}, brick.meta, { gateway_sid: brick.session_id || "" });
-    brick.session_id = sid;
-    const caption = pendingCaption || interimCaption(captionBuffer);
-    if (caption) brick.note = caption;
-    pendingCaption = "";
-    captionBuffer = "";
-    ensureHydration(sid);
-    appendBrick(memStore, sid, brick);
-    if (isPersistableKey(sid)) adapter.storageSet(sessionKey(sid), memStore[sessionKey(sid)]);
+    const p = asRecord(event && event.payload || {}) || {};
+    const id = typeof p.tool_id === "string" ? p.tool_id : "";
+    if (id && Number.isFinite(p.duration_s)) {
+      const cur = $liveDurations.get() || {};
+      const keys = Object.keys(cur);
+      const next = {};
+      keys.slice(Math.max(0, keys.length - LIVE_DURATIONS_MAX + 1)).forEach((k2) => {
+        next[k2] = cur[k2];
+      });
+      next[id] = p.duration_s;
+      $liveDurations.set(next);
+    }
     scheduleContextRefetch(viewKey());
-    refresh();
   } catch (err) {
     console.error("[hermes-filetools] tool.complete handler:", err);
   }
 }
 
 // desktop/src/file-ops-pane.js
-import { jsx as jsx36, jsxs as jsxs35 } from "react/jsx-runtime";
-import { useRef as useRef9, useLayoutEffect as useLayoutEffect6, useMemo as useMemo3, useEffect as useEffect8, useState as useState15, memo } from "react";
-import * as sdk8 from "@hermes/plugin-sdk";
+import { jsx as jsx42, jsxs as jsxs37, Fragment } from "react/jsx-runtime";
+import { useRef as useRef12, useLayoutEffect as useLayoutEffect7, useMemo as useMemo5, useEffect as useEffect10, useState as useState18, memo } from "react";
 
 // desktop/src/brick.js
 import { jsx, jsxs } from "react/jsx-runtime";
@@ -2796,6 +2378,8 @@ var EXPORT_HUE_SHARE = 25;
 var EXPORT_TONE = themeHue(EXPORT_BASE, EXPORT_HUE_SHARE);
 var IMPORT_BASE = { l: 0.75, c: 0.13, h: 215 };
 var IMPORT_TONE = themeHue(IMPORT_BASE, EXPORT_HUE_SHARE);
+var LLMOPS_BASE = { l: 0.78, c: 0.09, h: 75 };
+var LLMOPS_TONE = themeHue(LLMOPS_BASE, EXPORT_HUE_SHARE);
 var ACTION_COLOR = {
   content: "var(--ui-orange)",
   tool: "var(--ui-purple)",
@@ -2803,7 +2387,8 @@ var ACTION_COLOR = {
   compact: COMPACT_TONE,
   export: EXPORT_TONE,
   erase: "var(--ui-red)",
-  import: IMPORT_TONE
+  import: IMPORT_TONE,
+  llmops: LLMOPS_TONE
 };
 function railFill(tone) {
   return `color-mix(in oklch, ${tone}, transparent 45%)`;
@@ -2874,39 +2459,7 @@ function statusesFor(brick) {
   }
   return out;
 }
-function pickFor(brick, drop, onPick) {
-  const meta = brick.meta || {};
-  const op = typeof meta.op === "string" && meta.op ? meta.op : null;
-  const enabled = !!(drop && drop.mode);
-  if (!enabled) return null;
-  if (isErasedBrick(brick)) return null;
-  const action = actionOf(drop.action);
-  const dropped = meta.state === "removed_from_context" || !!(brick.read && brick.read.state === "removed_from_context");
-  if (dropped && action.mode === "content") return null;
-  const weight = opTokens(brick);
-  if (!op) {
-    return {
-      enabled: true,
-      selectable: false,
-      why: "no operation id \u2014 neither the button nor the command can address it"
-    };
-  }
-  return {
-    enabled: true,
-    selectable: true,
-    checked: !!(drop.picked && op in drop.picked),
-    onPick: onPick ? () => onPick(op, brick.tool_id || "") : void 0,
-    // Галочка подписана ГЛАГОЛОМ действия, а не «выбрать»: отмечая её, человек не выбирает
-    // абстрактно, а называет операцию, над которой действие произойдёт. Объект в этот момент
-    // известен и так — он написан на взведённой кнопке (см. boxOf в core.js).
-    label: boxOf(actionOf(drop.action)),
-    // `tk` у числа (владелец, 2026-09-09): «300 tk», иначе непонятно, что это токены, а не
-    // строки, байты или что-нибудь ещё, чего в этой панели показано достаточно.
-    tokensText: `${tokensLabel(weight.tokens)} tk`,
-    exact: weight.exact
-  };
-}
-function brickToCardProps(brick, toolColumnWidth, stalePct, drop, onPick) {
+function brickToCardProps(brick, toolColumnWidth, stalePct) {
   const meta = brick.meta || {};
   const isCommand = isCommandTool(brick.tool);
   const { fileName, filePath } = isCommand ? { fileName: null, filePath: null } : splitPath(brick.title);
@@ -2948,7 +2501,7 @@ function brickToCardProps(brick, toolColumnWidth, stalePct, drop, onPick) {
       // шапке карточки узкий и читает его человек, у которого адрес перед
       // глазами каждый день. Значение при этом одно и то же.
       opNumber: typeof meta.op === "string" && meta.op ? `op: ${meta.op}` : null,
-      pick: pickFor(brick, drop, onPick),
+      pick: null,
       toolColumnWidth
     },
     commandText: null,
@@ -2970,18 +2523,17 @@ var CHIP_STATUS = {
   // 2026-10-05: `≠` оранжевым). Сам факт импорта значка не получает — только строку в ховере.
   edited: { glyph: "\u2260", tone: "var(--ui-orange)", title: "edited by hand before import" }
 };
-function chipState(brick, fact) {
-  const meta = brick && brick.meta || {};
-  return fact && fact.state || meta.state || brick && brick.read && brick.read.state || "";
+function chipState(ledger, fact) {
+  return fact && fact.state || ledger && ledger.state || "";
 }
-function chipStatuses({ brick, fact, foreign, unrecorded }) {
+function chipStatuses({ ledger, fact, foreign, unrecorded }) {
   const out = [];
-  const kind = brick && brick.kind || fact && fact.kind || "ok";
+  const kind = fact && fact.kind || "ok";
   if (kind === "error") out.push(CHIP_STATUS.error);
   else if (kind === "no-change") out.push(CHIP_STATUS.noChange);
-  const state = chipState(brick, fact);
+  const state = chipState(ledger, fact);
   if (state === "removed_from_context") out.push(CHIP_STATUS.dropped);
-  else if (state === "compacted" || brick && brick.meta && brick.meta.compacted) out.push(CHIP_STATUS.compacted);
+  else if (state === "compacted") out.push(CHIP_STATUS.compacted);
   else if (state === "evicted") out.push(CHIP_STATUS.evicted);
   else if (state === "unknown") out.push(CHIP_STATUS.unknown);
   if (fact && fact.edited) out.push(CHIP_STATUS.edited);
@@ -2989,25 +2541,24 @@ function chipStatuses({ brick, fact, foreign, unrecorded }) {
   if (unrecorded) out.push(CHIP_STATUS.unrecorded);
   return out;
 }
-function brickSubject(brick) {
-  if (!brick) return "";
-  const tool = String(brick.tool || "");
-  let t = String(brick.title || "");
-  if (tool && t.startsWith(tool + " ")) t = t.slice(tool.length + 1);
-  return t === tool ? "" : t.trim();
+function callTitles(fact) {
+  const call = fact && fact.call;
+  if (!call || !call.args) return { title: "", subtitle: "", command: false };
+  const name = String(call.name || fact.name || "");
+  const t = brickTitles(name, call.args) || { title: "", subtitle: "" };
+  const blank2 = !t.title || t.title === name || ["read", "write", "patch", "search"].includes(t.title);
+  return { title: blank2 ? "" : t.title, subtitle: t.subtitle || "", command: isCommandTool(name) };
 }
-function chipTarget({ brick, fact, target }) {
+function chipTarget({ fact, target }) {
   if (fact && fact.file) return fact.file;
-  const subject = brickSubject(brick);
-  if (subject) return isCommandTool(brick.tool) ? subject : splitPath(subject).fileName;
-  const t = String(target || "").replace(/\\/g, "/");
-  return t ? t.split("/").filter(Boolean).pop() || t : "";
+  const t = callTitles(fact);
+  if (t.title) return t.command ? t.title : splitPath(t.title).fileName;
+  const raw = String(target || "").replace(/\\/g, "/");
+  return raw ? raw.split("/").filter(Boolean).pop() || raw : "";
 }
-function chipDiff(brick, fact) {
-  const fromLedger = fact && (Number(fact.added) > 0 || Number(fact.removed) > 0);
-  const meta = fromLedger ? fact : brick && brick.meta || {};
-  const added = Number.isFinite(Number(meta.added)) ? Number(meta.added) : 0;
-  const removed = Number.isFinite(Number(meta.removed)) ? Number(meta.removed) : 0;
+function chipDiff(ledger, fact) {
+  const added = ledger ? Number(ledger.added) || 0 : 0;
+  const removed = ledger ? Number(ledger.removed) || 0 : 0;
   if (added || removed) return { added, removed };
   return diffFromRow(fact);
 }
@@ -3039,27 +2590,95 @@ function diffFromRow(fact) {
   }
   return null;
 }
-function chipTipLines({ name, op, brick, fact, target, statuses, tokens, freshness }) {
-  const meta = brick && brick.meta || {};
+function chipTipLines({ name, op, ledger, fact, target, statuses, tokens, freshness, duration }) {
   const lines = [];
   lines.push([name, op ? `op ${op}` : ""].filter(Boolean).join(" \xB7 "));
-  const subject = brickSubject(brick);
-  const command = brick && isCommandTool(brick.tool) ? subject : "";
-  const path = fact && fact.path || (command ? "" : subject) || String(target || "");
+  const t = callTitles(fact);
+  const command = t.command ? t.title : "";
+  const path = fact && fact.path || (command ? "" : t.title) || String(target || "");
   if (command) lines.push(`command: ${command}`);
   else if (path) lines.push(path);
-  if (brick && brick.subtitle) lines.push(brick.subtitle);
-  const diff = chipDiff(brick, fact);
+  if (t.subtitle) lines.push(t.subtitle);
+  const diff = chipDiff(ledger, fact);
   if (diff) lines.push(`lines: +${diff.added} -${diff.removed}`);
   (statuses || []).forEach((s) => lines.push(`${s.glyph}  \u2014  ${s.title}`));
+  if (ledger && ledger.reason && !(fact && fact.state)) lines.push(String(ledger.reason));
   const from = fact && fact.imported_from;
   if (from && typeof from === "object") {
     lines.push(`imported: was op ${from.op || "?"} in ${from.session || "?"}`);
   }
-  const dur = formatDuration(meta.duration_s);
+  const dur = formatDuration(duration);
   lines.push([tokens ? `${tokens} tk` : "", `freshness: ${freshness}`, dur ? `took ${dur}` : ""].filter(Boolean).join(" \xB7 "));
   return lines.filter(Boolean);
 }
+
+// desktop/src/stack-mock.js
+var T0 = Date.UTC(2026, 9, 6, 12, 0, 0);
+function mock(i, tool, title, subtitle, body, meta = {}, extra = {}) {
+  return Object.assign({
+    tool,
+    ts: T0 + i * 7e3,
+    session_id: "mock",
+    tool_id: `mock_${i}`,
+    title,
+    subtitle,
+    body,
+    kind: "ok",
+    meta: Object.assign({ op: (64 + i).toString(16).padStart(4, "0"), duration_s: 0.1 + i / 10 }, meta)
+  }, extra);
+}
+var MOCK_BRICKS = [
+  mock(
+    1,
+    "read_file",
+    "read_file /workspace/src/app.py",
+    "line 1 \xB7 count 40",
+    "# Operation ID: 0041\n# File: /workspace/src/app.py\n# Lines: 1-40 of 212 \xB7 LF\n\u25CB\u25CB\u25CB\n\u25A0BLOCK\n   1 | import os\n   2 | import sys\n   3 |\n   4 | def main():\n   5 |     return run(sys.argv)\n\u25A0END",
+    {},
+    { note: "\u0421\u043D\u0430\u0447\u0430\u043B\u0430 \u043F\u043E\u0441\u043C\u043E\u0442\u0440\u044E, \u043A\u0430\u043A \u0443\u0441\u0442\u0440\u043E\u0435\u043D\u0430 \u0442\u043E\u0447\u043A\u0430 \u0432\u0445\u043E\u0434\u0430." }
+  ),
+  mock(
+    2,
+    "patch",
+    "patch /workspace/src/app.py",
+    "line 5",
+    "# Operation ID: 0042\n# File: /workspace/src/app.py\n# Lines: 212 -> 214\n\u25CB\u25CB\u25CB\nReplaced 1 occurrence.",
+    { added: 3, removed: 1 }
+  ),
+  mock(
+    3,
+    "terminal",
+    "terminal pytest -q tests/test_app.py",
+    "",
+    "\u25C6 Operation ID: 0043\n\u25C6 Exit code: 0\n\u25CB\u25CB\u25CB\n12 passed in 0.84s",
+    {}
+  ),
+  mock(
+    4,
+    "search_files",
+    "search_files /workspace/src",
+    "pattern 'run('",
+    "# Operation ID: 0044\n\u25CB\u25CB\u25CB\n/workspace/src/app.py:5:    return run(sys.argv)\n/workspace/src/cli.py:18:def run(argv):",
+    {}
+  ),
+  mock(
+    5,
+    "write_file",
+    "write_file /workspace/notes/todo.md",
+    "",
+    "<!-- Operation ID: 0045 -->\n<!-- File: /workspace/notes/todo.md -->\n\u25CB\u25CB\u25CB\nCreated new file (6 lines).",
+    { added: 6, removed: null, state: "removed_from_context" },
+    { read: { state: "removed_from_context", reason: "" } }
+  ),
+  mock(
+    6,
+    "read_file",
+    "read_file /workspace/src/cli.py",
+    "",
+    "",
+    { state: "erased", erased_at: (T0 + 6e4) / 1e3, erased_by: "erase" }
+  )
+];
 
 // desktop/src/core-window.js
 var ROW_PX = 34;
@@ -4300,8 +3919,8 @@ function PalettePane() {
 }
 
 // desktop/src/prompt-mirror.js
-import * as sdk7 from "@hermes/plugin-sdk";
-import { jsx as jsx31, jsxs as jsxs30 } from "react/jsx-runtime";
+import * as sdk8 from "@hermes/plugin-sdk";
+import { jsx as jsx33, jsxs as jsxs30 } from "react/jsx-runtime";
 import { useEffect as useEffect5, useLayoutEffect as useLayoutEffect4, useState as useState11, useMemo as useMemo2, useRef as useRef6 } from "react";
 
 // desktop/src/mirror-rail.js
@@ -4449,7 +4068,7 @@ function selectionRailChrome({ key, column, rowSpan, fill, headHeight, onClose, 
   }, `${key}-close`);
   return { body, cap, close };
 }
-function Rail({ railRows, cells, guide, gridRow, gridColumn }) {
+function Rail({ railRows, cells: cells2, guide, gridRow, gridColumn }) {
   const rowsTemplate = railRows.map((r) => `calc(${r.height} + ${r.gap})`).join(" ");
   return jsx19("div", {
     style: {
@@ -4466,7 +4085,7 @@ function Rail({ railRows, cells, guide, gridRow, gridColumn }) {
       outline: guide ? `1px solid ${SEGMENT_GUIDE}` : void 0,
       outlineOffset: guide ? "4px" : void 0
     },
-    children: cells
+    children: cells2
   });
 }
 var OPENER_CELL = "1.18rem";
@@ -4520,33 +4139,6 @@ function baseCells(railRows, picked, drag, paint) {
         cursor: active ? "pointer" : "default",
         border: active ? `1px solid ${border}` : "1px solid transparent",
         backgroundColor: selected ? fill : wash
-      }
-    }, `${r.rowIndex}`);
-  });
-}
-function pickCells(railRows, drop) {
-  if (!drop || !drop.mode) return [];
-  const color = ACTION_COLOR[drop.action] || "var(--ui-text-quaternary)";
-  const picked = drop.picked || {};
-  return railRows.filter((r) => r.pickable).map((r) => {
-    const isPicked = Object.prototype.hasOwnProperty.call(picked, r.op);
-    return jsx19("span", {
-      onClick: (e) => {
-        e.stopPropagation();
-        toggleDropPick(r.op, r.toolId);
-      },
-      title: `${isPicked ? "unpick" : "pick"} op ${r.op} for "${drop.action}"`,
-      style: {
-        gridRow: r.rowIndex + 1,
-        alignSelf: "end",
-        justifySelf: "center",
-        cursor: "pointer",
-        width: cellSide(r),
-        height: cellSide(r),
-        boxSizing: "border-box",
-        borderRadius: "0.1rem",
-        border: `1px solid ${color}`,
-        backgroundColor: isPicked ? color : "transparent"
       }
     }, `${r.rowIndex}`);
   });
@@ -4696,14 +4288,18 @@ function toneOf(role) {
 }
 var DISTILL_RE = /FT-DISTILL(-END)?(?:\/1|_v1)/;
 var DISTILL_HEAD_CHARS = 120;
-var BRIDGE_MARK = "\u25C6FT-DISTILL-BRIDGE_v1\u25C6";
+var BRIDGE_MARK = "\u25C6bridge-message\u25C6";
 var OLD_BRIDGE_HEADS = ["[system \u2014 context compaction:"];
 function firstBracket(head) {
   const close = head.indexOf("]");
   return /^<?\[/.test(head) && close > 0 ? head.slice(0, close + 1) : head.slice(0, DISTILL_HEAD_CHARS);
 }
+var SUMMARY_MARK = "\u25C6FT-SUMMARY_v1\u25C6";
+var SUMMARY_VOICES = ["[CONTEXT SUMMARISATION:", "[context summarisation:", "[LLM OPS:"];
 function distillKind(text) {
   const head = String(text || "").trimStart();
+  if (SUMMARY_VOICES.some((v) => head.startsWith(v))) return "summary";
+  if (firstBracket(head).includes(SUMMARY_MARK)) return "summary";
   if (OLD_BRIDGE_HEADS.some((h) => head.startsWith(h))) return "bridge";
   const first = firstBracket(head);
   if (first.includes(BRIDGE_MARK)) return "bridge";
@@ -4713,6 +4309,7 @@ function distillKind(text) {
 }
 function rowTone(fact) {
   const f = fact || {};
+  if (f.distill === "summary" || distillKind(f.text) === "summary") return ACTION_COLOR.llmops;
   return f.distill || distillKind(f.text) ? ACTION_COLOR.compact : toneOf(f.role);
 }
 function roughTokens(chars) {
@@ -4721,6 +4318,13 @@ function roughTokens(chars) {
 function factTokens(fact) {
   const f = fact || {};
   return typeof f.tokens === "number" && isFinite(f.tokens) ? f.tokens : roughTokens(f.chars);
+}
+function chipTokens(fact) {
+  const f = fact || {};
+  const own = factTokens(f);
+  if (typeof f.call_tokens === "number" && isFinite(f.call_tokens)) return own + f.call_tokens;
+  if (typeof f.prose_tokens === "number" && isFinite(f.prose_tokens)) return f.prose_tokens;
+  return own;
 }
 function briefPreview(text, maxChars) {
   const s = String(text || "");
@@ -5185,7 +4789,7 @@ function ChipTrigger({ id, popup, setPopup, tone, label, tip, border, flushLeft,
 }
 
 // desktop/src/mirror-bricks.js
-import { jsx as jsx24, jsxs as jsxs23 } from "react/jsx-runtime";
+import { jsx as jsx26, jsxs as jsxs23 } from "react/jsx-runtime";
 import { useEffect as useEffect3, useRef as useRef4, useState as useState8 } from "react";
 
 // desktop/src/call-render.js
@@ -5372,8 +4976,88 @@ function NestedTable({ part }) {
   });
 }
 var NAME_CH = 14;
-function CallView({ name, args, limit }) {
-  const { grid, wide, body } = splitFields(callRows(args, limit, 0, name));
+var DIFF_MAX_CELLS = 4e6;
+function lineDiff(oldText, newText) {
+  const a = String(oldText ?? "") === "" ? [] : String(oldText).split("\n");
+  const b = String(newText ?? "") === "" ? [] : String(newText).split("\n");
+  let head = 0;
+  while (head < a.length && head < b.length && a[head] === b[head]) head += 1;
+  let tail = 0;
+  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail += 1;
+  const x = a.slice(head, a.length - tail);
+  const y = b.slice(head, b.length - tail);
+  if ((x.length + 1) * (y.length + 1) > DIFF_MAX_CELLS) return null;
+  const w = y.length + 1;
+  const dp = new Uint32Array((x.length + 1) * w);
+  for (let i2 = x.length - 1; i2 >= 0; i2 -= 1) {
+    for (let j2 = y.length - 1; j2 >= 0; j2 -= 1) {
+      dp[i2 * w + j2] = x[i2] === y[j2] ? dp[(i2 + 1) * w + j2 + 1] + 1 : Math.max(dp[(i2 + 1) * w + j2], dp[i2 * w + j2 + 1]);
+    }
+  }
+  const out = a.slice(0, head).map((text) => ({ op: " ", text }));
+  let i = 0;
+  let j = 0;
+  while (i < x.length || j < y.length) {
+    if (i < x.length && j < y.length && x[i] === y[j]) {
+      out.push({ op: " ", text: x[i] });
+      i += 1;
+      j += 1;
+    } else if (j >= y.length || i < x.length && dp[(i + 1) * w + j] >= dp[i * w + j + 1]) {
+      out.push({ op: "-", text: x[i] });
+      i += 1;
+    } else {
+      out.push({ op: "+", text: y[j] });
+      j += 1;
+    }
+  }
+  return out.concat(a.slice(a.length - tail).map((text) => ({ op: " ", text })));
+}
+var DIFF_TONE = {
+  "-": "color-mix(in oklch, var(--ui-red), transparent 82%)",
+  "+": "color-mix(in oklch, var(--ui-green), transparent 82%)"
+};
+function DiffView({ lines }) {
+  const minus = lines.filter((l) => l.op === "-").length;
+  const plus = lines.filter((l) => l.op === "+").length;
+  return jsxs21("div", {
+    children: [
+      jsxs21("div", { className: "flex items-baseline gap-2", children: [
+        jsx22(Key, { text: "old_string \u2192 new_string" }, "k"),
+        jsx22("span", { style: { fontSize: "0.55rem", color: "var(--ui-text-quaternary)" }, children: `\u2212${minus} +${plus}` }, "n")
+      ] }, "head"),
+      jsx22("div", {
+        className: "font-mono",
+        style: Object.assign({ lineHeight: 1.3, minWidth: 0 }, SELECTABLE),
+        children: lines.map((l, k2) => jsxs21("div", {
+          style: { display: "flex", background: DIFF_TONE[l.op] || "transparent" },
+          children: [
+            // Знак — отдельной колонкой и невыделяемым: скопированный текст остаётся кодом.
+            jsx22("span", { style: {
+              width: "1.2em",
+              flexShrink: 0,
+              textAlign: "center",
+              userSelect: "none",
+              color: "var(--ui-text-quaternary)"
+            }, children: l.op === " " ? "" : l.op === "-" ? "\u2212" : "+" }, "s"),
+            jsx22("span", { style: { whiteSpace: "pre-wrap", overflowWrap: "anywhere", minWidth: 0 }, children: l.text || " " }, "t")
+          ]
+        }, k2))
+      }, "lines")
+    ]
+  });
+}
+function patchDiff(name, args, limit, cut) {
+  if (cut || name !== "patch" || !args || typeof args !== "object") return null;
+  const oldText = args.old_string;
+  const newText = args.new_string;
+  if (typeof oldText !== "string" || typeof newText !== "string") return null;
+  if (limit > 0 && (oldText.length > limit || newText.length > limit)) return null;
+  return lineDiff(oldText, newText);
+}
+function CallView({ name, args, limit, cut }) {
+  const diff = patchDiff(name, args, limit, cut);
+  const rows = callRows(args, limit, 0, name);
+  const { grid, wide, body } = splitFields(diff ? rows.filter((r) => r.key !== "old_string" && r.key !== "new_string") : rows);
   const head = name ? jsx22("div", {
     style: Object.assign({ fontWeight: 500 }, SELECTABLE),
     children: name
@@ -5392,7 +5076,8 @@ function CallView({ name, args, limit }) {
           jsx22("div", { className: "min-w-0", children: jsx22(FieldGrid, { rows: grid, wide }) }, "table")
         ]
       }, "top"),
-      ...FieldBlocks({ rows: body })
+      ...FieldBlocks({ rows: body }),
+      diff ? jsx22(DiffView, { lines: diff }, "diff") : null
     ]
   });
 }
@@ -5458,15 +5143,38 @@ function toRows(fields) {
     return { key, value: text, block: many, wide: !many && text.length > GRID_MAX };
   });
 }
-function ResultView({ text }) {
+function patchAddedLines(body, oldText, newText) {
+  const marks = /* @__PURE__ */ new Set();
+  const neu = String(newText || "");
+  if (!neu || !body) return marks;
+  const diff = lineDiff(oldText, neu);
+  if (!diff) return marks;
+  const plus = [];
+  let k2 = 0;
+  for (const l of diff) {
+    if (l.op === "+") plus.push(k2);
+    if (l.op !== "-") k2 += 1;
+  }
+  if (!plus.length) return marks;
+  let at = body.indexOf(neu);
+  while (at !== -1) {
+    const first = body.slice(0, at).split("\n").length - 1;
+    for (const p of plus) marks.add(first + p);
+    at = body.indexOf(neu, at + neu.length);
+  }
+  return marks;
+}
+var ADDED_TONE = "color-mix(in oklch, var(--ui-green), transparent 82%)";
+function ResultView({ text, added }) {
   const { fields, notes, body } = splitResult(text);
+  const marks = added ? patchAddedLines(body, added.oldText, added.newText) : null;
   const rows = toRows(fields);
   const grid = rows.filter((r) => !r.block && !r.wide);
   const wide = rows.filter((r) => r.wide);
-  const blocks = rows.filter((r) => r.block);
+  const blocks2 = rows.filter((r) => r.block);
   const parts = [];
   if (grid.length || wide.length) parts.push(jsx23(FieldGrid, { rows: grid, wide }, "grid"));
-  if (blocks.length) parts.push(...FieldBlocks({ rows: blocks }));
+  if (blocks2.length) parts.push(...FieldBlocks({ rows: blocks2 }));
   if (notes.length) {
     parts.push(jsx23("div", {
       className: "text-(--ui-text-tertiary)",
@@ -5496,7 +5204,7 @@ function ResultView({ text }) {
         // Без `PRE`: он задаёт `width: max-content`, то есть растягивает блок по самой длинной
         // строке — с переносом это несовместимо по смыслу.
       }, SELECTABLE),
-      children: body.split("\n").map((line, i) => jsx23(BodyLine, { text: line }, `b${i}`))
+      children: body.split("\n").map((line, i) => marks && marks.has(i) ? jsx23("div", { style: { background: ADDED_TONE }, children: jsx23(BodyLine, { text: line }) }, `b${i}`) : jsx23(BodyLine, { text: line }, `b${i}`))
     }, "body"));
   }
   if (parts.length === 0) {
@@ -5509,20 +5217,264 @@ function ResultView({ text }) {
   return jsxs22("div", { className: "flex flex-col gap-1", children: parts });
 }
 
+// desktop/src/markdown.js
+import { jsx as jsx25 } from "react/jsx-runtime";
+import * as sdk7 from "@hermes/plugin-sdk";
+
+// desktop/src/md-lite.js
+import { jsx as jsx24 } from "react/jsx-runtime";
+var FENCE = /^\s*(`{3,}|~{3,})\s*([\w+-]*)/;
+var HEADING = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
+var RULE = /^\s{0,3}([-*_])(\s*\1){2,}\s*$/;
+var QUOTE = /^\s{0,3}>\s?/;
+var ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+var TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+var blank = (line) => !line.trim();
+function cells(line) {
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|") && !s.endsWith("\\|")) s = s.slice(0, -1);
+  return s.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+}
+function startsBlock(lines, i) {
+  const line = lines[i];
+  return FENCE.test(line) || HEADING.test(line) || RULE.test(line) || QUOTE.test(line) || ITEM.test(line) || line.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]);
+}
+function parseMd(text) {
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (blank(line)) {
+      i += 1;
+      continue;
+    }
+    const fence = line.match(FENCE);
+    if (fence) {
+      const mark = fence[1];
+      const body = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trim().startsWith(mark)) {
+        body.push(lines[i]);
+        i += 1;
+      }
+      i += 1;
+      out.push({ type: "code", lang: fence[2] || "", text: body.join("\n") });
+      continue;
+    }
+    const heading = line.match(HEADING);
+    if (heading) {
+      out.push({ type: "heading", level: heading[1].length, text: heading[2] });
+      i += 1;
+      continue;
+    }
+    if (RULE.test(line)) {
+      out.push({ type: "rule" });
+      i += 1;
+      continue;
+    }
+    if (QUOTE.test(line)) {
+      const body = [];
+      while (i < lines.length && QUOTE.test(lines[i])) {
+        body.push(lines[i].replace(QUOTE, ""));
+        i += 1;
+      }
+      out.push({ type: "quote", children: parseMd(body.join("\n")) });
+      continue;
+    }
+    if (line.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1])) {
+      const head = cells(line);
+      const align = cells(lines[i + 1]).map((c) => c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : "left");
+      const rows = [];
+      i += 2;
+      while (i < lines.length && !blank(lines[i]) && lines[i].includes("|")) {
+        rows.push(cells(lines[i]));
+        i += 1;
+      }
+      out.push({ type: "table", head, align, rows });
+      continue;
+    }
+    const item = line.match(ITEM);
+    if (item) {
+      const indent = item[1].length;
+      const ordered = /\d/.test(item[2]);
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(ITEM);
+        if (!m || m[1].length !== indent || /\d/.test(m[2]) !== ordered) break;
+        const body = [m[3]];
+        i += 1;
+        while (i < lines.length) {
+          const l = lines[i];
+          if (blank(l)) {
+            const next = lines[i + 1];
+            if (next !== void 0 && !blank(next) && next.match(/^\s*/)[0].length > indent) {
+              body.push("");
+              i += 1;
+              continue;
+            }
+            break;
+          }
+          const lead = l.match(/^\s*/)[0].length;
+          if (lead <= indent) break;
+          body.push(l.slice(Math.min(lead, indent + 2)));
+          i += 1;
+        }
+        let first = body[0];
+        let checked = null;
+        const task = first.match(/^\[([ xX])\]\s+(.*)$/);
+        if (task) {
+          checked = task[1] !== " ";
+          first = task[2];
+        }
+        items.push({ checked, children: parseMd([first, ...body.slice(1)].join("\n")) });
+      }
+      out.push({ type: "list", ordered, start: ordered ? parseInt(item[2], 10) : 1, items });
+      continue;
+    }
+    const para = [];
+    while (i < lines.length && !blank(lines[i]) && (para.length === 0 || !startsBlock(lines, i))) {
+      para.push(lines[i].trim());
+      i += 1;
+    }
+    out.push({ type: "para", text: para.join("\n") });
+  }
+  return out;
+}
+var INLINE = /(`+)([\s\S]*?[^`])\1(?!`)|\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|~~([\s\S]+?)~~|\*([^*\s][\s\S]*?)\*|(?<![\w])_([^_\s][\s\S]*?)_(?![\w])/;
+function parseInline(text) {
+  const out = [];
+  let rest = String(text || "");
+  while (rest) {
+    const m = rest.match(INLINE);
+    if (!m) {
+      out.push({ type: "text", text: rest });
+      break;
+    }
+    if (m.index) out.push({ type: "text", text: rest.slice(0, m.index) });
+    if (m[1]) out.push({ type: "code", text: m[2].replace(/^ (.*) $/, "$1") });
+    else if (m[3]) out.push({ type: "link", href: m[4], children: parseInline(m[3]) });
+    else if (m[5] || m[6]) out.push({ type: "strong", children: parseInline(m[5] || m[6]) });
+    else if (m[7]) out.push({ type: "del", children: parseInline(m[7]) });
+    else out.push({ type: "em", children: parseInline(m[8] || m[9]) });
+    rest = rest.slice(m.index + m[0].length);
+  }
+  return out;
+}
+var MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+var CODE_BG = "color-mix(in oklch, var(--ui-text-primary, currentColor), transparent 92%)";
+var LINE = "1px solid var(--ui-stroke-secondary, rgba(128,128,128,0.35))";
+var SAFE_HREF = /^(https?:|mailto:)/i;
+function inline(nodes) {
+  return nodes.map((n2, k2) => {
+    if (n2.type === "text") {
+      const parts = n2.text.split("\n");
+      return parts.length === 1 ? n2.text : parts.flatMap((p, j) => j ? [jsx24("br", {}, `b${k2}-${j}`), p] : [p]);
+    }
+    if (n2.type === "code") {
+      return jsx24("code", { style: { fontFamily: MONO, fontSize: "0.9em", padding: "0 0.25em", borderRadius: "0.25em", background: CODE_BG }, children: n2.text }, k2);
+    }
+    if (n2.type === "strong") return jsx24("strong", { children: inline(n2.children) }, k2);
+    if (n2.type === "em") return jsx24("em", { children: inline(n2.children) }, k2);
+    if (n2.type === "del") return jsx24("del", { children: inline(n2.children) }, k2);
+    if (n2.type === "link") {
+      return SAFE_HREF.test(n2.href) ? jsx24("a", { href: n2.href, target: "_blank", rel: "noopener noreferrer", style: { color: "var(--dt-primary, inherit)", textDecoration: "underline" }, children: inline(n2.children) }, k2) : jsx24("span", { children: inline(n2.children) }, k2);
+    }
+    return null;
+  });
+}
+var H_SIZE = [1.35, 1.2, 1.1, 1, 0.95, 0.9];
+function blocks(list) {
+  return list.map((b, k2) => {
+    if (b.type === "heading") {
+      return jsx24(`h${b.level}`, { style: { fontSize: `${H_SIZE[b.level - 1]}em`, fontWeight: 650, margin: "0.7em 0 0.35em", lineHeight: 1.25 }, children: inline(parseInline(b.text)) }, k2);
+    }
+    if (b.type === "para") return jsx24("p", { style: { margin: "0 0 0.6em" }, children: inline(parseInline(b.text)) }, k2);
+    if (b.type === "rule") return jsx24("hr", { style: { border: "none", borderTop: LINE, margin: "0.8em 0" } }, k2);
+    if (b.type === "code") {
+      return jsx24("pre", {
+        title: b.lang || void 0,
+        style: {
+          fontFamily: MONO,
+          fontSize: "0.88em",
+          lineHeight: 1.4,
+          margin: "0 0 0.6em",
+          padding: "0.5em 0.65em",
+          borderRadius: "0.4em",
+          background: CODE_BG,
+          whiteSpace: "pre-wrap",
+          overflowWrap: "anywhere"
+        },
+        children: b.text
+      }, k2);
+    }
+    if (b.type === "quote") {
+      return jsx24("blockquote", { style: { margin: "0 0 0.6em", padding: "0 0 0 0.75em", borderLeft: "3px solid var(--ui-stroke-secondary, rgba(128,128,128,0.5))", opacity: 0.9 }, children: blocks(b.children) }, k2);
+    }
+    if (b.type === "list") {
+      return jsx24(b.ordered ? "ol" : "ul", {
+        start: b.ordered && b.start !== 1 ? b.start : void 0,
+        style: { margin: "0 0 0.6em", paddingLeft: "1.4em", listStyleType: b.ordered ? "decimal" : "disc" },
+        children: b.items.map((it, j) => jsx24("li", {
+          style: { margin: "0.15em 0", listStyleType: it.checked === null ? void 0 : "none" },
+          children: [
+            it.checked === null ? null : jsx24("span", { style: { marginRight: "0.35em", marginLeft: "-1.2em" }, children: it.checked ? "\u2611" : "\u2610" }, "box"),
+            // A one-paragraph item stays on the bullet's line (no paragraph margin).
+            ...it.children.length === 1 && it.children[0].type === "para" ? [jsx24("span", { children: inline(parseInline(it.children[0].text)) }, "p")] : blocks(it.children)
+          ]
+        }, j))
+      }, k2);
+    }
+    if (b.type === "table") {
+      const cell = (tag, text, j) => jsx24(tag, { style: { border: LINE, padding: "0.2em 0.5em", textAlign: b.align[j] || "left", verticalAlign: "top" }, children: inline(parseInline(text)) }, j);
+      return jsx24("div", { style: { overflowX: "auto", margin: "0 0 0.6em" }, children: jsx24("table", {
+        style: { borderCollapse: "collapse", fontSize: "0.95em" },
+        children: [
+          jsx24("thead", { children: jsx24("tr", { style: { fontWeight: 650 }, children: b.head.map((c, j) => cell("th", c, j)) }) }, "h"),
+          jsx24("tbody", { children: b.rows.map((r, ri) => jsx24("tr", { children: b.head.map((_, j) => cell("td", r[j] || "", j)) }, ri)) }, "b")
+        ]
+      }) }, k2);
+    }
+    return null;
+  });
+}
+function MdLite({ text }) {
+  return jsx24("div", { style: { fontSize: "0.875rem", lineHeight: 1.55, overflowWrap: "anywhere" }, children: blocks(parseMd(text)) });
+}
+
+// desktop/src/markdown.js
+var FORCE_LITE = false;
+var MessageText = sdk7.MessageTextContent;
+var Streamdown2 = sdk7.Streamdown;
+var markdown = FORCE_LITE ? (text) => jsx25(MdLite, { text }) : MessageText ? (text) => jsx25(MessageText, { text: String(text || ""), media: false }) : Streamdown2 ? (text) => jsx25(Streamdown2, { children: String(text || "") }) : (text) => jsx25(MdLite, { text });
+
 // desktop/src/mirror-bricks.js
-function FullText({ address, fallback, cut, raw }) {
+var MD_ZOOM = 0.85;
+function FullText({ address, fallback, cut, raw, md, patch }) {
   const [text, setText] = useState8("");
+  const [added, setAdded] = useState8(null);
   useEffect3(() => {
     let alive = true;
     loadMessageText(address).then((value) => {
       if (alive) setText(value);
     });
+    if (patch) {
+      loadMessageCall(address).then((call) => {
+        const a = call && call.name === "patch" && !call.cut ? call.args : null;
+        if (alive && a && typeof a.old_string === "string" && typeof a.new_string === "string") {
+          setAdded({ oldText: a.old_string, newText: a.new_string });
+        }
+      });
+    }
     return () => {
       alive = false;
     };
-  }, [address]);
+  }, [address, patch]);
   const shown = text || (cut ? fallback + " \u2026" : fallback);
-  return raw ? shown : jsx24(ResultView, { text: shown });
+  if (raw) return shown;
+  if (md) return jsx26("div", { "data-selectable-text": "true", style: Object.assign({ zoom: MD_ZOOM }, SELECTABLE), children: md(shown) });
+  return jsx26(ResultView, { text: shown, added });
 }
 function FullCall({ address, fallback, raw }) {
   const [call, setCall] = useState8(null);
@@ -5538,10 +5490,10 @@ function FullCall({ address, fallback, raw }) {
   const shown = call || fallback;
   if (!shown) return null;
   const callText = String(shown.raw || "");
-  return raw ? jsx24("div", {
+  return raw ? jsx26("div", {
     style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
     children: callText
-  }) : jsx24(CallView, { name: shown.name, args: shown.args, limit: 0 });
+  }) : jsx26(CallView, { name: shown.name, args: shown.args, limit: 0, cut: !!shown.cut });
 }
 var REPLY_PREVIEW_CHARS = 64;
 var POPUP_PREVIEW_CHARS = 240;
@@ -5553,7 +5505,7 @@ function isEmptyLeadIn(row) {
   return role === "assistant" && calls.length > 0 && !text;
 }
 function EyeButton({ raw, onToggle }) {
-  return jsx24("button", {
+  return jsx26("button", {
     onClick: (e) => {
       e.stopPropagation();
       onToggle();
@@ -5568,7 +5520,8 @@ function EyeButton({ raw, onToggle }) {
       opacity: raw ? 1 : 0.75
     },
     title: raw ? "showing RAW \u2014 exactly what goes into an exported file; click to render" : "rendered; click to see the RAW text",
-    children: raw ? "\u25C9" : "\u25CE"
+    // 📖 — rendered (owner, 2026-10-11: the same book as in the LLMOps window); ◉ orange — raw.
+    children: raw ? "\u25C9" : "\u{1F4D6}"
   }, "eye");
 }
 function PopupHead({ tone, title, address, fallback, raw, onToggleRaw, edit }) {
@@ -5579,7 +5532,7 @@ function PopupHead({ tone, title, address, fallback, raw, onToggleRaw, edit }) {
     setNote("\u2026");
     Promise.resolve(work()).then((res) => setNote(String(res && res.note || ""))).catch((err) => setNote(String(err && err.message || err))).then(() => setBusy(false));
   };
-  const btn2 = (label, { disabled, tone: tone2, hint, onPress }) => jsx24("button", {
+  const btn2 = (label, { disabled, tone: tone2, hint, onPress }) => jsx26("button", {
     disabled: !!disabled,
     // `stopPropagation` ОБЯЗАТЕЛЕН на каждой (см. выше): без него нажатие ещё и
     // разворачивало бы всплывашку до полного текста.
@@ -5607,7 +5560,7 @@ function PopupHead({ tone, title, address, fallback, raw, onToggleRaw, edit }) {
     title: hint,
     children: label
   }, label);
-  const reading = jsx24("span", { className: "flex items-center gap-1", children: [
+  const reading = jsx26("span", { className: "flex items-center gap-1", children: [
     btn2("copy", {
       disabled: busy,
       hint: "copy the FULL text of this message to the clipboard",
@@ -5620,7 +5573,7 @@ function PopupHead({ tone, title, address, fallback, raw, onToggleRaw, edit }) {
     })
   ] }, "read");
   const editing = !!(edit && edit.editing);
-  const writing = !edit ? null : jsx24("span", { className: "flex items-center gap-1", children: editing ? [
+  const writing = !edit ? null : jsx26("span", { className: "flex items-center gap-1", children: editing ? [
     btn2("save", {
       disabled: busy || !edit.dirty,
       tone: "var(--ui-orange)",
@@ -5653,16 +5606,16 @@ function PopupHead({ tone, title, address, fallback, raw, onToggleRaw, edit }) {
     children: [
       // В правке глазика нет (владелец, 2026-10-02): поле ввода показывает сырой текст всегда,
       // переключатель «rendered / raw» ни на что бы не влиял.
-      onToggleRaw && !editing ? jsx24(EyeButton, { raw, onToggle: onToggleRaw }, "eye") : null,
+      onToggleRaw && !editing ? jsx26(EyeButton, { raw, onToggle: onToggleRaw }, "eye") : null,
       // Подсказка с ПОЛНЫМ заголовком — по той же причине, что у строки сохранения: имя
       // тула с именем файла и адресом в узкое окно не влезает, а `truncate` съедает как раз
       // конец, где стоят адрес и размер (владелец, 2026-09-23).
-      jsx24("span", { className: "truncate", style: SELECTABLE, title, children: title }),
-      jsx24("span", { className: "flex-1" }),
+      jsx26("span", { className: "truncate", style: SELECTABLE, title, children: title }),
+      jsx26("span", { className: "flex-1" }),
       buttons
     ]
   }, "line");
-  const said = note ? jsx24("div", {
+  const said = note ? jsx26("div", {
     className: "truncate text-right",
     style: Object.assign({
       fontSize: "0.55rem",
@@ -5675,7 +5628,7 @@ function PopupHead({ tone, title, address, fallback, raw, onToggleRaw, edit }) {
   return jsxs23("div", { className: "flex flex-col gap-1", children: [line, said] }, "head");
 }
 function addrMark(address) {
-  return jsx24("span", {
+  return jsx26("span", {
     className: "shrink-0 text-(--ui-text-quaternary)",
     style: Object.assign({ fontSize: "0.5rem", opacity: 0.7 }, SELECTABLE),
     title: address ? `message address ${address}` : "no address \u2014 the indexer did not mark this row",
@@ -5722,7 +5675,7 @@ function ReplyBrick({ row, popup, setPopup }) {
   };
   const keep = (e) => e.stopPropagation();
   const editRows = edit ? Math.min(40, Math.max(8, edit.text.split("\n").length + 2)) : 0;
-  const editor = edit ? jsx24("textarea", {
+  const editor = edit ? jsx26("textarea", {
     value: edit.text,
     rows: editRows,
     autoFocus: true,
@@ -5754,9 +5707,9 @@ function ReplyBrick({ row, popup, setPopup }) {
     }
   }, "editor") : null;
   if (isEmptyLeadIn(row)) return null;
-  return jsx24(BrickRow, {
-    tokens: tokensLabel(factTokens(fact)),
-    chip: jsx24(ChipTrigger, {
+  return jsx26(BrickRow, {
+    tokens: tokensLabel(chipTokens(fact)),
+    chip: jsx26(ChipTrigger, {
       id: row.key,
       popup,
       setPopup,
@@ -5765,7 +5718,7 @@ function ReplyBrick({ row, popup, setPopup }) {
       label: preview || emptyLabel,
       tip: text ? briefPreview(text, 200) : emptyLabel,
       renderPopup: (tier, eye) => ({
-        head: jsx24(PopupHead, {
+        head: jsx26(PopupHead, {
           tone,
           address: row.address,
           fallback: text,
@@ -5775,16 +5728,22 @@ function ReplyBrick({ row, popup, setPopup }) {
           // Токены рядом с символами (владелец, 2026-09-23): цена сообщения читается в
           // токенах, а не в символах, и это то же число, что стоит слева от чипа в ленте
           // (`factTokens`) — одна оценка на все поверхности, не вторая рядом с первой.
-          title: `${(role || "no role").toUpperCase()} \xB7 ${row.address || "----"} \xB7 ${chars} chars \xB7 ~${tokensLabel(factTokens(fact))} tk`
+          title: `${(role || "no role").toUpperCase()} \xB7 ${row.address || "----"} \xB7 ${chars} chars \xB7 ~${tokensLabel(chipTokens(fact))} tk` + (typeof fact.prose_tokens === "number" ? " (prose; calls on their own chips)" : "")
         }),
         // Верхней секции у реплики НЕТ (решение владельца 2026-09-23): её вызовы уже
         // нарисованы своими кирпичиками, и повторять их здесь значит показать одно и то же
         // дважды. `TwoPanes` с пустым верхом схлопывается сам — своей ветки не нужно.
-        body: jsx24(TwoPanes, {
+        body: jsx26(TwoPanes, {
           bottomChars: tier === "full" ? chars : Math.min(chars, POPUP_PREVIEW_CHARS),
-          bottom: editor || jsx24("div", {
+          bottom: editor || jsx26("div", {
             style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
-            children: !text ? emptyLabel : tier === "full" ? jsx24(FullText, { address: row.address, fallback: text, cut }) : briefPreview(text, POPUP_PREVIEW_CHARS)
+            children: !text ? emptyLabel : tier === "full" ? jsx26(FullText, {
+              address: row.address,
+              fallback: text,
+              cut,
+              raw: eye.raw,
+              md: role === "assistant" ? markdown : null
+            }) : briefPreview(text, POPUP_PREVIEW_CHARS)
           })
         }),
         foot: tier === "summary" ? "click for full text" : null
@@ -5833,7 +5792,7 @@ function MessageTile({ row }) {
             className: "flex items-center gap-1.5 shrink-0",
             style: SELECTABLE,
             children: [
-              row.foreign ? jsx24("span", {
+              row.foreign ? jsx26("span", {
                 className: "px-1.5 rounded-full",
                 style: Object.assign({
                   border: "1px solid var(--ui-orange)",
@@ -5844,7 +5803,7 @@ function MessageTile({ row }) {
                 title: "no operation of ours carries this tool_call_id",
                 children: `${CHIP_STATUS.foreign.glyph} foreign`
               }) : null,
-              jsx24("span", {
+              jsx26("span", {
                 className: "text-(--ui-text-quaternary)",
                 style: SELECTABLE,
                 children: cut ? `${text.length}/${chars} chars` : `${chars} chars`
@@ -5855,7 +5814,7 @@ function MessageTile({ row }) {
       }),
       // НЕ `truncate`: обрезанное имя тула нельзя скопировать, а копировать нужно всё
       // (владелец, 2026-09-10). Переносим строкой.
-      marks.length ? jsx24("div", {
+      marks.length ? jsx26("div", {
         className: "text-(--ui-text-quaternary)",
         style: Object.assign({ fontSize: "0.55rem", overflowWrap: "anywhere" }, SELECTABLE),
         children: marks.join(" \xB7 ")
@@ -5863,7 +5822,7 @@ function MessageTile({ row }) {
       // Тело — с переносом, а не `truncate`: `truncate` это nowrap, то есть ширина
       // max-content, и одна длинная строка растянула бы весь список (та же грабля, что
       // уже оплачена в file-ops-pane.js).
-      text ? jsx24("div", {
+      text ? jsx26("div", {
         className: "mt-0.5 text-(--ui-text-secondary)",
         style: Object.assign(
           { whiteSpace: "pre-wrap", overflowWrap: "anywhere" },
@@ -5871,7 +5830,7 @@ function MessageTile({ row }) {
           SELECTABLE
         ),
         children: cut ? text + " \u2026" : text
-      }) : jsx24("div", {
+      }) : jsx26("div", {
         className: "mt-0.5 text-(--ui-text-quaternary) italic",
         style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
         children: calls.length ? "no text \u2014 this row only calls tools" : "empty"
@@ -5880,18 +5839,18 @@ function MessageTile({ row }) {
   });
 }
 function StepBar({ row }) {
-  return jsx24("div", {
+  return jsx26("div", {
     style: { height: ROW_HEIGHT2.step, boxSizing: "border-box", display: "flex", alignItems: "center" },
     title: `step ${row.index} \xB7 ${row.count} calls`,
-    children: jsx24("div", { className: "w-full border-t border-(--ui-stroke-tertiary)" })
+    children: jsx26("div", { className: "w-full border-t border-(--ui-stroke-tertiary)" })
   });
 }
 function MessageNode({ row, popup, setPopup }) {
   const role = String(row.fact && row.fact.role || "");
-  return role === "user" || role === "assistant" ? jsx24(ReplyBrick, { row, popup, setPopup }) : jsx24(MessageTile, { row });
+  return role === "user" || role === "assistant" ? jsx26(ReplyBrick, { row, popup, setPopup }) : jsx26(MessageTile, { row });
 }
 var MOCK_OP = UNASSIGNED_OP;
-function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
+function ToolPairBrick({ row, popup, setPopup, stale, ledger, duration }) {
   const answer = row.answer;
   const afact = answer && answer.fact || {};
   const chars = Number(afact.chars || 0);
@@ -5900,7 +5859,7 @@ function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
   const tone = toneOf("tool");
   const name = row.name || "\u0442\u0443\u043B";
   const realOp = afact.op || "";
-  const displayData = chipTarget({ brick, fact: afact, target: row.target });
+  const displayData = chipTarget({ fact: afact, target: row.target });
   const displayOp = realOp || MOCK_OP;
   const plainLabel = [name, displayData, displayOp].filter(Boolean).join(" \xB7 ");
   const addr = answer ? answer.address || "" : "";
@@ -5911,19 +5870,20 @@ function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
   const callText = call ? String(call.raw || "") : "";
   const realPct = realOp && stale && typeof stale[realOp] === "number" ? stale[realOp] : null;
   const pct = answer ? realPct : null;
-  const statuses = chipStatuses({ brick, fact: afact, foreign, unrecorded });
-  const diff = chipDiff(brick, afact);
+  const statuses = chipStatuses({ ledger, fact: afact, foreign, unrecorded });
+  const diff = chipDiff(ledger, afact);
   const tip = chipTipLines({
     name,
     op: realOp,
-    brick,
+    ledger,
     fact: afact,
     target: row.target,
     statuses,
-    tokens: tokensLabel(factTokens(afact)),
+    duration,
+    tokens: tokensLabel(chipTokens(afact)),
     freshness: pct === null ? "\u2014" : pct + "%"
   }).join("\n") + (text ? "\n\n" + briefPreview(text, 200) : "");
-  const chipBody = jsx24(OpChipBody, {
+  const chipBody = jsx26(OpChipBody, {
     marks: statuses,
     name,
     data: displayData,
@@ -5934,9 +5894,9 @@ function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
     overlapTitle: pct === null ? void 0 : "covered by later operations on this file (buildContextView().stale)"
   });
   const rest = [addrMark(addr)];
-  return jsx24(BrickRow, {
-    tokens: tokensLabel(factTokens(afact)),
-    chip: jsx24(ChipTrigger, {
+  return jsx26(BrickRow, {
+    tokens: tokensLabel(chipTokens(afact)),
+    chip: jsx26(ChipTrigger, {
       id: row.key,
       popup,
       setPopup,
@@ -5948,18 +5908,18 @@ function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
         const callLimit = 0;
         return {
           // Без `paste`: результат инструмента правке не подлежит.
-          head: jsx24(PopupHead, {
+          head: jsx26(PopupHead, {
             tone,
             address: addr,
             fallback: text,
             raw: eye.raw,
             onToggleRaw: eye.toggleRaw,
-            title: `${plainLabel} \xB7 ${addr || "----"} \xB7 ${chars} chars \xB7 ~${tokensLabel(factTokens(afact))} tk` + (statusMark ? " \xB7 " + statusMark : "")
+            title: `${plainLabel} \xB7 ${addr || "----"} \xB7 ${chars} chars \xB7 ~${tokensLabel(chipTokens(afact))} tk` + (typeof afact.call_tokens === "number" ? ` (call ${tokensLabel(afact.call_tokens)} + answer ${tokensLabel(factTokens(afact))})` : "") + (statusMark ? " \xB7 " + statusMark : "")
           }),
           // ДВЕ СЕКЦИИ: сверху вызов, снизу результат (Plan22-Task02). Пока в верхней тот же
           // текст, что уходит в файл выгрузки (`call.raw`) — рендер таблицей это Task04, и слот
           // под него здесь уже стоит.
-          body: jsx24(TwoPanes, {
+          body: jsx26(TwoPanes, {
             topChars: callText.length,
             bottomChars: tier === "full" ? chars : Math.min(chars, POPUP_PREVIEW_CHARS),
             // В развёрнутом окне приоритет у ВЫЗОВА: он показывается целиком и не скроллится,
@@ -5969,13 +5929,13 @@ function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
             // СЫРЬЁ — это `call.raw`, то есть БУКВАЛЬНО то, что уходит в файл выгрузки
             // (`context_ctl/_export.py::render_call`). Обещание глазика «покажи как есть»
             // держится тем, что сравнивать не с чем: строка одна и приехала с сервера.
-            top: !call ? null : tier === "full" ? jsx24(FullCall, { address: addr, fallback: call, raw: eye.raw }) : eye.raw ? jsx24("div", {
+            top: !call ? null : tier === "full" ? jsx26(FullCall, { address: addr, fallback: call, raw: eye.raw }) : eye.raw ? jsx26("div", {
               style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
               children: callText
-            }) : jsx24(CallView, { name: call.name, args: call.args, limit: callLimit }),
-            bottom: jsx24("div", {
+            }) : jsx26(CallView, { name: call.name, args: call.args, limit: callLimit, cut: !!call.cut }),
+            bottom: jsx26("div", {
               style: Object.assign({ overflowWrap: "anywhere" }, SELECTABLE),
-              children: !answer ? "no answer row recorded for this call" : !text ? "empty" : tier === "full" ? jsx24(FullText, { address: addr, fallback: text, cut, raw: eye.raw }) : eye.raw ? briefPreview(text, POPUP_PREVIEW_CHARS) : jsx24(ResultView, { text: briefPreview(text, POPUP_PREVIEW_CHARS) })
+              children: !answer ? "no answer row recorded for this call" : !text ? "empty" : tier === "full" ? jsx26(FullText, { address: addr, fallback: text, cut, raw: eye.raw, patch: !!call && call.name === "patch" }) : eye.raw ? briefPreview(text, POPUP_PREVIEW_CHARS) : jsx26(ResultView, { text: briefPreview(text, POPUP_PREVIEW_CHARS) })
             })
           }),
           foot: tier === "summary" ? "click for full text" : null
@@ -5987,7 +5947,7 @@ function ToolPairBrick({ row, popup, setPopup, stale, brick }) {
 }
 
 // desktop/src/mirror-action-zone.js
-import { jsx as jsx25, jsxs as jsxs24 } from "react/jsx-runtime";
+import { jsx as jsx27, jsxs as jsxs24 } from "react/jsx-runtime";
 var ACTION_BTN = {
   fontSize: "0.625rem",
   lineHeight: 1,
@@ -6012,7 +5972,7 @@ var ADDR_ACTIONS = [
 function ActionZone({ op, thin }) {
   const buttons = ADDR_ACTIONS.map((action) => {
     const armed = !!op.mode && op.kind === action.kind;
-    return jsx25("button", {
+    return jsx27("button", {
       key: action.kind,
       onClick: (e) => {
         e.stopPropagation();
@@ -6039,22 +5999,13 @@ function ActionZone({ op, thin }) {
     children: buttons
   });
 }
-function ActionHint({ drop }) {
-  if (!drop.mode) return null;
-  const pickedCount = Object.keys(drop.picked || {}).length;
-  return jsx25("span", {
-    className: "font-semibold",
-    style: { fontSize: "0.7rem", color: ACTION_COLOR[drop.action] || "var(--ui-text-secondary)" },
-    children: drop.busy ? "applying\u2026" : pickedCount ? `${pickedCount} picked` : "tick a marker on a chip above"
-  });
-}
 function ExportZone({ exp, addresses, thin }) {
   const armed = !!exp.mode;
   const color = ACTION_COLOR.export;
-  return jsx25("div", {
+  return jsx27("div", {
     className: thin ? "flex items-center px-1" : "flex items-center gap-2 px-2 py-1",
     style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
-    children: jsx25("button", {
+    children: jsx27("button", {
       onClick: (e) => {
         e.stopPropagation();
         if (exp.busy) return;
@@ -6085,10 +6036,10 @@ function ExportZone({ exp, addresses, thin }) {
 function ImportZone({ imp, thin, onOpen }) {
   const open = !!imp.open;
   const color = ACTION_COLOR.import;
-  return jsx25("div", {
+  return jsx27("div", {
     className: thin ? "flex items-center px-1" : "flex items-center gap-2 px-2 py-1",
     style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
-    children: jsx25("button", {
+    children: jsx27("button", {
       onClick: (e) => {
         e.stopPropagation();
         if (imp.busy) return;
@@ -6096,6 +6047,7 @@ function ImportZone({ imp, thin, onOpen }) {
           closeImport();
           return;
         }
+        if (llmopsWindowOpen()) return;
         const box = e.currentTarget && e.currentTarget.getBoundingClientRect ? e.currentTarget.getBoundingClientRect() : null;
         if (onOpen) onOpen(box ? { x: box.left + box.width / 2, y: box.bottom } : null);
         openImport();
@@ -6114,12 +6066,36 @@ function ImportZone({ imp, thin, onOpen }) {
     })
   });
 }
+function LLMOpsZone({ thin }) {
+  const rail = useLLMOpsRail();
+  const armed = !!rail.mode;
+  const color = ACTION_COLOR.llmops;
+  return jsx27("div", {
+    className: thin ? "flex items-center px-1" : "flex items-center gap-2 px-2 py-1",
+    style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
+    children: jsx27("button", {
+      onClick: (e) => {
+        e.stopPropagation();
+        setLLMOpsMode(!armed);
+      },
+      className: "mirror-action-btn rounded-full font-medium cursor-pointer select-none transition-colors duration-150 ease-out active:scale-95",
+      style: Object.assign({
+        border: `1px solid ${armed ? color : "var(--ui-stroke-secondary)"}`,
+        background: armed ? `color-mix(in srgb, ${color} 14%, transparent)` : "transparent",
+        color: armed ? color : "var(--ui-text-secondary)",
+        whiteSpace: "nowrap"
+      }, thin ? ACTION_BTN_THIN : ACTION_BTN),
+      title: armed ? 'close "llm ops" mode' : 'arm "llm ops": tick messages on the rail, then press Apply operation \u2014 opens the LLMOps window',
+      children: "llm ops"
+    })
+  });
+}
 
 // desktop/src/mirror-zones.js
-import { jsx as jsx27, jsxs as jsxs26 } from "react/jsx-runtime";
+import { jsx as jsx29, jsxs as jsxs26 } from "react/jsx-runtime";
 
 // desktop/src/compact-progress.js
-import { jsx as jsx26, jsxs as jsxs25 } from "react/jsx-runtime";
+import { jsx as jsx28, jsxs as jsxs25 } from "react/jsx-runtime";
 var STAGE_TEXT = {
   export: "exporting the session",
   prepare: "selecting",
@@ -6145,7 +6121,7 @@ function runLine(run) {
   const elapsed = now && r.started_at ? now - Number(r.started_at) : 0;
   const silentFor = now && r.beat ? now - Number(r.beat) : 0;
   const silent = Number(r.silence_s) > 0 && silentFor > Number(r.silence_s);
-  const parts = [r.who === "auto" ? "\u27F3 auto" : "\u27F3 compact"];
+  const parts = [r.who === "auto" ? "\u27F3 auto" : r.who === "llmops" ? "\u27F3 llm ops" : "\u27F3 compact"];
   if (r.span) parts.push(r.span);
   let pct = STAGE_PCT[r.stage] || 0;
   if (r.stage === "questions") {
@@ -6166,20 +6142,20 @@ function runLine(run) {
 function CompactProgress({ run, font }) {
   const line = runLine(run);
   if (!line) return null;
-  const tone = line.silent ? "var(--ui-yellow)" : ACTION_COLOR.compact;
+  const tone = line.silent ? "var(--ui-yellow)" : run && run.who === "llmops" ? ACTION_COLOR.llmops : ACTION_COLOR.compact;
   return jsxs25("div", {
     className: "flex flex-col min-w-0 w-full",
     "data-compact-progress": "",
     children: [
-      jsx26("span", {
+      jsx28("span", {
         className: "truncate",
         title: line.text,
         style: { color: tone, fontSize: font, userSelect: "text", minWidth: 0 },
         children: line.text
       }),
-      jsx26("div", {
+      jsx28("div", {
         style: { height: 2, width: "100%", background: "var(--ui-stroke-quaternary)", borderRadius: 1 },
-        children: jsx26("div", {
+        children: jsx28("div", {
           style: { height: "100%", width: `${line.pct}%`, background: tone, borderRadius: 1, transition: "width 0.4s" }
         })
       })
@@ -6191,7 +6167,7 @@ function CompactProgress({ run, font }) {
 var HEAD_FONT = "0.55rem";
 var TOGGLE_FONT = "0.8rem";
 function ZoneToggle({ title, open, onToggle }) {
-  return jsx27("button", {
+  return jsx29("button", {
     type: "button",
     onClick: (e) => {
       e.stopPropagation();
@@ -6214,12 +6190,12 @@ function OpGroup({ label, lead, children }) {
   return jsxs26("div", {
     className: "flex items-center flex-wrap",
     children: [
-      jsx27("span", {
+      jsx29("span", {
         className: "flex items-center shrink-0",
         style: { width: "3.6rem", paddingLeft: "0.375rem", gap: "2px" },
         children: [
-          lead || jsx27("span", { style: { display: "inline-block", width: "0.95rem" } }, "pad"),
-          jsx27("span", { className: "text-(--ui-text-quaternary)", style: { fontSize: HEAD_FONT }, children: label }, "label")
+          lead || jsx29("span", { style: { display: "inline-block", width: "0.95rem" } }, "pad"),
+          jsx29("span", { className: "text-(--ui-text-quaternary)", style: { fontSize: HEAD_FONT }, children: label }, "label")
         ]
       }),
       ...[].concat(children)
@@ -6232,10 +6208,10 @@ function noteTone(ok) {
 var AUTO_RESULT_MS = 6e4;
 function StatusLine({ report, run }) {
   if (run && run.running) {
-    return jsx27("div", {
+    return jsx29("div", {
       className: "shrink-0 flex items-center px-2 min-w-0 border-b border-(--ui-stroke-quaternary)",
       style: { fontSize: HEAD_FONT, lineHeight: 1.6, paddingBottom: 2 },
-      children: jsx27(CompactProgress, { run, font: HEAD_FONT })
+      children: jsx29(CompactProgress, { run, font: HEAD_FONT })
     });
   }
   if (run && run.who === "auto" && run.doneAt && Date.now() - run.doneAt < AUTO_RESULT_MS) {
@@ -6246,7 +6222,7 @@ function StatusLine({ report, run }) {
     };
   }
   if (!report || !report.note) {
-    return jsx27("div", {
+    return jsx29("div", {
       className: "shrink-0 px-2 border-b border-(--ui-stroke-quaternary) text-(--ui-text-quaternary)",
       style: { fontSize: HEAD_FONT, lineHeight: 1.6 },
       children: "no reports yet"
@@ -6256,7 +6232,7 @@ function StatusLine({ report, run }) {
     className: "shrink-0 flex items-center gap-2 px-2 min-w-0 border-b border-(--ui-stroke-quaternary)",
     style: { fontSize: HEAD_FONT, lineHeight: 1.6 },
     children: [
-      report.dir ? jsx27("button", {
+      report.dir ? jsx29("button", {
         type: "button",
         className: "mirror-action-btn rounded-full cursor-pointer select-none shrink-0",
         title: "copy the folder path to the clipboard",
@@ -6272,7 +6248,7 @@ function StatusLine({ report, run }) {
         }, ACTION_BTN),
         children: "copy path"
       }) : null,
-      jsx27("span", {
+      jsx29("span", {
         className: "truncate",
         title: report.note,
         style: Object.assign({ color: noteTone(report.ok), minWidth: 0 }, SELECTABLE),
@@ -6283,7 +6259,7 @@ function StatusLine({ report, run }) {
 }
 
 // desktop/src/file-context-panel.js
-import { jsx as jsx28, jsxs as jsxs27 } from "react/jsx-runtime";
+import { jsx as jsx30, jsxs as jsxs27 } from "react/jsx-runtime";
 import { useMemo, useRef as useRef5, useState as useState9, useLayoutEffect as useLayoutEffect3 } from "react";
 var MIN_H = 56;
 var MAX_H = 420;
@@ -6374,8 +6350,8 @@ function NameHover({ file, children }) {
       pos ? jsxs27("div", {
         style: Object.assign(popupStyle(pos.x, pos.y), { pointerEvents: "none", whiteSpace: "normal" }),
         children: [
-          jsx28("div", { style: { fontSize: "0.68rem", color: "var(--ui-text-primary)" }, children: file.name }),
-          dir ? jsx28("div", {
+          jsx30("div", { style: { fontSize: "0.68rem", color: "var(--ui-text-primary)" }, children: file.name }),
+          dir ? jsx30("div", {
             className: "font-mono",
             style: { fontSize: "0.55rem", color: "var(--ui-text-quaternary)", wordBreak: "break-all" },
             children: dir
@@ -6406,13 +6382,13 @@ function rangeText(from, to) {
 function OpIdsPopup({ file, pos, onClose }) {
   if (!pos) return null;
   const rows = file.rows || [];
-  return jsx28("div", {
+  return jsx30("div", {
     // Текст выделяется мышью (владелец, 2026-09-29: «выделяешь и копируешь, когда нужно сказать
     // агенту — вот ты читал 100-123»). Панель целиком `select-none`, поэтому разрешаем явно.
     style: Object.assign(popupStyle(pos.x, pos.y), { whiteSpace: "normal", cursor: "text" }, SELECTABLE),
     onMouseDown: (e) => e.stopPropagation(),
     onMouseLeave: onClose,
-    children: jsx28("div", {
+    children: jsx30("div", {
       className: "font-mono",
       style: {
         display: "grid",
@@ -6428,15 +6404,15 @@ function OpIdsPopup({ file, pos, onClose }) {
           // именно это и означает флаг `nested` в леджере. «Из терминала» показать нельзя: правка
           // файла шелл-командой нашими тулами не проходит вовсе и в леджер не попадает, так что
           // такого факта у нас просто нет, и выдумывать его метка не станет.
-          r.nested ? jsx28("span", {
+          r.nested ? jsx30("span", {
             // Тот же плотный оттенок, что у вложенного чтения на баре, и БЕЗ `opacity`: правило
             // «только оттенки, не прозрачности» держим по всей панели, а не только на слоях.
             style: { color: segFill("read_nested", 0, false) },
             children: " exec"
           }) : null
         ] }),
-        jsx28("div", { key: `o${i}`, style: { color: "var(--ui-text-primary)", textAlign: "right" }, children: `${r.op}:` }),
-        jsx28("div", {
+        jsx30("div", { key: `o${i}`, style: { color: "var(--ui-text-primary)", textAlign: "right" }, children: `${r.op}:` }),
+        jsx30("div", {
           key: `r${i}`,
           style: { color: r.from == null ? "var(--ui-text-quaternary)" : "var(--ui-text-primary)" },
           children: rangeText(r.from, r.to)
@@ -6457,11 +6433,11 @@ function Tile({ file, popupPos, onTogglePopup, onClosePopup }) {
         className: "flex items-baseline gap-1",
         style: { lineHeight: 1.2 },
         children: [
-          jsx28("div", {
+          jsx30("div", {
             className: "flex-1 min-w-0",
-            children: jsx28(NameHover, {
+            children: jsx30(NameHover, {
               file,
-              children: jsx28("div", {
+              children: jsx30("div", {
                 className: "truncate",
                 style: { fontSize: "0.6rem", color: "var(--ui-text-secondary)" },
                 children: truncateName(file.name)
@@ -6471,7 +6447,7 @@ function Tile({ file, popupPos, onTogglePopup, onClosePopup }) {
           // Номера операций: клик — список целиком (повторный закрывает; другая плитка —
           // закрывает эту и открывает ту, решает панель). Усекаются первыми: полный список
           // всегда в попапе.
-          jsx28("div", {
+          jsx30("div", {
             className: "truncate shrink",
             style: {
               fontSize: "0.5rem",
@@ -6503,9 +6479,9 @@ function Tile({ file, popupPos, onTogglePopup, onClosePopup }) {
               // Сама обрезка — вторая линия защиты к зажиму процентов в модели: если сегмент однажды
               // снова придёт шире длины файла, он обрежется по бару, а не полезет за габариты плитки
               // (живой симптом 2026-09-07).
-              jsx28("div", {
+              jsx30("div", {
                 style: { position: "absolute", inset: 0, overflow: "hidden" },
-                children: segs.map((s, i) => jsx28("div", {
+                children: segs.map((s, i) => jsx30("div", {
                   key: `${s.op}-${i}`,
                   style: {
                     position: "absolute",
@@ -6526,7 +6502,7 @@ function Tile({ file, popupPos, onTogglePopup, onClosePopup }) {
             ]
           }),
           // Длина — цветом имени: такая же характеристика файла. Не в кликабельной зоне.
-          jsx28("div", {
+          jsx30("div", {
             className: "shrink-0",
             style: { fontSize: "0.5rem", lineHeight: 1, color: "var(--ui-text-secondary)" },
             title: `${file.total} lines`,
@@ -6534,7 +6510,7 @@ function Tile({ file, popupPos, onTogglePopup, onClosePopup }) {
           })
         ]
       }),
-      jsx28(OpIdsPopup, { file, pos: popupPos, onClose: onClosePopup })
+      jsx30(OpIdsPopup, { file, pos: popupPos, onClose: onClosePopup })
     ]
   });
 }
@@ -6599,7 +6575,7 @@ function FileContextPanel({ view, selectedOp, open, onToggle }) {
         // приходится искать заново у каждой. Отсюда и `gap` вместо `justify-between`: прижимать
         // подпись к правому краю больше незачем, она идёт следом за своим органом управления.
         jsxs27("div", { className: "flex items-center gap-1 px-1.5", style: { fontSize: "0.55rem", lineHeight: 1.2 }, children: [
-          jsx28("button", {
+          jsx30("button", {
             onClick: () => setCollapsed((c) => !c),
             type: "button",
             className: "cursor-pointer shrink-0",
@@ -6617,18 +6593,19 @@ function FileContextPanel({ view, selectedOp, open, onToggle }) {
           // что нарисовано.
           jsxs27("span", { className: "text-(--ui-text-quaternary) truncate min-w-0 flex-1", children: [
             `context \xB7 ${files.length} files \xB7 `,
-            jsx28("span", { style: { color: segFill("read", 0, false) }, children: "read" }),
+            jsx30("span", { style: { color: segFill("read", 0, false) }, children: "read" }),
             " ",
-            jsx28("span", { style: { color: segFill("read_nested", 0, false) }, children: "exec" }),
+            jsx30("span", { style: { color: segFill("read_nested", 0, false) }, children: "exec" }),
             " ",
-            jsx28("span", { style: { color: segFill("patch", 0, false) }, children: "patch" }),
+            jsx30("span", { style: { color: segFill("patch", 0, false) }, children: "patch" }),
             // Режим НАЗЫВАЕТ себя и говорит, как из него выйти (владелец, 2026-09-08).
             // «grey от 0012» не объясняло ни что произошло, ни почему всё посерело: человек не
             // включал никакого «grey» и слова этого нигде не видел. Теперь строка отвечает на оба
-            // вопроса — что показано и что сделать, чтобы вернуть как было.
-            selectedOp ? jsx28("span", {
+            // вопроса — что показано и что сделать, чтобы вернуть как было. С 2026-10-06 выбор —
+            // открытое окно чипа в зеркале (`prompt-mirror.js::selectedOpOf`).
+            selectedOp ? jsx30("span", {
               style: { color: "var(--ui-text-secondary)" },
-              children: ` \xB7 shadowed at operation ${selectedOp} \u2014 click anywhere to clear`
+              children: ` \xB7 shadowed at operation ${selectedOp} \u2014 close the popup to clear`
             }) : ""
           ] })
         ] }),
@@ -6637,7 +6614,7 @@ function FileContextPanel({ view, selectedOp, open, onToggle }) {
         // слева от трека своё поле, а здесь сразу плитки со своим отступом сетки, и прежние 3px
         // прозрачного края плюс он давали широкую щель между плитками и планкой. Правило живёт
         // ЗДЕСЬ: панель стоит и над стаканом, и в зеркале, и должна выглядеть одинаково.
-        collapsed ? null : jsx28("style", { children: `
+        collapsed ? null : jsx30("style", { children: `
           .fctx-scroll::-webkit-scrollbar { width: 13px; }
           .fctx-scroll::-webkit-scrollbar-track { background: transparent; }
           .fctx-scroll::-webkit-scrollbar-thumb {
@@ -6650,17 +6627,17 @@ function FileContextPanel({ view, selectedOp, open, onToggle }) {
           }
           .fctx-scroll::-webkit-scrollbar-thumb:hover { background-color: var(--ui-stroke-primary); }
         ` }),
-        collapsed ? null : jsx28("div", {
+        collapsed ? null : jsx30("div", {
           className: "fctx-scroll",
           style: Object.assign({ height: `${manual ? height : autoH}px`, overflowY: "auto", overflowX: "hidden" }, CAPPED),
-          children: jsx28("div", {
+          children: jsx30("div", {
             ref: gridRef,
             // Плитка шире на ~30% (74 → 96px, владелец 2026-09-07): имена файлов усекались слишком
             // рано. Зазор между плитками и внутренний отступ снизу — меньше: вертикаль в этой
             // панели дороже горизонтали, её отдают стакану.
             className: "grid gap-0.5 p-1",
             style: { gridTemplateColumns: "repeat(auto-fill, minmax(96px, 1fr))", alignContent: "start" },
-            children: grayed.map((f) => jsx28(Tile, {
+            children: grayed.map((f) => jsx30(Tile, {
               key: f.path,
               file: Object.assign({}, f, { desync: desyncPaths.has(f.path) }),
               popupPos: openOps && openOps.path === f.path ? openOps.pos : null,
@@ -6669,7 +6646,7 @@ function FileContextPanel({ view, selectedOp, open, onToggle }) {
             }))
           })
         }),
-        collapsed ? null : jsx28("div", {
+        collapsed ? null : jsx30("div", {
           onMouseDown: onDragStart,
           title: "drag to resize",
           style: { height: "5px", cursor: "ns-resize", backgroundColor: "var(--ui-stroke-tertiary)", opacity: 0.35 }
@@ -6677,13 +6654,13 @@ function FileContextPanel({ view, selectedOp, open, onToggle }) {
       ] }),
       // Правая зона кнопок (спека §3): режим один, кнопок в нём нет — зона схлопнута до нуля,
       // ширины не тратит. Зарезервирована под compress/compact/summarize следующим планом.
-      jsx28("div", { style: { width: 0, flexShrink: 0 } })
+      jsx30("div", { style: { width: 0, flexShrink: 0 } })
     ]
   });
 }
 
 // desktop/src/mirror-compact-zone.js
-import { jsx as jsx29, jsxs as jsxs28 } from "react/jsx-runtime";
+import { jsx as jsx31, jsxs as jsxs28 } from "react/jsx-runtime";
 import { useState as useState10, useEffect as useEffect4 } from "react";
 var DEFAULT_CUT = { headKeep: 6, cutPercent: 30, tailKeep: 20 };
 var SHARE_STEP = 5;
@@ -6720,7 +6697,7 @@ function CompactZone({ compact, addresses, thin }) {
     setShare(String(Math.min(100, Math.max(0, next))));
   }
   function stepBtn(dir) {
-    return jsx29("button", {
+    return jsx31("button", {
       type: "button",
       disabled: compact.mode,
       title: dir > 0 ? `+${SHARE_STEP}%` : `-${SHARE_STEP}%`,
@@ -6759,7 +6736,7 @@ function CompactZone({ compact, addresses, thin }) {
     className: thin ? "flex items-center px-1" : "flex items-center gap-2 px-2 py-1",
     style: Object.assign({ fontSize: "0.55rem" }, SELECTABLE),
     children: [
-      jsx29("button", {
+      jsx31("button", {
         onClick: (e) => {
           e.stopPropagation();
           if (!compact.busy) handleClick();
@@ -6788,7 +6765,7 @@ function CompactZone({ compact, addresses, thin }) {
         onClick: (e) => e.stopPropagation(),
         children: [
           "cut %:",
-          jsx29("input", {
+          jsx31("input", {
             type: "text",
             inputMode: "numeric",
             value: share,
@@ -6805,7 +6782,7 @@ function CompactZone({ compact, addresses, thin }) {
       }),
       // Счётчик «N ticked» снят (владелец, 2026-09-28): число отмеченных стоит под крестиком
       // рельсы.
-      thin ? null : jsx29("div", { className: "flex-1 min-w-0" })
+      thin ? null : jsx31("div", { className: "flex-1 min-w-0" })
       // Модалка подтверждения переехала в `prompt-mirror.js`: она встаёт рядом с `Apply
       // operation`, а координаты этой кнопки знает только шапка зеркала (Plan16-Task08).
     ]
@@ -6813,7 +6790,7 @@ function CompactZone({ compact, addresses, thin }) {
 }
 
 // desktop/src/confirm-modal.js
-import { jsx as jsx30, jsxs as jsxs29 } from "react/jsx-runtime";
+import { jsx as jsx32, jsxs as jsxs29 } from "react/jsx-runtime";
 var KEYFRAMES = `
   @keyframes confirm-modal-appear {
     from { opacity: 0; transform: translateY(4px) scale(0.98); }
@@ -6862,7 +6839,7 @@ function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, 
       backgroundColor: "rgba(0,0,0,0.45)"
     },
     children: [
-      jsx30("style", { dangerouslySetInnerHTML: { __html: KEYFRAMES } }),
+      jsx32("style", { dangerouslySetInnerHTML: { __html: KEYFRAMES } }),
       jsxs29("div", {
         className: "confirm-modal-appear rounded-md p-4 flex flex-col gap-2",
         style: {
@@ -6888,20 +6865,20 @@ function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, 
           ...place
         },
         children: [
-          jsx30("div", { className: "text-sm font-semibold", style: SELECTABLE, children: title }),
-          jsx30("div", { className: "text-xs text-(--ui-text-secondary)", style: SELECTABLE, children: body }),
+          jsx32("div", { className: "text-sm font-semibold", style: SELECTABLE, children: title }),
+          jsx32("div", { className: "text-xs text-(--ui-text-secondary)", style: SELECTABLE, children: body }),
           busy ? jsxs29("div", { className: "flex flex-col gap-1 mt-1", children: [
-            jsx30("div", {
+            jsx32("div", {
               className: "h-2 w-full rounded-full overflow-hidden relative",
               style: { backgroundColor: "var(--ui-stroke-quaternary)" },
-              children: jsx30("div", {
+              children: jsx32("div", {
                 className: "confirm-modal-sweep absolute inset-y-0 w-1/3",
                 style: { background: "linear-gradient(90deg, transparent, var(--dt-primary), transparent)" }
               })
             }),
             // Строка сообщений/процент — место под индикатор хода (задел, п.7 задачи):
             // данных для него ещё нет, значит и текста конкретнее "running…" тоже нет.
-            jsx30("div", {
+            jsx32("div", {
               className: "text-[0.65rem] text-(--ui-text-quaternary)",
               style: SELECTABLE,
               children: progress || "running in the background\u2026"
@@ -6919,9 +6896,9 @@ function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, 
           //
           // Сетка из трёх колонок, а не `justify-between`: центр должен быть центром ОКНА, а
           // не серединой между двумя кнопками разной ширины.
-          Array.isArray(actions) && actions.length ? jsx30("div", {
+          Array.isArray(actions) && actions.length ? jsx32("div", {
             className: "mt-3 flex items-center justify-center gap-2 flex-wrap",
-            children: actions.map((a) => jsx30("button", {
+            children: actions.map((a) => jsx32("button", {
               disabled: !!busy || !canConfirm,
               onClick: a.onClick,
               className: `${a.main ? "px-4 py-1.5 text-sm font-semibold" : "px-2.5 py-1 text-xs font-medium"} rounded-md cursor-pointer select-none`,
@@ -6938,21 +6915,21 @@ function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, 
             className: "mt-3 grid items-center gap-2",
             style: { gridTemplateColumns: "1fr auto 1fr" },
             children: [
-              jsx30("div", {}),
-              Array.isArray(actions) && actions.length ? jsx30("div", {}) : jsxs29("button", {
+              jsx32("div", {}),
+              Array.isArray(actions) && actions.length ? jsx32("div", {}) : jsxs29("button", {
                 disabled: !!busy || !canConfirm,
                 onClick: onConfirm,
                 className: "px-4 py-1 rounded-md text-xs font-medium cursor-pointer select-none flex items-center gap-1.5 justify-center",
                 style: { border: "1px solid var(--ui-red)", color: "var(--ui-red)", opacity: canConfirm ? 1 : 0.35 },
                 children: [
-                  busy ? jsx30("div", {
+                  busy ? jsx32("div", {
                     className: "w-2.5 h-2.5 rounded-full confirm-modal-spin",
                     style: { border: "2px solid var(--ui-stroke-secondary)", borderTopColor: "var(--ui-red)" }
                   }) : null,
                   "confirm"
                 ]
               }),
-              jsx30("div", { className: "flex justify-end", children: jsx30("button", {
+              jsx32("div", { className: "flex justify-end", children: jsx32("button", {
                 disabled: !!busy,
                 onClick: onCancel,
                 className: "px-3 py-1 rounded-md text-xs cursor-pointer select-none",
@@ -6985,6 +6962,11 @@ var ADDR_PAINT = {
     fill: railFill(ACTION_COLOR.erase),
     active: (row) => !!row.msgAddr
   }
+};
+var LLMOPS_PAINT = {
+  border: ACTION_COLOR.llmops,
+  fill: railFill(ACTION_COLOR.llmops),
+  active: (row) => !!row.msgAddr
 };
 var COMPACT_PAINT = {
   border: ACTION_COLOR.compact,
@@ -7046,6 +7028,15 @@ function pairToolCalls(items) {
   });
   return out;
 }
+function selectedOpOf(popup, groups) {
+  const id = popup && popup.id;
+  if (!id) return null;
+  for (const g of groups || []) {
+    const hit = pairToolCalls(g.items).find((r) => r.kind === "toolpair" && r.key === id);
+    if (hit) return hit.answer && hit.answer.fact && hit.answer.fact.op || null;
+  }
+  return null;
+}
 function buildCarriageGroups(rows) {
   const groups = [];
   let current = null;
@@ -7061,7 +7052,7 @@ function buildCarriageGroups(rows) {
   });
   return groups;
 }
-function buildCarriage(group, popup, setPopup, stale, drop, compact, row, pickColumn, bricksByCall) {
+function buildCarriage(group, popup, setPopup, stale, compact, row, ledgerByMsg, durations) {
   const header = group.header;
   const opener = group.items.find((r) => r.kind === "msg" && r.opener);
   const rest = opener ? group.items.filter((r) => r !== opener) : group.items;
@@ -7080,16 +7071,18 @@ function buildCarriage(group, popup, setPopup, stale, drop, compact, row, pickCo
     prevKind = row2.kind;
     let node;
     if (row2.kind === "step") {
-      node = jsx31(StepBar, { row: row2 });
+      node = jsx33(StepBar, { row: row2 });
       railEntries.push({ kind: "step", pickable: false });
     } else if (row2.kind === "toolpair") {
       const callId = String(row2.answer && row2.answer.fact && row2.answer.fact.tool_call_id || "");
-      node = jsx31(ToolPairBrick, {
+      const answerAddr = row2.answer && row2.answer.address || "";
+      node = jsx33(ToolPairBrick, {
         row: row2,
         popup,
         setPopup,
         stale,
-        brick: callId && bricksByCall && bricksByCall.get(callId) || null
+        ledger: answerAddr && ledgerByMsg && ledgerByMsg.get(answerAddr) || null,
+        duration: callId && durations && durations[callId]
       });
       const afact = row2.answer && row2.answer.fact || {};
       const realOp = afact.op || "";
@@ -7110,7 +7103,7 @@ function buildCarriage(group, popup, setPopup, stale, drop, compact, row, pickCo
       node = null;
       railEntries.push({ kind: "empty", pickable: false, gapBefore, msgAddr: row2.address || "" });
     } else {
-      node = jsx31(MessageNode, { row: row2, popup, setPopup });
+      node = jsx33(MessageNode, { row: row2, popup, setPopup });
       railEntries.push({
         kind: "brick",
         pickable: false,
@@ -7119,7 +7112,7 @@ function buildCarriage(group, popup, setPopup, stale, drop, compact, row, pickCo
         msgAddr: row2.address || ""
       });
     }
-    return jsx31("div", { style: gapBefore ? { marginTop: "0.125rem" } : void 0, children: node }, row2.key);
+    return jsx33("div", { style: gapBefore ? { marginTop: "0.125rem" } : void 0, children: node }, row2.key);
   });
   const railRows = buildRailRows(railEntries);
   const vagon = jsxs30("div", {
@@ -7152,11 +7145,11 @@ function buildCarriage(group, popup, setPopup, stale, drop, compact, row, pickCo
       // Шапка вагона — сетка строк (`BrickHead`): `Turn …` слева, `op ID` над номерами операций,
       // `message ID` над адресами (владелец, 2026-09-23 и 2026-09-29). Адрес — наша система
       // координат, но по одному виду `m001f` этого не угадать.
-      jsx31("div", {
+      jsx33("div", {
         className: "px-2 pt-1",
         style: { height: ROW_HEIGHT2.header, boxSizing: "border-box" },
         // «carriage» → «Turn» (владелец, 2026-09-15).
-        children: jsx31(BrickHead, {
+        children: jsx33(BrickHead, {
           left: `Turn ${header.index} \xB7 ${header.count} msg`,
           opLabel: "op ID",
           addrLabel: "message ID",
@@ -7164,25 +7157,19 @@ function buildCarriage(group, popup, setPopup, stale, drop, compact, row, pickCo
           height: "100%"
         })
       }),
-      opener ? jsx31("div", {
+      opener ? jsx33("div", {
         className: "flex justify-end items-center px-2 pt-1",
         style: { height: ROW_HEIGHT2.opener, boxSizing: "border-box" },
-        children: jsx31(MessageNode, { row: opener, popup, setPopup })
+        children: jsx33(MessageNode, { row: opener, popup, setPopup })
       }) : null,
       // `pb-1`, БЕЗ `pt-1` (Таск 10a) — верхний паддинг этой обёртки не был бы учтён в
       // `railEntries` (там нет строки под «просто отступ»), и первая строка внутри
       // съехала бы вниз относительно своей ячейки на рельсе на эту величину. Нижний
       // паддинг безопасен — он ПОСЛЕ последней строки, ничьей ячейки не сдвигает.
-      jsx31("div", { className: "flex flex-col px-2 pb-1 gap-0", children: restNodes })
+      jsx33("div", { className: "flex flex-col px-2 pb-1 gap-0", children: restNodes })
     ]
   }, `${group.header.key}-vagon`);
-  const pickRail = drop && drop.mode ? jsx31(Rail, {
-    railRows,
-    cells: pickCells(railRows, drop),
-    gridRow: row,
-    gridColumn: pickColumn
-  }, `${group.header.key}-pick`) : null;
-  return { vagon, pickRail, railRows };
+  return { vagon, railRows };
 }
 function ImportBody({ imp }) {
   const check = imp.check;
@@ -7192,11 +7179,11 @@ function ImportBody({ imp }) {
   return jsxs30("div", {
     className: "flex flex-col gap-2",
     children: [
-      jsx31("div", { children: "Adds the folder's messages before (head) or after (tail) this chat's context, or replaces the WHOLE context with them. Order is the file number. Irreversible." }),
+      jsx33("div", { children: "Adds the folder's messages before (head) or after (tail) this chat's context, or replaces the WHOLE context with them. Order is the file number. Irreversible." }),
       jsxs30("div", {
         className: "flex items-center gap-1",
         children: [
-          jsx31("input", {
+          jsx33("input", {
             type: "text",
             value: imp.folder || "",
             placeholder: "export snapshot folder \u2014 or press Ctrl+V",
@@ -7215,7 +7202,7 @@ function ImportBody({ imp }) {
               color: "var(--ui-text-primary)"
             }
           }, "folder"),
-          jsx31("button", {
+          jsx33("button", {
             type: "button",
             disabled: !!imp.checking || !String(imp.folder || "").trim(),
             onClick: (e) => {
@@ -7234,7 +7221,7 @@ function ImportBody({ imp }) {
           }, "check")
         ]
       }, "row"),
-      fresh ? jsx31("div", {
+      fresh ? jsx33("div", {
         style: { color: check.ok ? "var(--ui-green)" : "var(--ui-red)", whiteSpace: "pre-wrap" },
         children: check.error ? String(check.error) : `${check.files || 0} files \u2192 ${check.messages || 0} messages` + (roles ? ` (${roles})` : "") + (problems.length ? `
 ${problems.length} problem(s):
@@ -7242,7 +7229,7 @@ ${problems.length} problem(s):
 \u2026 and ${problems.length - 8} more` : "") : `
 You gonna import: ${check.messages || 0} messages`)
       }, "result") : null,
-      imp.note && imp.ok === false ? jsx31("div", { style: { color: "var(--ui-red)" }, children: imp.note }, "note") : null
+      imp.note && imp.ok === false ? jsx33("div", { style: { color: "var(--ui-red)" }, children: imp.note }, "note") : null
     ]
   });
 }
@@ -7256,6 +7243,8 @@ function PromptMirror() {
   const [popup, setPopup] = useState11(null);
   const exp = useExportRail();
   const addrOp = useAddrOp();
+  const llmops = useLLMOpsRail();
+  const llmopsWin = useLLMOpsWin();
   const [applyAt, setApplyAt] = useState11(null);
   const [dropConfirm, setDropConfirm] = useState11(false);
   const imp = useImportOp();
@@ -7288,6 +7277,7 @@ function PromptMirror() {
   }
   const readExport = () => ($exportRail.get() || {}).picked || {};
   const readAddrOp = () => ($addrOp.get() || {}).picked || {};
+  const readLLMOps = () => ($llmopsRail.get() || {}).picked || {};
   useEffect5(() => {
     const up = () => {
       dragRef.current = null;
@@ -7301,22 +7291,16 @@ function PromptMirror() {
     document.addEventListener("click", clear);
     return () => document.removeEventListener("click", clear);
   }, [popup]);
-  const drop = useDrop();
   const fileContext = useFileContext();
   const ctxView = useMemo2(() => buildContextView(liveContextOps(fileContext.ops)), [fileContext.ops]);
-  const bricksByCall = useMemo2(() => {
+  const ledgerByMsg = useMemo2(() => {
     const map = /* @__PURE__ */ new Map();
-    (view.bricks || []).forEach((b) => {
-      if (b && b.tool_id) map.set(String(b.tool_id), b);
+    (fileContext.ops || []).forEach((f) => {
+      if (f && f.msg) map.set(String(f.msg), f);
     });
     return map;
-  }, [view.bricks]);
-  useEffect5(() => {
-    if (!drop.mode) return;
-    const clear = () => setDropMode(false);
-    document.addEventListener("click", clear);
-    return () => document.removeEventListener("click", clear);
-  }, [drop.mode]);
+  }, [fileContext.ops]);
+  const durations = useLiveDurations();
   const compact = useCompact();
   const compactRun = useCompactRun();
   useEffect5(() => {
@@ -7348,6 +7332,14 @@ function PromptMirror() {
     return () => document.removeEventListener("keydown", onKey);
   }, [addrOp.mode]);
   useEffect5(() => {
+    if (!llmops.mode) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setLLMOpsMode(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [llmops.mode]);
+  useEffect5(() => {
     if (compact.confirming) setPopup(null);
   }, [compact.confirming]);
   const zones = useZones();
@@ -7365,11 +7357,11 @@ function PromptMirror() {
     if (exp.note) setLastReport("export");
   }, [exp.note]);
   useEffect5(() => {
-    if (drop.note) setLastReport("drop");
-  }, [drop.note]);
-  useEffect5(() => {
     if (imp.note) setLastReport("import");
   }, [imp.note]);
+  useEffect5(() => {
+    if (llmops.note) setLastReport("llmops");
+  }, [llmops.note]);
   const { rows, placed, orphans } = layoutMessages(st.carriages, st.messages);
   const total = Array.isArray(st.messages) ? st.messages.length : 0;
   const foreign = rows.filter((r) => r.foreign).length;
@@ -7392,21 +7384,23 @@ function PromptMirror() {
     ro.observe(tape);
     if (headRef.current) ro.observe(headRef.current);
     return () => ro.disconnect();
-  }, [exp.mode, drop.mode, compact.mode, addrOp.mode, rows.length]);
-  const armedOp = exp.mode ? "export" : compact.mode ? "compact" : addrOp.mode ? addrOp.kind : null;
-  const armedPicked = armedOp === "export" ? exp.picked : armedOp === "compact" ? compact.picked : addrOp.mode ? addrOp.picked : {};
+  }, [exp.mode, compact.mode, addrOp.mode, llmops.mode, rows.length]);
+  const armedOp = exp.mode ? "export" : compact.mode ? "compact" : addrOp.mode ? addrOp.kind : llmops.mode ? "llmops" : null;
+  const armedPicked = armedOp === "export" ? exp.picked : armedOp === "compact" ? compact.picked : addrOp.mode ? addrOp.picked : armedOp === "llmops" ? llmops.picked : {};
   const armedBusy = armedOp === "export" ? !!exp.busy : armedOp === "compact" ? !!compact.busy : addrOp.mode ? !!addrOp.busy : false;
   const armedCount = markedAddresses(armedPicked).length;
-  const canApply = !!armedOp && !armedBusy && armedCount > 0;
+  const blockedByWindow = !!llmopsWin && (armedOp === "compact" || armedOp === "erase" || armedOp === "llmops");
+  const canApply = !!armedOp && !armedBusy && armedCount > 0 && !blockedByWindow;
   const applyColor = armedOp ? ACTION_COLOR[armedOp] : null;
-  const armedLabel = { export: "export", compact: "compact", content: "drop content", erase: "erase" }[armedOp] || "";
-  const report = lastReport === "addr" ? addrOp : lastReport === "compact" ? compact : lastReport === "export" ? exp : lastReport === "drop" ? drop : lastReport === "import" ? imp : null;
+  const armedLabel = { export: "export", compact: "compact", content: "drop content", erase: "erase", llmops: "llm ops" }[armedOp] || "";
+  const report = lastReport === "addr" ? addrOp : lastReport === "compact" ? compact : lastReport === "export" ? exp : lastReport === "import" ? imp : lastReport === "llmops" ? llmops : null;
   function applyArmed(button) {
     const box = button && button.getBoundingClientRect ? button.getBoundingClientRect() : null;
     setApplyAt(box ? { x: box.left + box.width / 2, y: box.bottom } : null);
     if (armedOp === "export") applyExport();
     else if (armedOp === "compact") openCompactConfirm();
     else if (armedOp === "content" || armedOp === "erase") setDropConfirm(true);
+    else if (armedOp === "llmops") applyLLMOps();
   }
   const head = jsxs30("div", {
     className: "items-center gap-2 px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0",
@@ -7417,10 +7411,10 @@ function PromptMirror() {
       alignItems: "center"
     }, SELECTABLE),
     children: [
-      jsx31("button", {
+      jsx33("button", {
         type: "button",
         disabled: !canApply,
-        title: canApply ? armedOp === "export" ? `export ${armedCount} ticked message(s) to files` : armedOp === "content" ? `drop the content of ${armedCount} ticked tool result(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "erase" ? `erase ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : `compact ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp ? "nothing ticked" : "arm an operation first",
+        title: canApply ? armedOp === "export" ? `export ${armedCount} ticked message(s) to files` : armedOp === "content" ? `drop the content of ${armedCount} ticked tool result(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "erase" ? `erase ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "llmops" ? `open the LLMOps window with ${armedCount} ticked message(s)` : `compact ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : blockedByWindow ? "the LLMOps window is open \u2014 close it first" : armedOp ? "nothing ticked" : "arm an operation first",
         onClick: (e) => {
           e.stopPropagation();
           if (canApply) applyArmed(e.currentTarget);
@@ -7436,14 +7430,14 @@ function PromptMirror() {
         }, ACTION_BTN),
         children: armedBusy ? "applying\u2026" : "Apply operation"
       }),
-      jsx31("span", {
+      jsx33("span", {
         className: orphans ? "text-(--ui-text-primary)" : "text-(--ui-text-quaternary)",
         style: Object.assign({ justifySelf: "center", minWidth: 0, textAlign: "center" }, SELECTABLE),
         // Число, которое и есть вердикт прогона: сколько сообщений легло в структуру
         // и сколько осталось за бортом.
         children: st.loading ? "loading\u2026" : `${placed}/${total} placed` + (orphans ? ` \xB7 ${orphans} not placed` : "") + (foreign ? ` \xB7 ${foreign} foreign` : "")
       }),
-      jsx31("button", {
+      jsx33("button", {
         onClick: () => loadMessages(),
         className: "rounded-full font-medium cursor-pointer select-none transition-colors duration-150 ease-out hover:bg-(--ui-bg-tertiary) active:scale-95",
         style: Object.assign({
@@ -7459,33 +7453,33 @@ function PromptMirror() {
     return jsxs30("div", {
       className: "flex flex-col h-full w-full overflow-hidden",
       style: CAPPED,
-      children: [head, sdkC(sdk7.EmptyState, "div", { title: "No messages", description: st.note })]
+      children: [head, sdkC(sdk8.EmptyState, "div", { title: "No messages", description: st.note })]
     });
   }
   if (!rows.length) {
     return jsxs30("div", {
       className: "flex flex-col h-full w-full overflow-hidden",
       style: CAPPED,
-      children: [head, sdkC(sdk7.EmptyState, "div", {
+      children: [head, sdkC(sdk8.EmptyState, "div", {
         title: st.loading ? "Loading\u2026" : "Nothing addressed yet",
         description: "Messages appear once the session has history and the indexer has run."
       })]
     });
   }
-  const msgTokens = (Array.isArray(st.messages) ? st.messages : []).reduce((sum, m) => sum + factTokens(m), 0);
+  const msgTokens2 = (Array.isArray(st.messages) ? st.messages : []).reduce((sum, m) => sum + factTokens(m), 0);
   const tokRep = tok && tok.sessionId === view.sessionId && tok.rep && tok.rep.ours || null;
   const fixedTokens = tokRep ? (tokRep.system || 0) + (tokRep.tools || 0) : 0;
-  const totalTokens = msgTokens + fixedTokens;
+  const totalTokens = msgTokens2 + fixedTokens;
   const pickedTokens = rows.reduce((sum, r) => r.kind === "msg" && r.address && (compact.picked || {})[r.address] ? sum + factTokens(r.fact) : sum, 0);
   const RAIL_HEAD = "1.35rem";
   const statsBar = jsxs30("div", {
     className: "flex items-center gap-2 min-w-0",
     style: Object.assign({ fontSize: "0.55rem", width: "100%" }, SELECTABLE),
     children: [
-      jsx31("span", {
+      jsx33("span", {
         className: "text-(--ui-text-quaternary)",
         style: SELECTABLE,
-        title: tokRep ? `messages ${msgTokens} + system ${tokRep.system || 0} + tools ${tokRep.tools || 0} \u2014 our estimator` : "messages only \u2014 the token counter has not answered yet",
+        title: tokRep ? `messages ${msgTokens2} + system ${tokRep.system || 0} + tools ${tokRep.tools || 0} \u2014 our estimator` : "messages only \u2014 the token counter has not answered yet",
         children: `~${tokensLabel(totalTokens)} tk total${tokRep ? "" : " (msgs)"}`
       }),
       // `PRESS ESC` снят вместе с приходом крестика на рельсу компакции (Plan16-Task07,
@@ -7498,17 +7492,12 @@ function PromptMirror() {
       // Источник — `rows`, а не `st.messages`: отметка стоит на АДРЕСЕ, и только в `rows`
       // адрес лежит рядом с длиной. `~` не для красоты: это оценка по символам, а не счёт
       // токенизатором (см. `factTokens`).
-      compact.mode ? jsx31("span", {
+      compact.mode ? jsx33("span", {
         className: "font-semibold",
         style: Object.assign({ fontSize: "0.7rem", color: ACTION_COLOR.compact }, SELECTABLE),
         title: "rough token estimate of the ticked messages \u2014 same per-message numbers as in the tape, summed",
         children: `~${tokensLabel(pickedTokens)} tk ticked`
-      }) : null,
-      // Подсказка режима отметки живёт ЗДЕСЬ, а не среди кнопок (владелец, 2026-09-23: «эта
-      // строчка сдвигает кнопку compact»): она появляется и исчезает вместе с режимом, и в
-      // полосе кнопок двигала соседнюю зону на каждое взведение. Полоса статистики — место,
-      // где ширина своя и прыгать нечему.
-      jsx31(ActionHint, { drop })
+      }) : null
     ]
   });
   const groups = buildCarriageGroups(rows);
@@ -7533,6 +7522,16 @@ function PromptMirror() {
       onClose: () => setAddrOpMode(false)
     });
   }
+  if (llmops.mode) {
+    railSpecs.push({
+      key: "llmops",
+      picked: llmops.picked,
+      paint: LLMOPS_PAINT,
+      setPicks: setLLMOpsPicks,
+      drag: railDrag("llmops", readLLMOps, setLLMOpsPicks),
+      onClose: () => setLLMOpsMode(false)
+    });
+  }
   if (compact.mode) {
     railSpecs.push({
       key: "compact",
@@ -7544,7 +7543,6 @@ function PromptMirror() {
     });
   }
   const openRails = railSpecs;
-  const pickColumn = 2 + railSpecs.length;
   const items = [];
   const idsBySpec = railSpecs.map(() => []);
   groups.forEach((g, i) => {
@@ -7553,18 +7551,17 @@ function PromptMirror() {
       popup,
       setPopup,
       ctxView.stale,
-      drop,
       compact,
       i + 1,
-      pickColumn,
-      bricksByCall
+      ledgerByMsg,
+      durations
     );
     items.push(built2.vagon);
     railSpecs.forEach((spec, slot) => {
       activeAddresses(built2.railRows, spec.paint.active).forEach((id) => {
         if (idsBySpec[slot].indexOf(id) < 0) idsBySpec[slot].push(id);
       });
-      items.push(jsx31(Rail, {
+      items.push(jsx33(Rail, {
         railRows: built2.railRows,
         cells: baseCells(built2.railRows, spec.picked, spec.drag, spec.paint),
         guide: true,
@@ -7572,7 +7569,6 @@ function PromptMirror() {
         gridColumn: 2 + slot
       }, `${g.header.key}-rail-${spec.key}`));
     });
-    if (built2.pickRail) items.push(built2.pickRail);
   });
   function pickAll(slot, clear) {
     const next = {};
@@ -7590,7 +7586,7 @@ function PromptMirror() {
     railSpecs[slot].setPicks(next);
   }
   function railPickBtn(title, glyph, onClick, disabled) {
-    return jsx31("button", {
+    return jsx33("button", {
       type: "button",
       className: "mirror-action-btn rounded-md border border-(--ui-stroke-secondary)",
       title,
@@ -7634,7 +7630,7 @@ function PromptMirror() {
   }) : [];
   const railLefts = Object.keys(railBoxes).map((k2) => railBoxes[k2].left);
   const firstRail = railLefts.length ? Math.min.apply(null, railLefts) : null;
-  const tapeHead = jsx31("div", {
+  const tapeHead = jsx33("div", {
     style: {
       position: "relative",
       zIndex: 4,
@@ -7655,22 +7651,21 @@ function PromptMirror() {
       className: "flex items-center gap-2 mt-3 mb-1",
       style: Object.assign({ fontSize: "0.55rem", width: "60%", gridColumn: "1 / -1" }, SELECTABLE),
       children: [
-        jsx31("span", {
+        jsx33("span", {
           className: "px-1.5 py-0.5 rounded-full border border-(--ui-stroke-secondary) text-(--ui-text-primary) shrink-0",
           children: `not placed \xB7 ${orphans}`
         }),
-        jsx31("div", { className: "grow", style: { borderTop: "1px solid var(--ui-stroke-primary)" } })
+        jsx33("div", { className: "grow", style: { borderTop: "1px solid var(--ui-stroke-primary)" } })
       ]
     }, "orphan-bar"));
-    orphanRows.forEach((row) => items.push(jsx31("div", {
+    orphanRows.forEach((row) => items.push(jsx33("div", {
       style: { gridColumn: "1 / -1" },
-      children: jsx31(MessageNode, { row, popup, setPopup })
+      children: jsx33(MessageNode, { row, popup, setPopup })
     }, row.key)));
   }
   const msgAddresses = rows.filter((r) => r.kind === "msg").map((r) => r.address).filter(Boolean);
   const railTerms = [];
   openRails.forEach(() => railTerms.push(RAIL_BODY_WIDTH));
-  if (drop.mode) railTerms.push(RAIL_WIDTH);
   const railCols = railTerms.length ? ` ${railTerms.join(" ")}` : "";
   const railColumnGap = "0.375rem";
   return jsxs30("div", {
@@ -7695,38 +7690,40 @@ function PromptMirror() {
       // развёрнутая — группы кнопок, треугольник в начале первой; свёрнутая — одна строка
       // тонких кнопок без опций. `Status` — просто одна строка: разворачивать там пока нечего.
       zones.operations ? jsxs30("div", { className: "shrink-0 flex flex-col border-b border-(--ui-stroke-quaternary)", children: [
-        jsx31(OpGroup, {
+        jsx33(OpGroup, {
           label: "context",
-          lead: jsx31(ZoneToggle, { title: "Operations", open: true, onToggle: () => toggleZone("operations") }),
+          lead: jsx33(ZoneToggle, { title: "Operations", open: true, onToggle: () => toggleZone("operations") }),
           children: [
-            jsx31(ActionZone, { op: addrOp }, "addr"),
-            jsx31(CompactZone, { compact, addresses: msgAddresses }, "compact")
+            jsx33(ActionZone, { op: addrOp }, "addr"),
+            jsx33(CompactZone, { compact, addresses: msgAddresses }, "compact"),
+            jsx33(LLMOpsZone, {}, "llmops")
           ]
         }),
-        jsx31(OpGroup, { label: "save", children: [
-          jsx31(ExportZone, { exp, addresses: msgAddresses }, "export"),
-          jsx31(ImportZone, { imp, onOpen: setImportAt }, "import")
+        jsx33(OpGroup, { label: "save", children: [
+          jsx33(ExportZone, { exp, addresses: msgAddresses }, "export"),
+          jsx33(ImportZone, { imp, onOpen: setImportAt }, "import")
         ] })
       ] }, "zone-operations") : jsxs30("div", {
         className: "shrink-0 flex items-center flex-wrap border-b border-(--ui-stroke-quaternary)",
         style: { paddingLeft: "0.375rem", minHeight: "1.25rem" },
         children: [
-          jsx31(ZoneToggle, { title: "Operations", open: false, onToggle: () => toggleZone("operations") }, "toggle"),
-          jsx31(ActionZone, { op: addrOp, thin: true }, "addr"),
-          jsx31(CompactZone, { compact, addresses: msgAddresses, thin: true }, "compact"),
-          jsx31(ExportZone, { exp, addresses: msgAddresses, thin: true }, "export"),
-          jsx31(ImportZone, { imp, thin: true, onOpen: setImportAt }, "import")
+          jsx33(ZoneToggle, { title: "Operations", open: false, onToggle: () => toggleZone("operations") }, "toggle"),
+          jsx33(ActionZone, { op: addrOp, thin: true }, "addr"),
+          jsx33(CompactZone, { compact, addresses: msgAddresses, thin: true }, "compact"),
+          jsx33(LLMOpsZone, { thin: true }, "llmops"),
+          jsx33(ExportZone, { exp, addresses: msgAddresses, thin: true }, "export"),
+          jsx33(ImportZone, { imp, thin: true, onOpen: setImportAt }, "import")
         ]
       }, "zone-operations"),
-      jsx31(StatusLine, { report, run: compactRun }, "zone-status"),
+      jsx33(StatusLine, { report, run: compactRun }, "zone-status"),
       // `Files` пропадает целиком, пока файлов в контексте нет (владелец: «сжимать в ноль»).
-      ctxView.files && ctxView.files.length ? jsx31(FileContextPanel, {
+      ctxView.files && ctxView.files.length ? jsx33(FileContextPanel, {
         view: ctxView,
-        selectedOp: fileContext.selectedOp,
+        selectedOp: selectedOpOf(popup, groups),
         open: zones.files,
         onToggle: () => toggleZone("files")
       }, "zone-files") : null,
-      jsx31("style", { children: `
+      jsx33("style", { children: `
         .fops-scroll::-webkit-scrollbar { width: 16px; }
         .fops-scroll::-webkit-scrollbar-track { background: transparent; }
         .fops-scroll::-webkit-scrollbar-thumb {
@@ -7788,7 +7785,7 @@ function PromptMirror() {
               ...railSpecs.map((spec, slot) => {
                 const box = railBoxes[spec.key];
                 if (!box || !chromes[slot]) return null;
-                return jsx31("div", {
+                return jsx33("div", {
                   style: {
                     position: "absolute",
                     top: 0,
@@ -7802,7 +7799,7 @@ function PromptMirror() {
               })
             ]
           }),
-          jsx31("div", {
+          jsx33("div", {
             className: "w-full fops-scroll",
             style: {
               flex: "1 1 auto",
@@ -7836,12 +7833,12 @@ function PromptMirror() {
               }, "tape"),
               // Хвост — СОСЕДОМ сетки, прямым ребёнком скроллера (2026-10-02: он жил внутри сетки,
               // 40% от её auto-высоты схлопнулись в ноль, и последний вагон лёг на нижний край).
-              jsx31("div", { style: { height: TAIL_SPACE, pointerEvents: "none" } }, "tail-space")
+              jsx33("div", { style: { height: TAIL_SPACE, pointerEvents: "none" } }, "tail-space")
             ]
           })
         ]
       }),
-      jsx31(ConfirmModal, {
+      jsx33(ConfirmModal, {
         open: !!compact.confirming,
         anchor: applyAt,
         title: "Compact messages?",
@@ -7850,7 +7847,7 @@ function PromptMirror() {
         onConfirm: () => confirmCompact(),
         onCancel: () => cancelCompactConfirm()
       }, "confirm-compact"),
-      jsx31(ConfirmModal, {
+      jsx33(ConfirmModal, {
         open: dropConfirm,
         anchor: applyAt,
         title: addrOp.kind === "erase" ? "Erase messages?" : "Drop content?",
@@ -7864,11 +7861,11 @@ function PromptMirror() {
         },
         onCancel: () => setDropConfirm(false)
       }, "confirm-drop"),
-      jsx31(ConfirmModal, {
+      jsx33(ConfirmModal, {
         open: !!imp.open,
         anchor: importAt,
         title: "Import session from a folder?",
-        body: jsx31(ImportBody, { imp }),
+        body: jsx33(ImportBody, { imp }),
         busy: !!imp.busy,
         canConfirm: !!(imp.check && imp.check.ok === true && imp.check.folder === imp.folder),
         // Три режима (Plan27, владелец): главная — `Replace session`, крупнее.
@@ -7893,11 +7890,11 @@ function PromptMirror() {
 }
 
 // desktop/src/token-strip.js
-import { jsx as jsx33, jsxs as jsxs32 } from "react/jsx-runtime";
+import { jsx as jsx35, jsxs as jsxs32 } from "react/jsx-runtime";
 import { useEffect as useEffect6, useState as useState13 } from "react";
 
 // desktop/src/token-bar.js
-import { jsx as jsx32, jsxs as jsxs31 } from "react/jsx-runtime";
+import { jsx as jsx34, jsxs as jsxs31 } from "react/jsx-runtime";
 import { useState as useState12, useRef as useRef7 } from "react";
 var k = (x) => typeof x === "number" && isFinite(x) ? x >= 1e4 ? Math.round(x / 1e3) + "k" : (x / 1e3).toFixed(1) + "k" : "\u2014";
 var n = (x) => typeof x === "number" && isFinite(x) ? x.toLocaleString("en-US").replace(/,/g, " ") : "\u2014";
@@ -7977,7 +7974,7 @@ function tipText(r, main, win, auto, autoPercent, ticked) {
   return lines.join("\n");
 }
 function seg(key, width, color, extra) {
-  return width > 0 ? jsx32("div", { style: Object.assign({ width: width + "%", height: "100%", backgroundColor: color, flex: "none" }, extra || {}) }, key) : null;
+  return width > 0 ? jsx34("div", { style: Object.assign({ width: width + "%", height: "100%", backgroundColor: color, flex: "none" }, extra || {}) }, key) : null;
 }
 function TokenBar({ rep, autoPercent, ticked }) {
   const [open, setOpen] = useState12(null);
@@ -8028,7 +8025,7 @@ function TokenBar({ rep, autoPercent, ticked }) {
           seg("growth", pct(growth), TOKEN_COLOR.growth)
         ]
       }),
-      auto != null ? jsx32("div", { style: {
+      auto != null ? jsx34("div", { style: {
         position: "absolute",
         left: `${pct(auto)}%`,
         top: "-0.15rem",
@@ -8041,17 +8038,17 @@ function TokenBar({ rep, autoPercent, ticked }) {
   const text = jsxs31("span", {
     style: { whiteSpace: "nowrap", flex: "none" },
     children: [
-      jsx32("span", {
+      jsx34("span", {
         className: "font-semibold",
         style: { color: "var(--ui-text-secondary)" },
         children: `${k(main.value)} / ${k(win)}`
       }),
       ` \xB7 ${Math.round(100 * main.value / win)}% ${main.mark}`,
-      auto != null ? jsx32("span", {
+      auto != null ? jsx34("span", {
         style: { color: over ? TOKEN_COLOR.over : void 0 },
         children: `   auto ${k(auto)} \xB7 ${over ? "over by " + k(main.value - auto) : k(auto - main.value) + " left"}`
       }) : null,
-      ticked ? jsx32("span", { style: { color: TOKEN_COLOR.ticked }, children: `   \u2192 \u2248${k(main.value - ticked)}` }) : null
+      ticked ? jsx34("span", { style: { color: TOKEN_COLOR.ticked }, children: `   \u2192 \u2248${k(main.value - ticked)}` }) : null
     ]
   });
   return jsxs31("div", {
@@ -8067,7 +8064,7 @@ function TokenBar({ rep, autoPercent, ticked }) {
         onClick: toggle,
         children: [bar, text]
       }),
-      open ? jsx32("div", {
+      open ? jsx34("div", {
         // Прозрачная подложка до самой полосы — мост для мыши; окошко сидит на её верхнем краю.
         style: {
           position: "fixed",
@@ -8077,7 +8074,7 @@ function TokenBar({ rep, autoPercent, ticked }) {
           maxWidth: open.maxWidth + "px",
           cursor: "text"
         },
-        children: jsx32("pre", {
+        children: jsx34("pre", {
           style: {
             margin: 0,
             padding: "0.4rem 0.5rem",
@@ -8104,7 +8101,7 @@ function TokenBar({ rep, autoPercent, ticked }) {
 
 // desktop/src/token-strip.js
 function btn(label, onClick, lit, title, disabled) {
-  return jsx33("button", {
+  return jsx35("button", {
     onClick,
     disabled,
     title,
@@ -8138,7 +8135,7 @@ function TokenStrip() {
   const notLoaded = s.kind === "router" && (s.status === "unloaded" || s.status === "loading");
   const canCount = s.kind !== "none" && (s.status === "loaded" || s.status == null || !!s.via);
   const ticked = compact.mode ? (Array.isArray(st.messages) ? st.messages : []).reduce((sum, m) => sum + ((compact.picked || {})[m && m.msg] ? factTokens(m) : 0), 0) : 0;
-  const cell = (child) => jsx33("div", { className: "min-w-0", children: child });
+  const cell = (child) => jsx35("div", { className: "min-w-0", children: child });
   return jsxs32("div", {
     "data-token-strip": "1",
     // Зазоры ужаты (владелец, 2026-09-29: высота ~0.7 от прежней). `relative` — окошко полосы
@@ -8158,7 +8155,7 @@ function TokenStrip() {
       paddingBottom: "0.15rem"
     },
     children: [
-      cell(t.rep ? jsx33(TokenBar, { rep: t.rep, autoPercent, ticked }) : jsx33("span", { children: t.note || "no token report yet" })),
+      cell(t.rep ? jsx35(TokenBar, { rep: t.rep, autoPercent, ticked }) : jsx35("span", { children: t.note || "no token report yet" })),
       btn(
         "count",
         () => loadTokens({ exact: true }),
@@ -8166,7 +8163,7 @@ function TokenStrip() {
         s.via ? `exact count now via ${s.via} (same tokenizer)` : "exact count by the model server now",
         t.busy || !canCount
       ),
-      cell(jsx33("div", {
+      cell(jsx35("div", {
         style: { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", userSelect: "text" },
         title: t.note || r.model || "",
         // Ошибка — ПЕРВОЙ (владелец: «ушла под срез»): иначе её не видно за длинным именем модели.
@@ -8184,8 +8181,12 @@ function TokenStrip() {
 }
 
 // desktop/src/config-pane.js
-import { jsx as jsx34, jsxs as jsxs33 } from "react/jsx-runtime";
-import { useState as useState14, useEffect as useEffect7, useLayoutEffect as useLayoutEffect5, useRef as useRef8 } from "react";
+import { jsx as jsx38, jsxs as jsxs34 } from "react/jsx-runtime";
+import { useState as useState16, useEffect as useEffect8, useLayoutEffect as useLayoutEffect6, useRef as useRef10 } from "react";
+
+// desktop/src/config-tools-table.js
+import { jsx as jsx36, jsxs as jsxs33 } from "react/jsx-runtime";
+import { useState as useState14, useLayoutEffect as useLayoutEffect5, useRef as useRef8 } from "react";
 function InfoLabel({ id, text, info, openInfo, setOpenInfo, className }) {
   const open = openInfo === id;
   const popRef = useRef8(null);
@@ -8201,7 +8202,7 @@ function InfoLabel({ id, text, info, openInfo, setOpenInfo, className }) {
     if (rect.right > window.innerWidth) setFlipLeft(true);
   }, [open]);
   return jsxs33("span", { className: "relative inline-flex min-w-0 flex-1", children: [
-    jsx34("span", {
+    jsx36("span", {
       key: "label",
       onClick: (e) => {
         e.stopPropagation();
@@ -8211,7 +8212,7 @@ function InfoLabel({ id, text, info, openInfo, setOpenInfo, className }) {
       style: SELECTABLE,
       children: text
     }),
-    open ? jsx34("div", {
+    open ? jsx36("div", {
       key: "pop",
       ref: popRef,
       onClick: (e) => e.stopPropagation(),
@@ -8226,7 +8227,7 @@ function InfoLabel({ id, text, info, openInfo, setOpenInfo, className }) {
   ] });
 }
 function sectionHead(text, infoId, info, openInfo, setOpenInfo) {
-  return jsx34("div", { className: "px-1 pt-1 pb-0.5", children: jsx34(InfoLabel, {
+  return jsx36("div", { className: "px-1 pt-1 pb-0.5", children: jsx36(InfoLabel, {
     id: infoId,
     info,
     openInfo,
@@ -8235,11 +8236,134 @@ function sectionHead(text, infoId, info, openInfo, setOpenInfo) {
     text
   }) });
 }
+var SELECT_STYLE = { backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)", height: "18px", margin: 0 };
+var CHECKBOX_STYLE = { accentColor: "var(--dt-primary)", width: "14px", height: "14px" };
+function disableRow(name, info, checked, onChange, openInfo, setOpenInfo) {
+  return jsxs33("div", {
+    className: "flex items-center justify-between gap-2 pl-1 pr-1 py-0 text-[10px] transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background)",
+    style: { borderRight: "1px solid var(--ui-stroke-quaternary)" },
+    children: [
+      // Hard clip, no ellipsis — the owner explicitly wants letters cut off, not "...": that
+      // reads as "still complete, just tight" instead of announcing a truncation.
+      jsx36(InfoLabel, { id: "dis-" + name, text: name, info, openInfo, setOpenInfo, className: "block w-full overflow-hidden whitespace-nowrap" }),
+      jsxs33("label", { className: "flex items-center gap-1 shrink-0 text-(--ui-text-quaternary) cursor-pointer", style: SELECTABLE, children: [
+        jsx36("span", { style: SELECTABLE, children: "disable" }),
+        jsx36("input", { type: "checkbox", checked, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE })
+      ] })
+    ]
+  }, name);
+}
+function paramControl(toolKey, param, onChange, openInfo, setOpenInfo) {
+  const id = "param-" + toolKey + "-" + param.key;
+  let control;
+  if (param.type === "bool") {
+    control = jsx36("input", { type: "checkbox", checked: param.value, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE });
+  } else if (param.type === "number") {
+    control = jsx36("input", {
+      type: "text",
+      inputMode: "numeric",
+      maxLength: 3,
+      value: String(param.value),
+      onChange: (e) => {
+        const digits = e.currentTarget.value.replace(/\D/g, "").slice(0, 3);
+        onChange(digits === "" ? 0 : Number(digits));
+      },
+      className: "w-8 px-1 rounded text-[10px] text-center outline-none",
+      style: SELECT_STYLE
+    });
+  } else if (param.type === "enum") {
+    control = jsx36("select", {
+      value: param.value,
+      onChange: (e) => onChange(e.currentTarget.value),
+      className: "rounded text-[10px] outline-none",
+      style: SELECT_STYLE,
+      children: (param.options || []).map((o) => jsx36("option", { value: o, children: o }, o))
+    });
+  } else {
+    control = jsx36("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: String(param.value) });
+  }
+  return jsxs33("div", { className: "flex items-center justify-between gap-2 w-full", children: [
+    jsx36(InfoLabel, { id, text: param.key, info: param.help, openInfo, setOpenInfo, className: "text-[10px]" }),
+    control
+  ] }, param.key);
+}
+function paramsEditor(toolKey, params, onChange, openInfo, setOpenInfo) {
+  if (!params.length) return jsx36("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: "\u2014" });
+  return jsx36("div", {
+    className: "flex flex-col gap-0.5 w-full",
+    children: params.map((p) => paramControl(toolKey, p, (value) => onChange(p.key, value), openInfo, setOpenInfo))
+  });
+}
+function pathSelect(key, value, onChange) {
+  return jsx36("select", {
+    value,
+    onChange: (e) => onChange(e.currentTarget.value),
+    className: "rounded text-[10px] outline-none",
+    style: SELECT_STYLE,
+    children: ["old", "new"].map((o) => jsx36("option", { value: o, children: o }, o))
+  });
+}
+var COL_PX = { tool: 100, params: 120, enabled: 60, path: 70 };
+function toolTableRow(key, state, onChange, showParams, showPath, hoverKey, setHoverKey) {
+  const onEnter = () => setHoverKey(key);
+  const onLeave = () => setHoverKey(null);
+  const cellStyle = (extra) => Object.assign(
+    { display: "flex", alignItems: "flex-start", borderBottom: "1px solid var(--ui-stroke-quaternary)", backgroundColor: hoverKey === key ? "var(--ui-row-hover-background)" : "transparent" },
+    extra
+  );
+  const cells2 = [
+    jsx36("div", {
+      className: "px-1 py-0.5 min-w-0 text-[10px]",
+      style: cellStyle(),
+      onMouseEnter: onEnter,
+      onMouseLeave: onLeave,
+      // text-[0.8rem]: text-sm (0.875rem) was competing with the section header's own text-xs
+      // for visual weight; dialed back a touch while keeping the added font-semibold.
+      children: jsx36(InfoLabel, { id: "slot-" + key, text: key, info: state.help, openInfo: state.openInfo, setOpenInfo: state.setOpenInfo, className: "text-[10px] font-semibold truncate" })
+    }, key + "-name")
+  ];
+  if (showParams) {
+    cells2.push(jsx36("div", {
+      className: "px-1 py-0.5",
+      onMouseEnter: onEnter,
+      onMouseLeave: onLeave,
+      style: cellStyle({ borderRight: "1px solid var(--ui-stroke-quaternary)" }),
+      children: paramsEditor(
+        key,
+        state.params,
+        (paramKey, value) => onChange({ params: state.params.map((p) => p.key === paramKey ? Object.assign({}, p, { value }) : p) }),
+        state.openInfo,
+        state.setOpenInfo
+      )
+    }, key + "-params"));
+  }
+  cells2.push(jsx36("div", {
+    className: "px-1 py-0.5",
+    style: cellStyle({ justifyContent: "center" }),
+    onMouseEnter: onEnter,
+    onMouseLeave: onLeave,
+    children: jsx36("span", { className: "inline-flex items-center", children: jsx36("input", { type: "checkbox", checked: state.enabled, onChange: (e) => onChange({ enabled: e.currentTarget.checked }), style: CHECKBOX_STYLE }) })
+  }, key + "-enabled"));
+  if (showPath) {
+    cells2.push(jsx36("div", {
+      className: "px-1 py-0.5 text-[10px]",
+      style: cellStyle(),
+      onMouseEnter: onEnter,
+      onMouseLeave: onLeave,
+      children: pathSelect(key, state.path, (v) => onChange({ path: v }))
+    }, key + "-path"));
+  }
+  return cells2;
+}
+
+// desktop/src/config-widgets.js
+import { jsx as jsx37 } from "react/jsx-runtime";
+import { useState as useState15, useEffect as useEffect7, useRef as useRef9 } from "react";
 function zone(children) {
-  return jsx34("div", { className: "flex flex-col border-b border-(--ui-stroke-quaternary) pb-1 mb-1", children });
+  return jsx37("div", { className: "flex flex-col border-b border-(--ui-stroke-quaternary) pb-1 mb-1", children });
 }
 function textInput(value, onChange, placeholder, extraClassName) {
-  return jsx34("input", {
+  return jsx37("input", {
     type: "text",
     value,
     onChange,
@@ -8254,21 +8378,8 @@ function textInput(value, onChange, placeholder, extraClassName) {
     }
   });
 }
-function seamsElapsedText(ms) {
-  const sec = Math.max(0, Math.floor((Number(ms) || 0) / 1e3));
-  return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0") + " / ~3:00";
-}
-function seamsTallyText(tally) {
-  if (!tally || typeof tally !== "object") return "";
-  return Object.keys(tally).sort().map((k2) => k2 + ": " + tally[k2]).join(" \xB7 ");
-}
-function hermesVerifiedText(verified) {
-  const commit = String(verified && verified.commit || "");
-  const date = String(verified && verified.date || "");
-  return "Verified on Hermes " + (commit || "\u2014") + (date ? " (" + date + ")" : "") + ". Much of this plugin hooks into Hermes code that is not a public API \u2014 after a Hermes update, run Full check.";
-}
 function textArea(value, rows, small) {
-  return jsx34("textarea", {
+  return jsx37("textarea", {
     readOnly: true,
     value,
     rows: rows || 5,
@@ -8280,7 +8391,7 @@ function textArea(value, rows, small) {
   });
 }
 function smallNumberField(value, onChange) {
-  return jsx34("input", {
+  return jsx37("input", {
     type: "text",
     inputMode: "numeric",
     value,
@@ -8303,140 +8414,21 @@ function smallNumberField(value, onChange) {
 }
 function compactCell(label, title, control) {
   return [
-    jsx34("span", { title, className: "text-right text-(--ui-text-secondary)", style: SELECTABLE, children: label }, label + ":l"),
-    jsx34("div", { title, className: "flex items-center", children: control }, label + ":c")
+    jsx37("span", { title, className: "text-right text-(--ui-text-secondary)", style: SELECTABLE, children: label }, label + ":l"),
+    jsx37("div", { title, className: "flex items-center", children: control }, label + ":c")
   ];
 }
 function actionButton(label, onClick) {
-  return jsx34("button", {
+  return jsx37("button", {
     onClick,
     className: "px-2 py-0.5 rounded text-[10px] font-medium cursor-pointer select-none transition-colors duration-100 ease-out hover:bg-(--ui-bg-tertiary) active:scale-95",
     style: { border: "1px solid var(--ui-stroke-secondary)" },
     children: label
   });
 }
-var SELECT_STYLE = { backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)", height: "18px", margin: 0 };
-var CHECKBOX_STYLE = { accentColor: "var(--dt-primary)", width: "14px", height: "14px" };
-function disableRow(name, info, checked, onChange, openInfo, setOpenInfo) {
-  return jsxs33("div", {
-    className: "flex items-center justify-between gap-2 pl-1 pr-1 py-0 text-[10px] transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background)",
-    style: { borderRight: "1px solid var(--ui-stroke-quaternary)" },
-    children: [
-      // Hard clip, no ellipsis — the owner explicitly wants letters cut off, not "...": that
-      // reads as "still complete, just tight" instead of announcing a truncation.
-      jsx34(InfoLabel, { id: "dis-" + name, text: name, info, openInfo, setOpenInfo, className: "block w-full overflow-hidden whitespace-nowrap" }),
-      jsxs33("label", { className: "flex items-center gap-1 shrink-0 text-(--ui-text-quaternary) cursor-pointer", style: SELECTABLE, children: [
-        jsx34("span", { style: SELECTABLE, children: "disable" }),
-        jsx34("input", { type: "checkbox", checked, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE })
-      ] })
-    ]
-  }, name);
-}
-function paramControl(toolKey, param, onChange, openInfo, setOpenInfo) {
-  const id = "param-" + toolKey + "-" + param.key;
-  let control;
-  if (param.type === "bool") {
-    control = jsx34("input", { type: "checkbox", checked: param.value, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE });
-  } else if (param.type === "number") {
-    control = jsx34("input", {
-      type: "text",
-      inputMode: "numeric",
-      maxLength: 3,
-      value: String(param.value),
-      onChange: (e) => {
-        const digits = e.currentTarget.value.replace(/\D/g, "").slice(0, 3);
-        onChange(digits === "" ? 0 : Number(digits));
-      },
-      className: "w-8 px-1 rounded text-[10px] text-center outline-none",
-      style: SELECT_STYLE
-    });
-  } else if (param.type === "enum") {
-    control = jsx34("select", {
-      value: param.value,
-      onChange: (e) => onChange(e.currentTarget.value),
-      className: "rounded text-[10px] outline-none",
-      style: SELECT_STYLE,
-      children: (param.options || []).map((o) => jsx34("option", { value: o, children: o }, o))
-    });
-  } else {
-    control = jsx34("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: String(param.value) });
-  }
-  return jsxs33("div", { className: "flex items-center justify-between gap-2 w-full", children: [
-    jsx34(InfoLabel, { id, text: param.key, info: param.help, openInfo, setOpenInfo, className: "text-[10px]" }),
-    control
-  ] }, param.key);
-}
-function paramsEditor(toolKey, params, onChange, openInfo, setOpenInfo) {
-  if (!params.length) return jsx34("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: "\u2014" });
-  return jsx34("div", {
-    className: "flex flex-col gap-0.5 w-full",
-    children: params.map((p) => paramControl(toolKey, p, (value) => onChange(p.key, value), openInfo, setOpenInfo))
-  });
-}
-function pathSelect(key, value, onChange) {
-  return jsx34("select", {
-    value,
-    onChange: (e) => onChange(e.currentTarget.value),
-    className: "rounded text-[10px] outline-none",
-    style: SELECT_STYLE,
-    children: ["old", "new"].map((o) => jsx34("option", { value: o, children: o }, o))
-  });
-}
-var COL_PX = { tool: 100, params: 120, enabled: 60, path: 70 };
-function toolTableRow(key, state, onChange, showParams, showPath, hoverKey, setHoverKey) {
-  const onEnter = () => setHoverKey(key);
-  const onLeave = () => setHoverKey(null);
-  const cellStyle = (extra) => Object.assign(
-    { display: "flex", alignItems: "flex-start", borderBottom: "1px solid var(--ui-stroke-quaternary)", backgroundColor: hoverKey === key ? "var(--ui-row-hover-background)" : "transparent" },
-    extra
-  );
-  const cells = [
-    jsx34("div", {
-      className: "px-1 py-0.5 min-w-0 text-[10px]",
-      style: cellStyle(),
-      onMouseEnter: onEnter,
-      onMouseLeave: onLeave,
-      // text-[0.8rem]: text-sm (0.875rem) was competing with the section header's own text-xs
-      // for visual weight; dialed back a touch while keeping the added font-semibold.
-      children: jsx34(InfoLabel, { id: "slot-" + key, text: key, info: state.help, openInfo: state.openInfo, setOpenInfo: state.setOpenInfo, className: "text-[10px] font-semibold truncate" })
-    }, key + "-name")
-  ];
-  if (showParams) {
-    cells.push(jsx34("div", {
-      className: "px-1 py-0.5",
-      onMouseEnter: onEnter,
-      onMouseLeave: onLeave,
-      style: cellStyle({ borderRight: "1px solid var(--ui-stroke-quaternary)" }),
-      children: paramsEditor(
-        key,
-        state.params,
-        (paramKey, value) => onChange({ params: state.params.map((p) => p.key === paramKey ? Object.assign({}, p, { value }) : p) }),
-        state.openInfo,
-        state.setOpenInfo
-      )
-    }, key + "-params"));
-  }
-  cells.push(jsx34("div", {
-    className: "px-1 py-0.5",
-    style: cellStyle({ justifyContent: "center" }),
-    onMouseEnter: onEnter,
-    onMouseLeave: onLeave,
-    children: jsx34("span", { className: "inline-flex items-center", children: jsx34("input", { type: "checkbox", checked: state.enabled, onChange: (e) => onChange({ enabled: e.currentTarget.checked }), style: CHECKBOX_STYLE }) })
-  }, key + "-enabled"));
-  if (showPath) {
-    cells.push(jsx34("div", {
-      className: "px-1 py-0.5 text-[10px]",
-      style: cellStyle(),
-      onMouseEnter: onEnter,
-      onMouseLeave: onLeave,
-      children: pathSelect(key, state.path, (v) => onChange({ path: v }))
-    }, key + "-path"));
-  }
-  return cells;
-}
 function useElementWidth() {
-  const ref = useRef8(null);
-  const [width, setWidth] = useState14(9999);
+  const ref = useRef9(null);
+  const [width, setWidth] = useState15(9999);
   useEffect7(() => {
     const el = ref.current;
     if (!el || typeof ResizeObserver === "undefined") return;
@@ -8449,6 +8441,21 @@ function useElementWidth() {
   }, []);
   return [ref, width];
 }
+
+// desktop/src/config-pane.js
+function seamsElapsedText(ms) {
+  const sec = Math.max(0, Math.floor((Number(ms) || 0) / 1e3));
+  return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0") + " / ~3:00";
+}
+function seamsTallyText(tally) {
+  if (!tally || typeof tally !== "object") return "";
+  return Object.keys(tally).sort().map((k2) => k2 + ": " + tally[k2]).join(" \xB7 ");
+}
+function hermesVerifiedText(verified) {
+  const commit = String(verified && verified.commit || "");
+  const date = String(verified && verified.date || "");
+  return "Verified on Hermes " + (commit || "\u2014") + (date ? " (" + date + ")" : "") + ". Much of this plugin hooks into Hermes code that is not a public API \u2014 after a Hermes update, run Full check.";
+}
 function splitDisabledTools(rawDisabled, help) {
   const canonical = Object.keys(help);
   return {
@@ -8457,44 +8464,44 @@ function splitDisabledTools(rawDisabled, help) {
   };
 }
 function ConfigPane() {
-  const [status, setStatus] = useState14("loading");
-  const [errorMsg, setErrorMsg] = useState14("");
-  const [zoneHelp, setZoneHelp] = useState14({ disabled: "" });
-  const [disabledHelp, setDisabledHelp] = useState14({});
-  const [legacyDisabled, setLegacyDisabled] = useState14([]);
-  const [disabled, setDisabled] = useState14({});
-  const [slots, setSlots] = useState14({});
-  const [auxModel, setAuxModel] = useState14("");
-  const [ctxEnabled, setCtxEnabled] = useState14(true);
-  const [compactHeadKeep, setCompactHeadKeep] = useState14("6");
-  const [compactAutoPercent, setCompactAutoPercent] = useState14("70");
-  const [compactCutPercent, setCompactCutPercent] = useState14("30");
-  const [compactTailKeep, setCompactTailKeep] = useState14("20");
-  const [compactAutoOn, setCompactAutoOn] = useState14(false);
-  const [compactPauseMin, setCompactPauseMin] = useState14("3");
-  const [compactSilenceMin, setCompactSilenceMin] = useState14("5");
-  const [compactWaitTurnMin, setCompactWaitTurnMin] = useState14("10");
-  const [dataRoot, setDataRoot] = useState14("");
-  const [settingsFile, setSettingsFile] = useState14("");
-  const [exportRoot, setExportRoot] = useState14("");
-  const [seamsState, setSeamsState] = useState14("idle");
-  const [seamsOutput, setSeamsOutput] = useState14("Check - quick seam check (search). Full check - plus the behaviour tests (minutes).");
-  const [seamsTally, setSeamsTally] = useState14("");
-  const [seamsFull, setSeamsFull] = useState14(false);
-  const [seamsStarted, setSeamsStarted] = useState14(0);
-  const [seamsNow, setSeamsNow] = useState14(0);
-  const [hermesVerified, setHermesVerified] = useState14({ commit: "", date: "" });
-  useEffect7(() => {
+  const [status, setStatus] = useState16("loading");
+  const [errorMsg, setErrorMsg] = useState16("");
+  const [zoneHelp, setZoneHelp] = useState16({ disabled: "" });
+  const [disabledHelp, setDisabledHelp] = useState16({});
+  const [legacyDisabled, setLegacyDisabled] = useState16([]);
+  const [disabled, setDisabled] = useState16({});
+  const [slots, setSlots] = useState16({});
+  const [auxModel, setAuxModel] = useState16("");
+  const [ctxEnabled, setCtxEnabled] = useState16(true);
+  const [compactHeadKeep, setCompactHeadKeep] = useState16("6");
+  const [compactAutoPercent, setCompactAutoPercent] = useState16("70");
+  const [compactCutPercent, setCompactCutPercent] = useState16("30");
+  const [compactTailKeep, setCompactTailKeep] = useState16("20");
+  const [compactAutoOn, setCompactAutoOn] = useState16(false);
+  const [compactPauseMin, setCompactPauseMin] = useState16("3");
+  const [compactSilenceMin, setCompactSilenceMin] = useState16("5");
+  const [compactWaitTurnMin, setCompactWaitTurnMin] = useState16("10");
+  const [dataRoot, setDataRoot] = useState16("");
+  const [settingsFile, setSettingsFile] = useState16("");
+  const [exportRoot, setExportRoot] = useState16("");
+  const [seamsState, setSeamsState] = useState16("idle");
+  const [seamsOutput, setSeamsOutput] = useState16("Check - quick seam check (search). Full check - plus the behaviour tests (minutes).");
+  const [seamsTally, setSeamsTally] = useState16("");
+  const [seamsFull, setSeamsFull] = useState16(false);
+  const [seamsStarted, setSeamsStarted] = useState16(0);
+  const [seamsNow, setSeamsNow] = useState16(0);
+  const [hermesVerified, setHermesVerified] = useState16({ commit: "", date: "" });
+  useEffect8(() => {
     if (seamsState !== "pending" || !seamsFull) return void 0;
     const id = setInterval(() => setSeamsNow(Date.now()), 1e3);
     return () => clearInterval(id);
   }, [seamsState, seamsFull]);
-  const [openInfo, setOpenInfo] = useState14(null);
-  const [hoverKey, setHoverKey] = useState14(null);
+  const [openInfo, setOpenInfo] = useState16(null);
+  const [hoverKey, setHoverKey] = useState16(null);
   const [tableRef, tableWidth] = useElementWidth();
-  const [saveState, setSaveState] = useState14("idle");
-  const [reloadState, setReloadState] = useState14("idle");
-  const [reloadMsg, setReloadMsg] = useState14("");
+  const [saveState, setSaveState] = useState16("idle");
+  const [reloadState, setReloadState] = useState16("idle");
+  const [reloadMsg, setReloadMsg] = useState16("");
   function applyConfigData(data) {
     if (!data || data.error) {
       setErrorMsg(data && data.error || "empty response");
@@ -8532,7 +8539,7 @@ function ConfigPane() {
     setExportRoot(String(compaction.export_root ?? ""));
     setStatus("ready");
   }
-  useEffect7(() => {
+  useEffect8(() => {
     if (!hasRest()) {
       setStatus("unavailable");
       return;
@@ -8549,20 +8556,20 @@ function ConfigPane() {
       cancelled = true;
     };
   }, []);
-  useEffect7(() => {
+  useEffect8(() => {
     if (!openInfo) return;
     const clear = () => setOpenInfo(null);
     document.addEventListener("click", clear);
     return () => document.removeEventListener("click", clear);
   }, [openInfo]);
   if (status === "loading") {
-    return jsx34("div", { className: "flex items-center justify-center h-full text-xs text-(--ui-text-quaternary)", style: SELECTABLE, children: "loading config\u2026" });
+    return jsx38("div", { className: "flex items-center justify-center h-full text-xs text-(--ui-text-quaternary)", style: SELECTABLE, children: "loading config\u2026" });
   }
   if (status === "unavailable") {
-    return jsx34("div", { className: "flex items-center justify-center h-full text-xs text-(--ui-text-quaternary) text-center px-4", style: SELECTABLE, children: "REST is not available in this build \u2014 Config needs the live plugin API." });
+    return jsx38("div", { className: "flex items-center justify-center h-full text-xs text-(--ui-text-quaternary) text-center px-4", style: SELECTABLE, children: "REST is not available in this build \u2014 Config needs the live plugin API." });
   }
   if (status === "error") {
-    return jsx34("div", { className: "flex items-center justify-center h-full text-xs text-center px-4", style: Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE), children: "/config failed: " + errorMsg });
+    return jsx38("div", { className: "flex items-center justify-center h-full text-xs text-center px-4", style: Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE), children: "/config failed: " + errorMsg });
   }
   const setDisabledOne = (name, v) => setDisabled((cur) => Object.assign({}, cur, { [name]: v }));
   const setSlot = (key, patch) => setSlots((cur) => Object.assign({}, cur, { [key]: Object.assign({}, cur[key], patch) }));
@@ -8637,14 +8644,14 @@ function ConfigPane() {
       setSeamsState("error");
     });
   }
-  const head = jsxs33("div", {
+  const head = jsxs34("div", {
     className: "flex items-center justify-between gap-2 px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0",
     style: { fontSize: "0.55rem" },
     children: [
-      jsx34("span", { className: "text-(--ui-text-quaternary)", style: SELECTABLE, children: "tool settings need a new agent session to apply \u2014 compaction settings (ours) may apply live" }),
-      jsxs33("div", { className: "flex items-center gap-2 shrink-0", children: [
-        saveState === "saved" ? jsx34("span", { className: "text-(--dt-primary)", style: SELECTABLE, children: "saved" }) : null,
-        saveState === "error" ? jsx34("span", { style: Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE), children: "save failed: " + errorMsg }) : null
+      jsx38("span", { className: "text-(--ui-text-quaternary)", style: SELECTABLE, children: "tool settings need a new agent session to apply \u2014 compaction settings (ours) may apply live" }),
+      jsxs34("div", { className: "flex items-center gap-2 shrink-0", children: [
+        saveState === "saved" ? jsx38("span", { className: "text-(--dt-primary)", style: SELECTABLE, children: "saved" }) : null,
+        saveState === "error" ? jsx38("span", { style: Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE), children: "save failed: " + errorMsg }) : null
       ] })
     ]
   });
@@ -8655,7 +8662,7 @@ function ConfigPane() {
     // every existing column instead of being wasted — the earlier "compress unevenly" bug was
     // actually the missing name-truncation fix (now in InfoLabel), not this stretch by itself:
     // auto-fill keeps one shared track size for the whole grid, not a per-row thing.
-    jsx34("div", {
+    jsx38("div", {
       className: "grid",
       style: { gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))" },
       children: Object.keys(disabledHelp).map((name) => disableRow(name, disabledHelp[name], !!disabled[name], (v) => setDisabledOne(name, v), openInfo, setOpenInfo))
@@ -8667,7 +8674,7 @@ function ConfigPane() {
   if (showParams) gridCols.push(COL_PX.params + "px");
   gridCols.push(COL_PX.enabled + "px");
   if (showPath) gridCols.push(COL_PX.path + "px");
-  const headerCell = (text, center) => jsx34("div", {
+  const headerCell = (text, center) => jsx38("div", {
     className: "text-[0.6rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary) opacity-50 px-1 pb-0.5" + (center ? " text-center" : ""),
     style: SELECTABLE,
     children: text
@@ -8677,7 +8684,7 @@ function ConfigPane() {
     // No alignItems override: grid's default `stretch` makes every cell in a row match the
     // tallest one (Params, when it stacks several controls) — needed so hover paints one even
     // rectangle instead of a staircase.
-    jsx34("div", { ref: tableRef, className: "grid", style: { gridTemplateColumns: gridCols.join(" "), rowGap: 0 }, children: [
+    jsx38("div", { ref: tableRef, className: "grid", style: { gridTemplateColumns: gridCols.join(" "), rowGap: 0 }, children: [
       headerCell("Tool Name"),
       showParams ? headerCell("Params") : null,
       headerCell("Enable", true),
@@ -8687,18 +8694,18 @@ function ConfigPane() {
   ]);
   const auxZone = zone([
     sectionHead("Aux model \u2014 compression (not wired)", "zone-aux", "", openInfo, setOpenInfo),
-    jsx34("div", { className: "px-1 pb-0.5", children: textInput(auxModel, (e) => setAuxModel(e.currentTarget.value), "(empty \u2014 falls back to their default)") })
+    jsx38("div", { className: "px-1 pb-0.5", children: textInput(auxModel, (e) => setAuxModel(e.currentTarget.value), "(empty \u2014 falls back to their default)") })
   ]);
   const compactionZone = zone([
     sectionHead("Compaction", "zone-compaction", "", openInfo, setOpenInfo),
-    jsx34("div", { className: "px-1 pb-0.5", children: jsxs33("label", { className: "inline-flex items-center gap-2 cursor-pointer text-[10px]", children: [
-      jsx34("input", { type: "checkbox", checked: ctxEnabled, onChange: (e) => setCtxEnabled(e.currentTarget.checked), style: CHECKBOX_STYLE }),
-      jsx34("span", { style: SELECTABLE, children: "context_ctl.enabled \u2014 our context engine kill switch" })
+    jsx38("div", { className: "px-1 pb-0.5", children: jsxs34("label", { className: "inline-flex items-center gap-2 cursor-pointer text-[10px]", children: [
+      jsx38("input", { type: "checkbox", checked: ctxEnabled, onChange: (e) => setCtxEnabled(e.currentTarget.checked), style: CHECKBOX_STYLE }),
+      jsx38("span", { style: SELECTABLE, children: "context_ctl.enabled \u2014 our context engine kill switch" })
     ] }) }),
     // Числа и выключатель компакции (Plan16-Task03; автомат и ход прогона — 2026-09-30) — одной
     // СЕТКОЙ в четыре колонки «подпись · поле», мелко (владелец: «раскидано хрен пойми как»).
     // Сохраняются общей кнопкой Save выше, не своей.
-    jsx34("div", {
+    jsx38("div", {
       className: "px-1 pb-0.5 grid items-center text-[10px]",
       style: {
         gridTemplateColumns: "repeat(4, max-content 2.5rem)",
@@ -8730,7 +8737,7 @@ function ConfigPane() {
         compactCell(
           "auto on",
           'compact_auto_enabled \u2014 the automaton compacts at "auto %"; off = the decision is only shown',
-          jsx34("input", {
+          jsx38("input", {
             type: "checkbox",
             checked: compactAutoOn,
             onChange: (e) => setCompactAutoOn(e.currentTarget.checked),
@@ -8756,7 +8763,7 @@ function ConfigPane() {
     }),
     // Предупреждение про направление третьего числа (владелец, 2026-09-22) — ставится тут же,
     // рядом с полем, а не только в комментарии кода: экран этот числа и меняет.
-    jsx34("div", {
+    jsx38("div", {
       className: "px-1 pb-0.5 text-[0.6rem] text-(--ui-text-quaternary)",
       style: SELECTABLE,
       children: '"cut %" is OUR share to cut \u2014 not their "shrink to" target. Same shape of number, opposite meaning.'
@@ -8764,25 +8771,25 @@ function ConfigPane() {
   ]);
   const referenceZone = zone([
     sectionHead("Reference (read-only, from their config)", "zone-reference", "", openInfo, setOpenInfo),
-    jsx34("div", { className: "px-1 pb-0.5 flex flex-col text-[10px]", children: [
+    jsx38("div", { className: "px-1 pb-0.5 flex flex-col text-[10px]", children: [
       ["auxiliary.compression.provider", "auto"],
       ["auxiliary.compression.model", "(not set)"],
       ["auxiliary.compression.timeout", "60000"]
-    ].map(([k2, v]) => jsxs33("div", { style: SELECTABLE, children: [k2 + ": ", jsx34("span", { className: "text-(--ui-text-quaternary)", children: v })] }, k2)) })
+    ].map(([k2, v]) => jsxs34("div", { style: SELECTABLE, children: [k2 + ": ", jsx38("span", { className: "text-(--ui-text-quaternary)", children: v })] }, k2)) })
   ]);
   const dataZone = zone([
     sectionHead("Paths", "zone-data", "", openInfo, setOpenInfo),
     // Только чтение: дом плагина и файл, куда Save пишет ваши настройки (умолчания — plugin.yaml).
-    jsxs33("div", { className: "px-1 pb-0.5 grid gap-x-2 text-[10px]", style: { gridTemplateColumns: "max-content 1fr" }, children: [
-      jsx34("span", { className: "text-(--ui-text-quaternary)", style: SELECTABLE, children: "data root" }),
-      jsx34("span", { className: "font-mono break-all", style: SELECTABLE, children: dataRoot || "\u2014" }),
-      jsx34("span", { className: "text-(--ui-text-quaternary)", style: SELECTABLE, children: "your settings" }),
-      jsx34("span", { className: "font-mono break-all", style: SELECTABLE, children: settingsFile || "\u2014" })
+    jsxs34("div", { className: "px-1 pb-0.5 grid gap-x-2 text-[10px]", style: { gridTemplateColumns: "max-content 1fr" }, children: [
+      jsx38("span", { className: "text-(--ui-text-quaternary)", style: SELECTABLE, children: "data root" }),
+      jsx38("span", { className: "font-mono break-all", style: SELECTABLE, children: dataRoot || "\u2014" }),
+      jsx38("span", { className: "text-(--ui-text-quaternary)", style: SELECTABLE, children: "your settings" }),
+      jsx38("span", { className: "font-mono break-all", style: SELECTABLE, children: settingsFile || "\u2014" })
     ] }),
     // НАСТОЯЩАЯ настройка, в отличие от строки выше: едет в `plugin.yaml` и обратно. Само
     // сохранение сообщений ещё не написано (`Vision09`) — ключ заведён заранее, чтобы путь
     // выбирался один раз и на виду, а не изобретался первым кодом, которому он понадобится.
-    jsx34("div", {
+    jsx38("div", {
       className: "px-1 pb-0.5 text-[0.6rem] text-(--ui-text-quaternary)",
       style: SELECTABLE,
       children: "export root \u2014 where messages and sessions are saved as .md (empty = plugin home)"
@@ -8790,18 +8797,18 @@ function ConfigPane() {
     // Подсказка косыми ВПЕРЁД, хотя система Windows: обратный слэш в конце строкового
     // литерала экранирует закрывающую кавычку, и это уже стоило одной сломанной сборки.
     // Путь всё равно разбирает `pathlib`, которому направление косой безразлично.
-    jsx34("div", { className: "px-1 pb-0.5", children: textInput(exportRoot, (e) => setExportRoot(e.currentTarget.value), "<hermes home>/filetools/export/", "w-full font-mono") })
+    jsx38("div", { className: "px-1 pb-0.5", children: textInput(exportRoot, (e) => setExportRoot(e.currentTarget.value), "<hermes home>/filetools/export/", "w-full font-mono") })
   ]);
   const seamsZone = zone([
     sectionHead("Check Seams", "zone-seams", "", openInfo, setOpenInfo),
     // Строка из двух колонок (владелец): [Check] [вердикт], под ней — поле отчёта во всю ширину.
-    jsxs33("div", { className: "px-1 pb-0.5 flex flex-col gap-1", children: [
-      jsxs33("div", { className: "grid gap-2 items-center", style: { gridTemplateColumns: "max-content 1fr" }, children: [
-        jsxs33("div", { className: "flex items-center gap-1", children: [
+    jsxs34("div", { className: "px-1 pb-0.5 flex flex-col gap-1", children: [
+      jsxs34("div", { className: "grid gap-2 items-center", style: { gridTemplateColumns: "max-content 1fr" }, children: [
+        jsxs34("div", { className: "flex items-center gap-1", children: [
           actionButton(seamsState === "pending" && !seamsFull ? "Checking\u2026" : "Check", () => handleCheckSeams(false)),
           actionButton(seamsState === "pending" && seamsFull ? "Running tests\u2026" : "Full check", () => handleCheckSeams(true))
         ] }),
-        jsx34("span", {
+        jsx38("span", {
           className: "font-medium text-[10px]" + (seamsState === "error" ? "" : " text-(--dt-primary)"),
           style: seamsState === "error" ? Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE) : SELECTABLE,
           children: seamsState === "pending" && seamsFull ? "running\u2026 " + seamsElapsedText(seamsNow - seamsStarted) : seamsTally
@@ -8810,7 +8817,7 @@ function ConfigPane() {
       // ЗАЧЕМ ЭТА ЗОНА, одной строкой (владелец, 2026-10-02): многое у нас держится за
       // НЕПУБЛИЧНЫЙ код Hermes — другого способа достать это нет, — и их обновление может это
       // сломать. Поэтому каждая версия называет коммит Hermes, на котором её проверили.
-      jsx34("div", {
+      jsx38("div", {
         className: "text-[10px] text-(--ui-text-quaternary)",
         style: SELECTABLE,
         children: hermesVerifiedText(hermesVerified)
@@ -8818,18 +8825,18 @@ function ConfigPane() {
       textArea(seamsOutput, seamsState === "idle" ? 2 : 28, true)
     ] })
   ]);
-  const reloadZone = jsx34("div", { className: "shrink-0 px-1 py-1 flex items-center gap-2 border-t border-(--ui-stroke-quaternary)", children: [
+  const reloadZone = jsx38("div", { className: "shrink-0 px-1 py-1 flex items-center gap-2 border-t border-(--ui-stroke-quaternary)", children: [
     actionButton(saveState === "saving" ? "Saving\u2026" : "Save", handleSave),
     actionButton(reloadState === "pending" ? "Reloading\u2026" : "\u21BB Reload plugin", handleReload),
-    reloadState === "done" ? jsx34("span", { className: "text-(--dt-primary) text-xs", style: SELECTABLE, children: "reloaded" }) : null,
-    reloadState === "error" ? jsx34("span", { className: "text-xs", style: Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE), children: "reload failed: " + reloadMsg }) : null
+    reloadState === "done" ? jsx38("span", { className: "text-(--dt-primary) text-xs", style: SELECTABLE, children: "reloaded" }) : null,
+    reloadState === "error" ? jsx38("span", { className: "text-xs", style: Object.assign({ color: "var(--dt-danger, #e05252)" }, SELECTABLE), children: "reload failed: " + reloadMsg }) : null
   ] });
-  return jsxs33("div", {
+  return jsxs34("div", {
     className: "flex flex-col h-full w-full overflow-hidden",
     style: CAPPED,
     children: [
       head,
-      jsx34("div", {
+      jsx38("div", {
         className: "flex-1 overflow-y-auto py-0.5 px-1",
         // Порядок (владелец, 2026-09-30): рабочие зоны сверху, справка ниже,
         // неподключённое (Aux model) — в самом низу.
@@ -8849,124 +8856,14 @@ function ConfigPane() {
 }
 
 // desktop/src/file-ops-strip.js
-import { jsx as jsx35, jsxs as jsxs34 } from "react/jsx-runtime";
-var STRIP_BTN = "px-2 py-0.5 rounded-full text-[0.7rem] font-medium cursor-pointer select-none transition-colors duration-150 ease-out hover:bg-(--ui-bg-tertiary) active:scale-95";
-var STRIP_EDGE = { borderBottom: "2px solid var(--ui-stroke-secondary)" };
-var ACTIONS = Object.keys(CONTEXT_ACTIONS).map((key) => CONTEXT_ACTIONS[key]);
-function StripHandle({ open }) {
-  return jsx35("button", {
-    // stopPropagation: на document висит снятие режима (см. FileOpsPane), и без этого свой же
-    // клик по треугольнику схлопывал бы то, что им только что открыли.
-    onClick: (e) => {
-      e.stopPropagation();
-      setStripOpen(!open);
-    },
-    className: "cursor-pointer select-none shrink-0",
-    style: {
-      border: "none",
-      background: "transparent",
-      padding: "0 2px",
-      lineHeight: 1,
-      // Вдвое крупнее прежнего: 0.55rem был меньше подписи рядом и требовал прицеливания.
-      fontSize: "1.1rem",
-      color: "var(--ui-text-quaternary)"
-    },
-    title: open ? "collapse context actions" : "context actions",
-    children: open ? "\u25BE" : "\u25B8"
-  });
-}
-function ActionButton({ action, drop }) {
-  const armed = drop.mode && drop.action === action.mode;
-  const picked = Object.keys(drop.picked || {}).length;
-  return jsx35("button", {
-    onClick: (e) => {
-      e.stopPropagation();
-      if (drop.busy) return;
-      if (!armed) setDropMode(true, action.mode);
-      else applyDrop();
-    },
-    className: STRIP_BTN,
-    disabled: !!drop.busy,
-    style: {
-      border: `1px solid ${armed ? "var(--ui-red)" : "var(--ui-stroke-secondary)"}`,
-      background: armed ? "color-mix(in srgb, var(--ui-red) 14%, transparent)" : "transparent",
-      userSelect: "none",
-      color: armed ? "var(--ui-red)" : "var(--ui-text-secondary)",
-      opacity: drop.busy ? 0.5 : 1,
-      whiteSpace: "nowrap"
-    },
-    title: armed ? `apply "${action.label}" to the ${picked} ticked operation(s) \u2014 IRREVERSIBLE. Click anywhere else to cancel` : `arm "${action.label}": tick the operations it should apply to`,
-    children: action.label
-  });
-}
-function DropStrip({ bricks, drop }) {
-  if (!drop.open) {
-    return jsxs34("div", {
-      className: "flex items-center gap-1 px-2 py-0.5 shrink-0",
-      style: Object.assign({ fontSize: "0.55rem" }, STRIP_EDGE),
-      children: [
-        jsx35(StripHandle, { open: false }),
-        // Исход последнего применения виден и в свёрнутой полосе: правка необратима, и
-        // сообщение о ней не должно исчезать из-за того, что полосу закрыли.
-        drop.note ? jsx35("span", {
-          className: "truncate",
-          title: drop.note,
-          style: {
-            minWidth: 0,
-            color: drop.ok === true ? "var(--ui-green)" : drop.ok === false ? "var(--ui-red)" : "var(--ui-text-quaternary)"
-          },
-          children: drop.note
-        }) : null
-      ]
-    });
-  }
-  const picked = Object.keys(drop.picked || {});
-  const chosen = new Set(picked);
-  let tokens = 0;
-  let exact = true;
-  for (const b of bricks) {
-    const op = b && b.meta && typeof b.meta.op === "string" ? b.meta.op : null;
-    if (!op || !chosen.has(op)) continue;
-    const w = opTokens(b);
-    tokens += w.tokens;
-    if (!w.exact) exact = false;
-  }
-  const children = [jsx35(StripHandle, { open: true })];
-  ACTIONS.forEach((action) => {
-    children.push(jsx35(ActionButton, { key: action.mode, action, drop }));
-  });
-  if (drop.mode) {
-    children.push(jsx35("span", {
-      style: { color: "var(--ui-text-quaternary)" },
-      children: drop.busy ? "applying\u2026" : picked.length ? `${picked.length} ops \xB7 ${exact ? "" : "~"}${tokensLabel(tokens)} tk` : "tick operations in the card drawers"
-    }));
-  }
-  children.push(jsx35("div", { className: "flex-1 min-w-0" }));
-  if (drop.note) {
-    children.push(jsx35("span", {
-      className: "truncate",
-      title: drop.note,
-      style: {
-        minWidth: 0,
-        maxWidth: "60%",
-        color: drop.ok === true ? "var(--ui-green)" : drop.ok === false ? "var(--ui-red)" : "var(--ui-text-quaternary)"
-      },
-      children: drop.note
-    }));
-  }
-  return jsxs34("div", {
-    className: "flex items-center gap-2 px-2 py-1 shrink-0",
-    style: Object.assign({ fontSize: "0.55rem" }, STRIP_EDGE),
-    children
-  });
-}
+import { jsx as jsx39, jsxs as jsxs35 } from "react/jsx-runtime";
 var FILTER_LABEL = "show erased";
 function FilterBar({ showErased, hidden }) {
-  return jsxs34("div", {
+  return jsxs35("div", {
     className: "flex items-center gap-2 px-2 py-1 shrink-0 border-t border-(--ui-stroke-secondary)",
     style: { fontSize: "0.55rem" },
     children: [
-      jsxs34("label", {
+      jsxs35("label", {
         className: "inline-flex items-center gap-1 cursor-pointer select-none",
         // Клик не всплывает: выше на document висят снятие режима выбора и снятие затенения.
         onClick: (e) => {
@@ -8974,18 +8871,18 @@ function FilterBar({ showErased, hidden }) {
         },
         title: "show operations that were erased from the context",
         children: [
-          jsx35("input", {
+          jsx39("input", {
             type: "checkbox",
             checked: !!showErased,
             onChange: (e) => setShowErased(e && e.target ? e.target.checked : !showErased),
             style: { accentColor: "var(--dt-primary)", width: "10px", height: "10px" }
           }),
-          jsx35("span", { style: { color: "var(--ui-text-secondary)" }, children: FILTER_LABEL })
+          jsx39("span", { style: { color: "var(--ui-text-secondary)" }, children: FILTER_LABEL })
         ]
       }),
       // Сколько спрятано. Молчаливое сокрытие — ложь того же рода, что молчаливое удаление:
       // без этого числа человек не поймёт, влияет ли фильтр на что-нибудь вообще.
-      hidden > 0 && !showErased ? jsx35("span", {
+      hidden > 0 && !showErased ? jsx39("span", {
         style: { color: "var(--ui-text-quaternary)" },
         children: `${hidden} hidden`
       }) : null
@@ -8993,20 +8890,917 @@ function FilterBar({ showErased, hidden }) {
   });
 }
 
+// desktop/src/llmops/llmops-host.js
+import { jsx as jsx41 } from "react/jsx-runtime";
+import { useMemo as useMemo4 } from "react";
+
+// desktop/src/llmops/llmops-window.js
+import { jsx as jsx40, jsxs as jsxs36 } from "react/jsx-runtime";
+import { useEffect as useEffect9, useMemo as useMemo3, useRef as useRef11, useState as useState17 } from "react";
+
+// desktop/src/llmops/llmops-core.js
+function roughTokens2(text) {
+  return Math.ceil(String(text || "").length / 4);
+}
+function msgTokens(m) {
+  const t = m && m.tokens;
+  return typeof t === "number" && isFinite(t) ? t : roughTokens2(m && m.text);
+}
+function sumTokens(list) {
+  return (list || []).reduce((n2, m) => n2 + msgTokens(m), 0);
+}
+function kLabel(n2) {
+  const v = Number(n2 || 0);
+  return v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : String(v);
+}
+function messageBlock(m) {
+  const who = m.tool ? `${m.role} ${m.tool}` : m.role;
+  return `[${m.addr} ${who}]
+${String(m.text || "")}`;
+}
+function dataText(data, picks) {
+  const p = picks || {};
+  const parts = [];
+  if (p.prefix && data.prefix && data.prefix.length) {
+    parts.push("<context-before>\n" + data.prefix.map(messageBlock).join("\n\n") + "\n</context-before>");
+  }
+  parts.push("<messages>\n" + (data.target || []).map(messageBlock).join("\n\n") + "\n</messages>");
+  if (p.suffix && data.suffix && data.suffix.length) {
+    parts.push("<context-after>\n" + data.suffix.map(messageBlock).join("\n\n") + "\n</context-after>");
+  }
+  return parts.join("\n\n");
+}
+function presetTurns(preset, data, picks, values) {
+  const pr = preset || {};
+  const body = dataText(data, picks);
+  const tpl = String(pr.user || "{{data}}");
+  const user = tpl.includes("{{data}}") ? tpl.split("{{data}}").join(body) : `${tpl}
+
+${body}`;
+  const lines = (pr.settings || []).map((s) => {
+    const v = (values || {})[s.key] || (s.options || [])[0];
+    return v ? `${s.label}: ${v}` : "";
+  }).filter(Boolean);
+  const system = [String(pr.system || ""), lines.join("\n")].filter(Boolean).join("\n\n");
+  return [
+    { role: "system", content: system },
+    { role: "user", content: user }
+  ];
+}
+function conversationTokens(turns) {
+  return (turns || []).reduce((n2, t) => n2 + roughTokens2(t.content), 0);
+}
+var WRAPS = ["as-it-was", "summarisation", "compaction", "none"];
+function asItWas(frames) {
+  return (frames || []).some((f) => f && f.kind === "compaction") ? "compaction" : "none";
+}
+function resolveWrap(wrap, frames) {
+  return wrap === "as-it-was" ? asItWas(frames) : wrap;
+}
+function wrapResult(body, wrap, frames, frameTexts) {
+  const kind = resolveWrap(wrap, frames);
+  if (kind === "none") return String(body || "");
+  const stripped = (frames || []).find((f) => f && f.kind === kind);
+  const fr = stripped || (frameTexts || {})[kind];
+  if (!fr) return String(body || "");
+  return `${fr.head}
+${String(body || "")}
+${fr.tail}`;
+}
+function dropReply(result, text) {
+  return result.cleared ? result : { body: String(text || ""), cleared: false };
+}
+function clearResult() {
+  return { body: "", cleared: true };
+}
+function moveToResult(text) {
+  return { body: String(text || ""), cleared: true };
+}
+function unwrapMessages(body) {
+  const lines = String(body || "").trim().split("\n");
+  let from = 0;
+  let to = lines.length;
+  if (lines[0] && lines[0].trim() === "<messages>") from = 1;
+  if (to > from && lines[to - 1].trim() === "</messages>") to -= 1;
+  if (from === 0 && to === lines.length) return null;
+  return lines.slice(from, to).join("\n").trim();
+}
+function stripHeaders(body, data) {
+  const d = data || {};
+  const heads = new Set([...d.prefix || [], ...d.target || [], ...d.suffix || []].map((m) => messageBlock({ ...m, text: "" }).trim()));
+  const lines = String(body || "").split("\n");
+  const kept = lines.filter((l) => !heads.has(l.trim()));
+  if (kept.length === lines.length) return null;
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function trainRows(data) {
+  const t = (data && data.target || []).map((m) => ({ ...m, bubble: false }));
+  const b = (data && data.bubbles || []).map((m) => ({ ...m, bubble: true }));
+  return t.concat(b).sort((x, y) => String(x.addr).localeCompare(String(y.addr)));
+}
+function targetLabel(data) {
+  const t = data && data.target || [];
+  if (!t.length) return "nothing selected";
+  const span = t.length === 1 ? t[0].addr : `${t[0].addr}\u2026${t[t.length - 1].addr}`;
+  return `${span} \xB7 ${t.length} msg`;
+}
+function dragPos(x, y, width, viewW, viewH, keep = 120, headPx = 32) {
+  const nx = Math.min(Math.max(x, keep - width), viewW - keep);
+  const ny = Math.min(Math.max(y, 0), viewH - headPx);
+  return { x: Math.round(nx), y: Math.round(ny) };
+}
+var MIN_W = 480;
+var MIN_H2 = 280;
+function placeOf(saved, viewW, viewH) {
+  const s = saved || {};
+  if (![s.x, s.y, s.w, s.h].every((v) => typeof v === "number" && Number.isFinite(v))) return null;
+  const w = Math.round(Math.min(Math.max(s.w, MIN_W), viewW));
+  const h = Math.round(Math.min(Math.max(s.h, MIN_H2), viewH));
+  return { ...dragPos(s.x, s.y, w, viewW, viewH), w, h };
+}
+function frameFor(kind, frameTexts, kept) {
+  const fr = (frameTexts || {})[kind];
+  if (!fr || kind === "none") return null;
+  const apart = kind === "compaction" && !!kept;
+  return {
+    head: String(apart && fr.head_kept || fr.head || ""),
+    tail: String(apart && fr.tail_kept || fr.tail || ""),
+    tailApart: apart
+  };
+}
+
+// desktop/src/llmops/llmops-window.js
+var PLACE_KEY = "hermes-filetools.llmops.place";
+function loadPlace() {
+  try {
+    return JSON.parse(window.localStorage.getItem(PLACE_KEY) || "null");
+  } catch (_) {
+    return null;
+  }
+}
+function savePlace(place) {
+  try {
+    window.localStorage.setItem(PLACE_KEY, JSON.stringify(place));
+  } catch (_) {
+  }
+}
+var SURFACE = "oklch(from var(--ui-editor-surface-background) l c h / 1)";
+var ELEVATED = `color-mix(in oklch, ${SURFACE}, oklch(from var(--ui-bg-elevated) l c h / 1) 50%)`;
+var STROKE = "1px solid var(--ui-stroke-secondary)";
+var STROKE_SOFT = "1px solid var(--ui-stroke-quaternary)";
+var TEXT_DIM = "var(--ui-text-quaternary)";
+var TEXT_2 = "var(--ui-text-secondary)";
+var ACCENT = "var(--dt-primary)";
+var SEL = { userSelect: "text", WebkitUserSelect: "text" };
+function mixTone2(baseVar) {
+  return `color-mix(in oklch, var(${baseVar}), var(--dt-primary) 30%)`;
+}
+var ROLE_TONE2 = {
+  user: mixTone2("--ui-blue"),
+  assistant: mixTone2("--ui-green"),
+  tool: mixTone2("--ui-cyan"),
+  system: mixTone2("--ui-yellow")
+};
+var toneOf2 = (role) => ROLE_TONE2[role] || TEXT_DIM;
+var WIN_W = "min(72rem, calc(100vw - 2rem))";
+var WIN_H = "min(46rem, calc(100vh - 5rem))";
+var WRAP_LABEL = { "as-it-was": "as it was", summarisation: "summarisation", compaction: "compaction", none: "no wrap" };
+function Btn({ children, onClick, disabled, title, strong, tone }) {
+  return jsx40("button", {
+    onClick,
+    disabled,
+    title,
+    className: "cursor-pointer select-none",
+    style: {
+      padding: strong ? "0.25rem 0.9rem" : "0.15rem 0.5rem",
+      borderRadius: "0.375rem",
+      fontSize: strong ? "0.75rem" : "0.65rem",
+      fontWeight: strong ? 600 : 500,
+      border: `1px solid ${tone || "var(--ui-stroke-secondary)"}`,
+      color: tone || "inherit",
+      background: "transparent",
+      opacity: disabled ? 0.35 : 1,
+      whiteSpace: "nowrap"
+    },
+    children
+  });
+}
+function Select({ value, options, onChange, title }) {
+  return jsx40("select", {
+    value,
+    title,
+    onChange: (e) => onChange(e.target.value),
+    style: {
+      fontSize: "0.65rem",
+      padding: "0.1rem 0.25rem",
+      borderRadius: "0.3rem",
+      border: STROKE,
+      background: SURFACE,
+      color: "inherit",
+      maxWidth: "11rem"
+    },
+    children: options.map((o) => jsx40("option", { value: o.value, children: o.label }, o.value))
+  });
+}
+function Label({ children }) {
+  return jsx40("div", { style: { fontSize: "0.55rem", letterSpacing: "0.06em", color: TEXT_DIM, textTransform: "uppercase", padding: "0.25rem 0" }, children });
+}
+function ModeSwitch({ raw, onRaw, md, editLabel }) {
+  if (!md) return null;
+  const side = (on, label, title, value) => jsx40("button", {
+    onClick: (e) => {
+      e.stopPropagation();
+      onRaw(value);
+    },
+    title,
+    className: "cursor-pointer select-none",
+    style: {
+      padding: "0.05rem 0.35rem",
+      fontSize: "0.65rem",
+      border: "none",
+      color: on ? ACCENT : TEXT_DIM,
+      background: on ? `color-mix(in oklch, ${ACCENT}, transparent 85%)` : "transparent"
+    },
+    children: label
+  });
+  return jsxs36("span", {
+    style: { display: "inline-flex", border: STROKE, borderRadius: "0.375rem", overflow: "hidden", flexShrink: 0 },
+    children: [
+      side(!raw, "\u{1F4D6}", "view \u2014 rendered markdown", false),
+      side(raw, "\u270E", editLabel || "edit \u2014 the raw text", true)
+    ]
+  });
+}
+function Md({ text, md, style }) {
+  return jsx40("div", {
+    "data-selectable-text": "true",
+    style: {
+      fontSize: "0.75rem",
+      lineHeight: 1.5,
+      wordBreak: "break-word",
+      minWidth: 0,
+      ...md ? {} : { whiteSpace: "pre-wrap" },
+      ...SEL,
+      ...style
+    },
+    children: md ? md(text) : String(text || "")
+  });
+}
+function Chip2({ m, open, onOpen }) {
+  const tone = toneOf2(m.role);
+  const what = m.tool || String(m.text || "").slice(0, 40) || (m.calls ? `\u2192 ${m.calls.join(", ")}` : "");
+  return jsxs36("div", {
+    onClick: (e) => onOpen(open ? null : { addr: m.addr, rect: e.currentTarget.getBoundingClientRect() }),
+    title: m.bubble ? "bubble: floats out, stays in the tape, not sent" : void 0,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: "0.3rem",
+      minWidth: 0,
+      cursor: "pointer",
+      padding: "0.15rem 0.45rem",
+      borderRadius: "0.75rem",
+      fontSize: "0.6rem",
+      lineHeight: 1.2,
+      backgroundColor: `color-mix(in oklch, ${tone}, transparent ${open ? 70 : 85}%)`,
+      color: tone,
+      border: m.bubble ? `1px dashed ${tone}` : "1px solid transparent",
+      opacity: m.bubble ? 0.75 : 1,
+      boxShadow: open ? `inset 0 0 0 1px color-mix(in oklch, ${tone}, transparent 30%)` : "none"
+    },
+    children: [
+      m.bubble ? jsx40("span", { children: "\u25E7" }) : null,
+      jsx40("span", { style: { fontFamily: "monospace", flexShrink: 0 }, children: m.addr }),
+      jsx40("span", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, flex: 1 }, children: what }),
+      jsx40("span", { style: { color: TEXT_DIM, flexShrink: 0 }, children: kLabel(msgTokens(m)) })
+    ]
+  });
+}
+var POPUP_W_REM = 26;
+function ChipPopup({ m, rect, onClose, onCopy, md }) {
+  const tone = toneOf2(m.role);
+  const [raw, setRaw] = useState17(false);
+  const rem = 16;
+  const w = POPUP_W_REM * rem;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const left = rect.right + 8 + w <= vw ? rect.right + 8 : Math.max(8, rect.left - 8 - w);
+  const top = Math.min(Math.max(8, rect.top), Math.max(8, vh - 0.6 * vh - 8));
+  return jsxs36("div", {
+    onClick: (e) => e.stopPropagation(),
+    style: {
+      position: "fixed",
+      left: `${left}px`,
+      top: `${top}px`,
+      width: `${POPUP_W_REM}rem`,
+      maxHeight: "60vh",
+      zIndex: 950,
+      display: "flex",
+      flexDirection: "column",
+      background: SURFACE,
+      border: STROKE,
+      borderRadius: "0.5rem",
+      boxShadow: "0 8px 28px rgba(0,0,0,0.45)"
+    },
+    children: [
+      jsxs36("div", {
+        style: { display: "flex", alignItems: "center", gap: "0.4rem", padding: "0.3rem 0.5rem", borderBottom: STROKE_SOFT, fontSize: "0.62rem", userSelect: "none" },
+        children: [
+          jsx40("span", { style: { fontFamily: "monospace", color: tone, fontWeight: 600 }, children: m.addr }),
+          jsx40("span", { style: { color: tone }, children: m.tool ? `${m.role} \xB7 ${m.tool}` : m.role }),
+          m.bubble ? jsx40("span", { style: { color: TEXT_DIM }, children: "\u25E7 bubble \u2014 stays in the tape, not sent" }) : null,
+          jsx40("span", { style: { color: TEXT_DIM, marginLeft: "auto" }, children: kLabel(msgTokens(m)) }),
+          jsx40(ModeSwitch, { raw, onRaw: setRaw, md, editLabel: "raw \u2014 the text as the model gets it" }),
+          jsx40(Btn, { onClick: onCopy, title: "copy the text", children: "\u29C9" }),
+          jsx40(Btn, { onClick: onClose, title: "close", children: "\xD7" })
+        ]
+      }),
+      md && !raw ? jsx40(Md, { text: m.text, md, style: { overflowY: "auto", padding: "0.45rem 0.55rem" } }) : jsx40("div", {
+        style: { overflowY: "auto", padding: "0.45rem 0.55rem", fontSize: "0.7rem", lineHeight: 1.45, whiteSpace: "pre-wrap", wordBreak: "break-word", ...SEL },
+        children: String(m.text || "")
+      })
+    ]
+  });
+}
+function Wagon({ name, list, on, onToggle }) {
+  const n2 = (list || []).length;
+  return jsxs36("label", {
+    title: n2 ? `${name}: ${list[0].addr}\u2026${list[n2 - 1].addr}` : `${name}: empty`,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: "0.35rem",
+      cursor: n2 ? "pointer" : "default",
+      padding: "0.4rem 0.45rem",
+      borderRadius: "0.5rem",
+      fontSize: "0.6rem",
+      background: ELEVATED,
+      border: STROKE_SOFT,
+      borderLeft: `3px solid ${on ? ACCENT : "var(--ui-stroke-secondary)"}`,
+      opacity: n2 ? 1 : 0.4,
+      userSelect: "none"
+    },
+    children: [
+      jsx40("input", { type: "checkbox", checked: !!on, disabled: !n2, onChange: () => onToggle(), style: { margin: 0 } }),
+      jsx40("span", { style: { fontWeight: 600 }, children: name }),
+      jsx40("span", { style: { color: TEXT_DIM, marginLeft: "auto" }, children: `${n2} \xB7 ${kLabel(sumTokens(list))}` })
+    ]
+  });
+}
+function Grow({ value, onChange, readOnly, minRem, maxRem, placeholder, onKeyDown, mono }) {
+  const ref = useRef11(null);
+  useEffect9(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight + 2}px`;
+  }, [value]);
+  return jsx40("textarea", {
+    ref,
+    value,
+    readOnly,
+    placeholder,
+    onKeyDown,
+    onChange: (e) => onChange && onChange(e.target.value),
+    style: {
+      width: "100%",
+      resize: "none",
+      boxSizing: "border-box",
+      minHeight: `${minRem || 1.6}rem`,
+      maxHeight: `${maxRem || 12}rem`,
+      overflowY: "auto",
+      fontSize: "0.7rem",
+      lineHeight: 1.4,
+      padding: "0.35rem 0.45rem",
+      borderRadius: "0.375rem",
+      border: STROKE,
+      background: readOnly ? "transparent" : SURFACE,
+      color: "inherit",
+      fontFamily: mono ? "monospace" : "inherit",
+      ...SEL
+    }
+  });
+}
+function copyText(text) {
+  const clip = typeof navigator !== "undefined" && navigator && navigator.clipboard;
+  if (!clip || typeof clip.writeText !== "function") return Promise.resolve(false);
+  return Promise.resolve(clip.writeText(String(text || ""))).then(() => true, () => false);
+}
+function Turn({ turn, index, editable, folded, onFold, onEdit, onCopy, onMove, md, raw, onRaw }) {
+  const tone = toneOf2(turn.role);
+  const reply = turn.role === "assistant";
+  return jsxs36("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: "0.3rem",
+      padding: "0.5rem 0 0.4rem",
+      marginTop: index ? "0.35rem" : 0,
+      borderTop: index ? `2px solid color-mix(in oklch, ${tone}, transparent 35%)` : "none"
+    },
+    children: [
+      jsxs36("div", {
+        style: {
+          display: "flex",
+          alignItems: "center",
+          gap: "0.4rem",
+          fontSize: "0.62rem",
+          userSelect: "none",
+          padding: "0.2rem 0.4rem",
+          borderRadius: "0.35rem",
+          background: `color-mix(in oklch, ${tone}, transparent 85%)`
+        },
+        children: [
+          jsx40("span", {
+            onClick: onFold,
+            style: { cursor: "pointer", color: tone, fontWeight: 700, fontSize: "0.8rem", letterSpacing: "0.02em" },
+            children: `${folded ? "\u25B8" : "\u25BE"} ${turn.role}${index < 2 && editable ? " (editable)" : ""}`
+          }),
+          folded ? jsx40("span", {
+            style: { color: TEXT_DIM, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, flex: 1 },
+            children: String(turn.content).slice(0, 80)
+          }) : jsx40("span", { style: { flex: 1 } }),
+          jsx40("span", { style: { color: TEXT_DIM }, children: kLabel(roughTokens2(turn.content)) }),
+          folded ? null : jsx40(ModeSwitch, { raw, onRaw, md, editLabel: editable ? "edit this turn" : "raw \u2014 the text as it came" }),
+          reply ? jsx40(Btn, { onClick: onCopy, title: "copy", children: "\u29C9" }) : null,
+          reply ? jsx40(Btn, { onClick: onMove, title: "to the result", children: "\u2192" }) : null
+        ]
+      }),
+      folded ? null : md && !raw ? jsx40(Md, { text: turn.content, md }) : editable ? jsx40(Grow, { value: turn.content, onChange: onEdit, maxRem: 16, mono: index === 1 }) : jsx40("div", {
+        style: { fontSize: "0.7rem", lineHeight: 1.45, whiteSpace: "pre-wrap", wordBreak: "break-word", ...SEL },
+        children: turn.content
+      })
+    ]
+  });
+}
+function FramePiece({ text, open, onToggle, note }) {
+  const first = String(text || "").split("\n")[0];
+  const long = String(text || "").includes("\n");
+  return jsxs36("div", {
+    style: {
+      fontSize: "0.62rem",
+      lineHeight: 1.4,
+      color: TEXT_DIM,
+      padding: "0.25rem 0.45rem",
+      borderRadius: "0.375rem",
+      border: "1px dashed var(--ui-stroke-secondary)",
+      whiteSpace: "pre-wrap",
+      wordBreak: "break-word",
+      maxHeight: open ? "14rem" : "none",
+      overflowY: open ? "auto" : "visible",
+      flexShrink: 0,
+      ...SEL
+    },
+    children: [
+      long ? jsx40("span", { onClick: onToggle, style: { cursor: "pointer", userSelect: "none" }, children: open ? "\u25BE " : "\u25B8 " }) : null,
+      open || !long ? text : first,
+      note ? jsx40("div", { style: { fontStyle: "italic", marginTop: "0.15rem" }, children: `\u21B3 ${note}` }) : null
+    ]
+  });
+}
+function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp, markdown: md, onClose }) {
+  const [presets, setPresets] = useState17(presetsProp || []);
+  const [frameTexts, setFrameTexts] = useState17(framesProp || {});
+  const [data, setData] = useState17(null);
+  const [models, setModels] = useState17({ session: "", list: [] });
+  const [model, setModel] = useState17("");
+  const [think, setThink] = useState17(false);
+  const [presetKey, setPresetKey] = useState17((presets[0] || {}).key);
+  const [picks, setPicks] = useState17({ prefix: false, suffix: false });
+  const [values, setValues] = useState17({});
+  const [turns, setTurns] = useState17([]);
+  const [sent, setSent] = useState17(false);
+  const [folded, setFolded] = useState17({ 0: true });
+  const [input, setInput] = useState17("");
+  const [busy, setBusy] = useState17(false);
+  const [status, setStatus] = useState17({ kind: "idle", note: "loading\u2026" });
+  const [result, setResult] = useState17({ body: "", cleared: false });
+  const [undoBody, setUndoBody] = useState17(null);
+  const [rawTurns, setRawTurns] = useState17({});
+  const [resultRaw, setResultRaw] = useState17(false);
+  const [wrap, setWrap] = useState17((presets[0] || {}).wrap || "as-it-was");
+  const tapeRef = useRef11(null);
+  const [chipPop, setChipPop] = useState17(null);
+  const [headOpen, setHeadOpen] = useState17(false);
+  const saved = useMemo3(() => placeOf(loadPlace(), window.innerWidth, window.innerHeight), []);
+  const [pos, setPos] = useState17(saved ? { x: saved.x, y: saved.y } : null);
+  const [size, setSize] = useState17(saved ? { w: saved.w, h: saved.h } : null);
+  const boxRef = useRef11(null);
+  useEffect9(() => {
+    const el = boxRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let timer = null;
+    const ro = new ResizeObserver(() => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const r = el.getBoundingClientRect();
+        const w = Math.round(r.width);
+        const h = Math.round(r.height);
+        setSize((s) => s && s.w === w && s.h === h ? s : { w, h });
+        savePlace({ x: Math.round(r.left), y: Math.round(r.top), w, h });
+      }, 250);
+    });
+    ro.observe(el);
+    return () => {
+      clearTimeout(timer);
+      ro.disconnect();
+    };
+  }, []);
+  const startDrag = (e) => {
+    if (e.button !== 0) return;
+    const tag = String(e.target && e.target.tagName || "").toLowerCase();
+    if (["select", "button", "input", "option", "textarea"].includes(tag)) return;
+    const box = boxRef.current && boxRef.current.getBoundingClientRect();
+    if (!box) return;
+    e.preventDefault();
+    const dx = e.clientX - box.left;
+    const dy = e.clientY - box.top;
+    const move = (ev) => setPos(dragPos(ev.clientX - dx, ev.clientY - dy, box.width, window.innerWidth, window.innerHeight));
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      const r = boxRef.current && boxRef.current.getBoundingClientRect();
+      if (r) savePlace({ x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) });
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+  const preset = presets.find((p) => p.key === presetKey) || presets[0] || {};
+  useEffect9(() => {
+    let dead = false;
+    const pack = transport.presets ? transport.presets() : Promise.resolve(null);
+    Promise.all([transport.data(), transport.models(), pack]).then(([d, m, p]) => {
+      if (dead) return;
+      if (p && Array.isArray(p.presets) && p.presets.length) {
+        setPresets(p.presets);
+        setFrameTexts(p.frames || {});
+        setPresetKey(p.presets[0].key);
+        setWrap(p.presets[0].wrap || "as-it-was");
+      }
+      setData(d);
+      setModels(m);
+      setModel(m.session || (m.list || [])[0] || "");
+      setStatus({ kind: "idle", note: "ready" });
+    }, (err) => {
+      if (!dead) setStatus({ kind: "error", note: `${err && err.message || err}` });
+    });
+    return () => {
+      dead = true;
+    };
+  }, [transport]);
+  useEffect9(() => {
+    if (!data || sent) return;
+    setTurns(presetTurns(preset, data, picks, values));
+  }, [data, presetKey, picks, values, sent]);
+  useEffect9(() => {
+    const el = tapeRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [turns.length]);
+  const choosePreset = (key) => {
+    setPresetKey(key);
+    setValues({});
+    setWrap((presets.find((p) => p.key === key) || {}).wrap || "as-it-was");
+    if (sent) {
+      setSent(false);
+      setStatus({ kind: "idle", note: "preset changed \u2014 conversation restarted" });
+    }
+  };
+  const send = () => {
+    if (busy || !data) return;
+    let conv = turns;
+    const extra = input.trim();
+    if (extra) conv = conv.concat({ role: "user", content: input });
+    const last = conv[conv.length - 1];
+    if (!last || last.role !== "user") {
+      setStatus({ kind: "idle", note: "write a message first" });
+      return;
+    }
+    setTurns(conv);
+    setInput("");
+    setSent(true);
+    setBusy(true);
+    setStatus({ kind: "busy", note: `sending ${kLabel(conversationTokens(conv))} to ${model}\u2026` });
+    transport.chat({ messages: conv.map((t) => ({ role: t.role, content: t.content })), model, think }).then((r) => {
+      if (!r || !r.ok) {
+        setStatus({ kind: "error", note: r && r.error || "no answer" });
+        return;
+      }
+      setTurns((c) => c.concat({ role: "assistant", content: r.text }));
+      setResult((res) => dropReply(res, r.text));
+      const tk = r.tokens || {};
+      setStatus({ kind: "idle", note: `${r.model || model} \xB7 ${kLabel(tk.prompt)} \u2192 ${kLabel(tk.completion)}` });
+    }, (err) => setStatus({ kind: "error", note: String(err && err.message || err) })).then(() => setBusy(false));
+  };
+  const frames = data && data.frames || [];
+  const frame = !data ? null : wrap === "as-it-was" ? frames[0] ? { head: frames[0].head, tail: frames[0].tail || "", tailApart: false } : null : frameFor(wrap, frameTexts, (data.bubbles || []).length > 0);
+  const wrapped = data ? wrapResult(result.body, wrap, frames, frameTexts) : "";
+  const targetTok = data ? sumTokens(data.target) : 0;
+  const replace = () => {
+    if (busy || !data || !result.body.trim()) return;
+    setBusy(true);
+    setStatus({ kind: "busy", note: "replacing\u2026" });
+    transport.replace({ addrs: data.addrs || data.target.map((m) => m.addr), text: result.body, wrap, preset: preset.key || "" }).then(
+      (r) => setStatus(r && r.ok ? { kind: "done", note: `${r.report || "replaced"} \u2014 the tape is reloaded` } : { kind: "error", note: r && r.error || "replace failed" }),
+      (err) => setStatus({ kind: "error", note: String(err && err.message || err) })
+    ).then(() => setBusy(false));
+  };
+  const rows = useMemo3(() => data ? trainRows(data) : [], [data]);
+  const popRow = chipPop ? rows.find((r) => r.addr === chipPop.addr) : null;
+  useEffect9(() => {
+    if (!chipPop) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setChipPop(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [chipPop]);
+  const stateColor = status.kind === "error" ? "var(--ui-red)" : status.kind === "done" ? "var(--ui-green)" : TEXT_2;
+  const head = jsxs36("div", {
+    onMouseDown: startDrag,
+    title: "drag to move",
+    style: { display: "flex", alignItems: "center", gap: "0.5rem", padding: "0.35rem 0.6rem", borderBottom: STROKE, userSelect: "none", fontSize: "0.65rem", cursor: "move" },
+    children: [
+      jsx40("span", { style: { fontWeight: 700, color: ACCENT, fontSize: "0.75rem" }, children: "LLMOps" }),
+      jsx40(Select, {
+        value: presetKey,
+        title: "preset",
+        onChange: choosePreset,
+        options: presets.map((p) => ({ value: p.key, label: `preset: ${p.label}` }))
+      }),
+      jsx40(Select, {
+        value: model,
+        title: "model of the route server",
+        onChange: setModel,
+        options: (models.list || []).map((m) => ({ value: m, label: m === models.session ? `${m} (session)` : m }))
+      }),
+      jsx40("span", {
+        style: { fontWeight: 600, color: TEXT_2, whiteSpace: "nowrap" },
+        title: "the call goes to this model",
+        children: model ? `\u2192 ${model}` : "\u2192 \u2026"
+      }),
+      jsxs36("label", { style: { display: "flex", alignItems: "center", gap: "0.2rem", cursor: "pointer" }, children: [
+        jsx40("input", { type: "checkbox", checked: think, onChange: () => setThink(!think), style: { margin: 0 } }),
+        "think"
+      ] }),
+      jsxs36("span", {
+        style: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: stateColor, ...SEL },
+        title: status.note,
+        children: [busy ? "\u25CC " : status.kind === "error" ? "\u26A0 " : "", status.note]
+      }),
+      jsx40("span", { style: { color: TEXT_DIM }, title: "the whole conversation goes every time", children: `request ${kLabel(conversationTokens(turns))}` }),
+      jsx40(Btn, { onClick: onClose, title: "close (the conversation is not stored)", children: "\xD7" })
+    ]
+  });
+  const left = jsxs36("div", {
+    style: { display: "flex", flexDirection: "column", gap: "0.3rem", padding: "0 0.45rem 0.45rem", borderRight: STROKE, minHeight: 0, overflow: "hidden" },
+    children: [
+      jsx40(Label, { children: "data" }),
+      data ? jsx40(Wagon, { name: "prefix", list: data.prefix, on: picks.prefix, onToggle: () => setPicks({ ...picks, prefix: !picks.prefix }) }) : null,
+      jsx40("div", {
+        style: { display: "flex", flexDirection: "column", gap: "0.2rem", overflowY: "auto", minHeight: 0, flex: "0 1 auto", padding: "0.1rem 0" },
+        children: rows.map((m) => jsx40(Chip2, { m, open: !!chipPop && chipPop.addr === m.addr, onOpen: setChipPop }, m.addr))
+      }),
+      data ? jsx40(Wagon, { name: "suffix", list: data.suffix, on: picks.suffix, onToggle: () => setPicks({ ...picks, suffix: !picks.suffix }) }) : null,
+      jsx40("div", { style: { flex: 1 } }),
+      frames.length ? jsx40("div", {
+        style: { fontSize: "0.55rem", color: TEXT_DIM },
+        title: frames.map((f) => f.head).join("\n"),
+        children: `frames stripped: ${frames.map((f) => f.kind).join(", ")}`
+      }) : null,
+      jsxs36("div", {
+        style: { borderTop: STROKE_SOFT, paddingTop: "0.2rem", display: "flex", flexDirection: "column", gap: "0.25rem" },
+        children: [
+          jsx40(Label, { children: `preset \xB7 ${preset.label || ""}` }),
+          (preset.settings || []).length ? (preset.settings || []).map((s) => jsxs36("label", {
+            style: { display: "flex", alignItems: "center", gap: "0.3rem", fontSize: "0.6rem" },
+            children: [s.label, jsx40(Select, {
+              value: values[s.key] || s.options[0],
+              onChange: (v) => setValues({ ...values, [s.key]: v }),
+              options: s.options.map((o) => ({ value: o, label: o }))
+            })]
+          }, s.key)) : jsx40("div", { style: { fontSize: "0.6rem", color: TEXT_DIM }, children: "no settings" })
+        ]
+      })
+    ]
+  });
+  const centre = jsxs36("div", {
+    style: { display: "flex", flexDirection: "column", minHeight: 0, borderRight: STROKE },
+    children: [
+      jsx40("div", { style: { padding: "0 0.6rem" }, children: jsx40(Label, { children: "conversation" }) }),
+      jsx40("div", {
+        ref: tapeRef,
+        style: { flex: 1, minHeight: 0, overflowY: "auto", padding: "0 0.6rem" },
+        children: turns.map((t, i) => jsx40(Turn, {
+          turn: t,
+          index: i,
+          editable: !sent && i < 2,
+          folded: !!folded[i],
+          onFold: () => setFolded({ ...folded, [i]: !folded[i] }),
+          onEdit: (v) => setTurns(turns.map((x, j) => j === i ? { ...x, content: v } : x)),
+          onCopy: () => copyText(t.content).then((ok) => setStatus({ kind: "idle", note: ok ? "copied" : "copy failed" })),
+          onMove: () => {
+            setUndoBody(null);
+            setResult(moveToResult(t.content));
+          },
+          md,
+          raw: !!rawTurns[i],
+          onRaw: (v) => setRawTurns({ ...rawTurns, [i]: v })
+        }, i))
+      }),
+      jsxs36("div", {
+        style: { display: "flex", alignItems: "flex-end", gap: "0.4rem", padding: "0.45rem 0.6rem", borderTop: STROKE },
+        children: [
+          jsx40("div", { style: { flex: 1, minWidth: 0 }, children: jsx40(Grow, {
+            value: input,
+            onChange: setInput,
+            maxRem: 10,
+            placeholder: sent ? "next message\u2026 (Ctrl+Enter \u2014 Send)" : "optional: add to the preset turns\u2026 (Ctrl+Enter \u2014 Send)",
+            onKeyDown: (e) => {
+              if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                send();
+              }
+            }
+          }) }),
+          jsx40(Btn, { onClick: send, disabled: busy || !data, strong: true, tone: ACCENT, children: busy ? "\u2026" : "Send" })
+        ]
+      })
+    ]
+  });
+  const right = jsxs36("div", {
+    style: { display: "flex", flexDirection: "column", gap: "0.4rem", minHeight: 0, padding: "0 0.6rem 0.5rem" },
+    children: [
+      jsxs36("div", { style: { display: "flex", alignItems: "center", gap: "0.3rem", flexWrap: "wrap" }, children: [
+        jsx40(Label, { children: result.cleared ? "result \u2014 only \u2192 fills it now" : "result \u2014 the reply drops in" }),
+        jsx40("span", { style: { marginLeft: "auto" } }),
+        // Clean-up by hand (owner, 2026-10-11): the model may echo our wrapping; the human decides.
+        jsx40(Btn, {
+          onClick: () => {
+            setUndoBody(result.body);
+            setResult({ ...result, body: unwrapMessages(result.body) });
+          },
+          disabled: unwrapMessages(result.body) === null,
+          title: "take off a <messages> line at the start and a </messages> line at the end of the body",
+          children: "strip <messages>"
+        }),
+        jsx40(Btn, {
+          onClick: () => {
+            setUndoBody(result.body);
+            setResult({ ...result, body: stripHeaders(result.body, data) });
+          },
+          disabled: stripHeaders(result.body, data) === null,
+          title: "take off lines like [m0033 assistant] \u2014 headers of the messages that were sent",
+          children: "strip [m\u2026] headers"
+        }),
+        jsx40(Btn, {
+          onClick: () => {
+            setResult({ ...result, body: undoBody });
+            setUndoBody(null);
+          },
+          disabled: undoBody === null,
+          title: "put back the body as it was before the last strip",
+          children: "\u21B6"
+        }),
+        jsx40(ModeSwitch, { raw: resultRaw || !result.body.trim(), onRaw: setResultRaw, md, editLabel: "edit the body" })
+      ] }),
+      frame ? jsx40(FramePiece, { text: frame.head, open: headOpen, onToggle: () => setHeadOpen(!headOpen) }, "frame-head") : null,
+      // 📖 shows the body rendered; an empty body is always the field (there is nothing to read).
+      md && !resultRaw && result.body.trim() ? jsx40(Md, { text: result.body, md, style: {
+        flex: 1,
+        minHeight: 0,
+        overflowY: "auto",
+        padding: "0.45rem 0.55rem",
+        borderRadius: "0.375rem",
+        border: STROKE
+      } }) : jsx40("div", { style: { flex: 1, minHeight: 0, display: "flex" }, children: jsx40("textarea", {
+        value: result.body,
+        onChange: (e) => setResult({ ...result, body: e.target.value }),
+        placeholder: "body only \u2014 the wrap is shown around it",
+        style: {
+          flex: 1,
+          resize: "none",
+          fontSize: "0.72rem",
+          lineHeight: 1.45,
+          padding: "0.45rem 0.55rem",
+          borderRadius: "0.375rem",
+          border: STROKE,
+          background: SURFACE,
+          color: "inherit",
+          ...SEL
+        }
+      }) }),
+      frame && frame.tail ? jsx40(FramePiece, { text: frame.tail, note: frame.tailApart ? "separate message, after the bubbles" : "" }, "frame-tail") : null,
+      jsxs36("div", { style: { display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.62rem", flexWrap: "wrap" }, children: [
+        "wrap",
+        jsx40(Select, {
+          value: wrap,
+          onChange: setWrap,
+          title: "frame around the body",
+          options: WRAPS.map((w) => ({ value: w, label: w === "as-it-was" ? `as it was (${WRAP_LABEL[asItWas(frames)]})` : WRAP_LABEL[w] }))
+        }),
+        jsx40("span", {
+          style: { color: TEXT_DIM },
+          title: "always the compaction path: one message in place of the span, bubbles float out",
+          children: "insert: compaction path"
+        })
+      ] }),
+      jsxs36("div", { style: { display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.62rem", color: TEXT_2 }, children: [
+        jsx40("span", { children: `target ${data ? targetLabel(data) : "\u2014"}` }),
+        jsx40("span", {
+          style: { marginLeft: "auto", fontFamily: "monospace" },
+          title: "target tokens \u2192 wrapped result tokens",
+          children: `${kLabel(targetTok)} \u2192 ${kLabel(roughTokens2(wrapped))}`
+        })
+      ] }),
+      jsxs36("div", { style: { display: "flex", alignItems: "center", gap: "0.4rem", justifyContent: "flex-end" }, children: [
+        jsx40(Btn, { onClick: () => {
+          setUndoBody(null);
+          setResult(clearResult());
+        }, title: "clear \u2014 replies stop dropping in by themselves", children: "\xD7" }),
+        jsx40(Btn, {
+          onClick: () => copyText(wrapped).then((ok) => setStatus({ kind: "idle", note: ok ? "copied (wrapped)" : "copy failed" })),
+          title: "copy the wrapped text",
+          children: "\u29C9"
+        }),
+        jsx40(Btn, {
+          onClick: replace,
+          disabled: busy || !result.body.trim(),
+          strong: true,
+          tone: "var(--ui-red)",
+          title: "replace the target span \u2014 runs at once, the field is the preview",
+          children: "Replace"
+        })
+      ] })
+    ]
+  });
+  return jsxs36("div", {
+    ref: boxRef,
+    // Clicks must not fall through to the panel's document-level «click outside» listeners.
+    onClick: (e) => e.stopPropagation(),
+    onMouseDown: (e) => e.stopPropagation(),
+    style: {
+      position: "fixed",
+      zIndex: 900,
+      // Spawns in the middle of the app window; once dragged — where it was left. No `transform`
+      // for centring: it would make the chip popup's `fixed` count from this box, not the screen.
+      top: pos ? `${pos.y}px` : `calc((100vh - ${WIN_H}) / 2)`,
+      left: pos ? `${pos.x}px` : `calc((100vw - ${WIN_W}) / 2)`,
+      width: size ? `${size.w}px` : WIN_W,
+      height: size ? `${size.h}px` : WIN_H,
+      // Native corner resize (bottom-right); the observer above remembers the result.
+      resize: "both",
+      minWidth: `${MIN_W}px`,
+      minHeight: `${MIN_H2}px`,
+      maxWidth: "100vw",
+      maxHeight: "100vh",
+      display: "flex",
+      flexDirection: "column",
+      overflow: "hidden",
+      background: SURFACE,
+      border: STROKE,
+      borderRadius: "0.6rem",
+      // All round, the TOP too (owner, 2026-10-11: the top edge merged with the chat text under it): a
+      // thin dark ring, an upward glow, the old drop below.
+      boxShadow: "0 0 0 1px rgba(0,0,0,0.25), 0 -10px 40px rgba(0,0,0,0.35), 0 20px 64px rgba(0,0,0,0.4)",
+      color: "var(--ui-text-primary)"
+    },
+    children: [
+      head,
+      popRow ? jsx40(ChipPopup, {
+        m: popRow,
+        rect: chipPop.rect,
+        onClose: () => setChipPop(null),
+        md,
+        onCopy: () => copyText(popRow.text).then((ok) => setStatus({ kind: "idle", note: ok ? `copied ${popRow.addr}` : "copy failed" }))
+      }, "chip-pop") : null,
+      jsxs36("div", {
+        style: { flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "11rem minmax(0, 1fr) minmax(0, 1fr)" },
+        children: [left, centre, right]
+      })
+    ]
+  });
+}
+
+// desktop/src/llmops/llmops-host.js
+function LLMOpsHost() {
+  const win = useLLMOpsWin();
+  const seq = win ? win.seq : 0;
+  const transport = useMemo4(() => win ? llmopsTransport(win.sid, win.addrs) : null, [seq]);
+  if (!win || !transport) return null;
+  return jsx41(LLMOpsWindow, { transport, markdown, onClose: closeLLMOpsWindow }, seq);
+}
+
 // desktop/src/file-ops-pane.js
 var USE_CARD_V2 = true;
 var TAIL_SPACE2 = "40%";
-function renderCard(brick, key, toolColumnWidth, onSelectOp, stale, drop, onPick) {
-  if (!USE_CARD_V2) return jsx36(Brick, { key, brick });
-  const opId0 = brick.meta && typeof brick.meta.op === "string" ? brick.meta.op : null;
-  const props = brickToCardProps(brick, toolColumnWidth, opId0 && stale ? stale[opId0] : void 0, drop, onPick);
-  const opId = opId0;
-  if (opId && onSelectOp) props.headerProps.onSelectOp = () => onSelectOp(opId);
-  return jsx36("div", {
+function renderCard(brick, key, toolColumnWidth) {
+  if (!USE_CARD_V2) return jsx42(Brick, { key, brick });
+  const props = brickToCardProps(brick, toolColumnWidth);
+  return jsx42("div", {
     key,
     className: "mb-1 animate-appear-once",
     style: CAPPED,
-    children: jsx36(OperationCard, props)
+    children: jsx42(OperationCard, props)
   });
 }
 var DEV_MODES = ["operations", "palette"];
@@ -9016,14 +9810,13 @@ function effectiveMode(saved, dev) {
 }
 function FileOpsPaneImpl() {
   const view = useView();
-  const fileContext = useFileContext();
-  const drop = useDrop();
-  const scrollerRef = useRef9(null);
-  const shownSessionRef = useRef9(null);
-  const shownListRef = useRef9("");
-  const [version, setVersion] = useState15("");
-  const [dev, setDev] = useState15(false);
-  useEffect8(() => {
+  const bricks = MOCK_BRICKS;
+  const scrollerRef = useRef12(null);
+  const shownSessionRef = useRef12(null);
+  const shownListRef = useRef12("");
+  const [version, setVersion] = useState18("");
+  const [dev, setDev] = useState18(false);
+  useEffect10(() => {
     let dead = false;
     loadConfig().then((data) => {
       if (dead || !data || data.error) return;
@@ -9035,10 +9828,10 @@ function FileOpsPaneImpl() {
       dead = true;
     };
   }, []);
-  const [viewport, setViewport] = useState15({ top: 0, height: 600 });
-  const bricksForWindowRef = useRef9([]);
-  const winBoundsRef = useRef9({ start: 0, end: 0 });
-  const scrollRaf = useRef9(null);
+  const [viewport, setViewport] = useState18({ top: 0, height: 600 });
+  const bricksForWindowRef = useRef12([]);
+  const winBoundsRef = useRef12({ start: 0, end: 0 });
+  const scrollRaf = useRef12(null);
   const onScroll = () => {
     if (scrollRaf.current) return;
     scrollRaf.current = requestAnimationFrame(() => {
@@ -9050,35 +9843,15 @@ function FileOpsPaneImpl() {
       setViewport({ top: el.scrollTop, height: el.clientHeight });
     });
   };
-  useLayoutEffect6(() => {
+  useLayoutEffect7(() => {
     const el = scrollerRef.current;
     if (el) setViewport({ top: el.scrollTop, height: el.clientHeight });
   }, []);
-  function selectOp(opId) {
-    $fileContext.set(Object.assign({}, fileContext, {
-      selectedOp: fileContext.selectedOp === opId ? null : opId
-    }));
-  }
-  useEffect8(() => {
-    if (!fileContext.selectedOp) return;
-    const clear = () => {
-      const cur = $fileContext.get() || {};
-      $fileContext.set(Object.assign({}, cur, { selectedOp: null }));
-    };
-    document.addEventListener("click", clear);
-    return () => document.removeEventListener("click", clear);
-  }, [fileContext.selectedOp]);
-  useEffect8(() => {
-    if (!drop.mode) return;
-    const clear = () => setDropMode(false);
-    document.addEventListener("click", clear);
-    return () => document.removeEventListener("click", clear);
-  }, [drop.mode]);
-  useLayoutEffect6(() => {
+  useLayoutEffect7(() => {
     const el = scrollerRef.current;
     if (!el) return;
-    const last = view.bricks[view.bricks.length - 1];
-    const signature = `${view.bricks.length}:${last && (last.tool_id || last.ts) || ""}`;
+    const last = bricks[bricks.length - 1];
+    const signature = `${bricks.length}:${last && (last.tool_id || last.ts) || ""}`;
     const listChanged = shownListRef.current !== signature;
     shownListRef.current = signature;
     const switched = shownSessionRef.current !== view.sessionId;
@@ -9090,16 +9863,12 @@ function FileOpsPaneImpl() {
       setViewport({ top: el.scrollTop, height: el.clientHeight });
     }
   });
-  const ctxView = useMemo3(
-    () => buildContextView(liveContextOps(fileContext.ops)),
-    [fileContext.ops]
-  );
   const mode = effectiveMode(view.mode, dev);
   const mirrorOn = mode === "mirror";
   const paletteOn = mode === "palette";
   const configOn = mode === "config";
   function modeBtn(label, key, on, muted) {
-    return jsx36("button", {
+    return jsx42("button", {
       onClick: () => {
         $view.set(Object.assign({}, view, { mode: key }));
       },
@@ -9114,13 +9883,13 @@ function FileOpsPaneImpl() {
     }, key);
   }
   function brandLabel() {
-    return jsxs35("span", { className: "flex items-baseline gap-1 min-w-0", children: [
-      jsx36("span", {
+    return jsxs37("span", { className: "flex items-baseline gap-1 min-w-0", children: [
+      jsx42("span", {
         className: "font-semibold text-[color:hsl(var(--primary))] truncate",
         title: "hermes-filetools plugin",
         children: "File Ops"
       }),
-      jsx36("span", {
+      jsx42("span", {
         className: "text-(--ui-text-quaternary) shrink-0",
         style: { fontSize: "0.55rem" },
         title: version ? "plugin version (both halves ship from one manifest)" : "version unknown \u2014 /config did not answer",
@@ -9129,7 +9898,7 @@ function FileOpsPaneImpl() {
     ] }, "brand");
   }
   function modeBtns() {
-    return jsxs35("div", { className: "flex items-center gap-1 shrink-0", children: [
+    return jsxs37("div", { className: "flex items-center gap-1 shrink-0", children: [
       modeBtn((mirrorOn ? "\u25C9" : "\u25CB") + " Mirror", "mirror", mirrorOn),
       modeBtn((configOn ? "\u25C9" : "\u25CB") + " Config", "config", configOn),
       // Operations — за Config и приглушённым текстом (владелец, 2026-09-30). Только в dev.
@@ -9140,11 +9909,11 @@ function FileOpsPaneImpl() {
     ] }, "modes");
   }
   if (mirrorOn) {
-    return jsxs35("div", {
+    return jsxs37("div", {
       className: "flex flex-col h-full w-full overflow-hidden bg-background",
       style: CAPPED,
       children: [
-        jsxs35("div", {
+        jsxs37("div", {
           className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
           style: { fontSize: "0.6rem", userSelect: "none" },
           children: [
@@ -9154,17 +9923,17 @@ function FileOpsPaneImpl() {
         }),
         // Зеркало в своей ячейке `flex-1`: его корень `h-full`, и без обёртки он вытеснил бы
         // мини-панель токенов под край.
-        jsx36("div", { className: "flex-1 min-h-0", children: jsx36(PromptMirror, {}) }),
-        jsx36(TokenStrip, {})
+        jsx42("div", { className: "flex-1 min-h-0", children: jsx42(PromptMirror, {}) }),
+        jsx42(TokenStrip, {})
       ]
     });
   }
   if (paletteOn) {
-    return jsxs35("div", {
+    return jsxs37("div", {
       className: "flex flex-col h-full w-full overflow-hidden bg-background",
       style: CAPPED,
       children: [
-        jsxs35("div", {
+        jsxs37("div", {
           className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
           style: { fontSize: "0.6rem", userSelect: "none" },
           children: [
@@ -9172,16 +9941,16 @@ function FileOpsPaneImpl() {
             modeBtns()
           ]
         }),
-        jsx36(PalettePane, {})
+        jsx42(PalettePane, {})
       ]
     });
   }
   if (configOn) {
-    return jsxs35("div", {
+    return jsxs37("div", {
       className: "flex flex-col h-full w-full overflow-hidden bg-background",
       style: CAPPED,
       children: [
-        jsxs35("div", {
+        jsxs37("div", {
           className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
           style: { fontSize: "0.6rem", userSelect: "none" },
           children: [
@@ -9189,56 +9958,11 @@ function FileOpsPaneImpl() {
             modeBtns()
           ]
         }),
-        jsx36(ConfigPane, {})
+        jsx42(ConfigPane, {})
       ]
     });
   }
-  if (!hasEvents()) {
-    return jsxs35("div", {
-      className: "flex flex-col h-full w-full overflow-hidden bg-background",
-      style: CAPPED,
-      children: [
-        jsx36("div", {
-          className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
-          style: { fontSize: "0.6rem", userSelect: "none" },
-          children: [brandLabel(), modeBtns()]
-        }),
-        sdkC(sdk8.EmptyState, "div", { title: "No tool events", description: "This Hermes build does not emit tool events, so no operations can appear here." })
-      ]
-    });
-  }
-  if (!view.sessionId) {
-    return jsxs35("div", {
-      className: "flex flex-col h-full w-full overflow-hidden bg-background",
-      style: CAPPED,
-      children: [
-        jsx36("div", {
-          className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
-          style: { fontSize: "0.6rem", userSelect: "none" },
-          children: [brandLabel(), modeBtns()]
-        }),
-        sdkC(sdk8.EmptyState, "div", { title: "No active chat", description: "Open a chat \u2014 operations appear as the file tools run." })
-      ]
-    });
-  }
-  if (view.bricks.length === 0) {
-    return jsxs35("div", {
-      className: "flex flex-col h-full w-full overflow-hidden bg-background",
-      style: CAPPED,
-      children: [
-        jsx36("div", {
-          className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
-          style: { fontSize: "0.6rem", userSelect: "none" },
-          children: [brandLabel(), modeBtns()]
-        }),
-        sdkC(sdk8.EmptyState, "div", {
-          title: "No operations yet",
-          description: view.note ? view.note : `Session ${view.sessionId}. Operations appear on read_file / write_file / patch / search_files calls.`
-        })
-      ]
-    });
-  }
-  const shown = visibleBricks(view.bricks, view.showErased);
+  const shown = visibleBricks(bricks, view.showErased);
   const toolCol = toolColWidth(shown.bricks.map((b) => b.tool));
   const win = renderWindow(shown.bricks, viewport.top, viewport.height);
   bricksForWindowRef.current = shown.bricks;
@@ -9247,7 +9971,7 @@ function FileOpsPaneImpl() {
   for (let i = win.start; i < win.end; i++) {
     const b = shown.bricks[i];
     if (b.note) {
-      rows.push(jsx36("div", {
+      rows.push(jsx42("div", {
         key: `note-${b.tool_id || i}`,
         // Появляется вместе со своей карточкой — той же анимацией, иначе подпись выскакивала бы
         // мгновенно, а операция под ней всплывала следом.
@@ -9263,53 +9987,28 @@ function FileOpsPaneImpl() {
         children: b.note
       }));
     }
-    rows.push(renderCard(
-      b,
-      b.tool_id || `${b.ts}-${i}`,
-      toolCol,
-      selectOp,
-      ctxView.stale,
-      drop,
-      toggleDropPick
-    ));
+    rows.push(renderCard(b, b.tool_id || `${b.ts}-${i}`, toolCol));
   }
-  if (view.note && win.start === 0) {
-    rows.unshift(jsx36("div", {
-      key: "route-note",
-      // Тоже с переносом, по той же причине — см. подпись операции выше.
-      className: "px-1 pb-1 text-(--ui-text-quaternary)",
-      style: Object.assign({ fontSize: "0.65rem", whiteSpace: "normal", overflowWrap: "anywhere" }, CAPPED, SELECTABLE),
-      title: view.note,
-      children: view.note
-    }));
-  }
-  const list = jsxs35("div", {
+  const list = jsxs37("div", {
     className: "flex flex-col items-stretch p-2 gap-0",
     style: CAPPED,
     children: rows
   });
-  return jsxs35("div", {
+  return jsxs37("div", {
     className: "flex flex-col h-full w-full overflow-hidden bg-background",
     style: CAPPED,
     children: [
-      jsxs35("div", {
+      jsxs37("div", {
         className: "flex items-center justify-between px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0 select-none",
         style: { fontSize: "0.6rem", userSelect: "none" },
         children: [
           brandLabel(),
-          jsxs35("div", { className: "flex items-center gap-1.5 shrink-0", children: [
-            jsx36("span", { className: "text-(--ui-text-quaternary)", children: view.bricks.length + " ops" }),
+          jsxs37("div", { className: "flex items-center gap-1.5 shrink-0", children: [
+            jsx42("span", { className: "text-(--ui-text-quaternary)", children: "mock \xB7 " + bricks.length + " ops" }),
             modeBtns()
           ] })
         ]
       }),
-      // Файловая субпанель (Plan12) — делит стакан операций, между заголовком и скроллером.
-      // `ops` сейчас всегда [] (см. adapter.js::$fileContext) — вебсокет-подписка на
-      // /context-state ещё не подключена (Plan11-Task06/07, отдельный шов, не мой). Панель
-      // существует и корректно рисует «данных нет», не выдаёт ложную картину.
-      jsx36(FileContextPanel, { view: ctxView, selectedOp: fileContext.selectedOp }),
-      // Полоса работы с контекстом — на одном уровне с файловой субпанелью, над стаканом.
-      jsx36(DropStrip, { bricks: view.bricks, drop }),
       // СВОЙ скроллер, а НЕ sdk.ScrollArea — и это не вкусовщина. SDK-шный ScrollArea (Radix)
       // оборачивает содержимое во внутренний контейнер с `display: table`, а таблица сайзится ПО
       // СОДЕРЖИМОМУ. Этот контейнер не наш: ни className, ни style до него не доходят, поэтому
@@ -9343,7 +10042,7 @@ function FileOpsPaneImpl() {
       // plays once on mount, not `infinite` - re-triggers per card because each card's `key` is
       // its stable `tool_id`, so the DOM node the animation is attached to genuinely is a new
       // mount, not a re-render of an old one).
-      jsx36("style", { children: `
+      jsx42("style", { children: `
         @keyframes appear-once {
           from { opacity: 0; transform: translateY(4px) scale(0.98); }
           to   { opacity: 1; transform: translateY(0) scale(1); }
@@ -9364,7 +10063,7 @@ function FileOpsPaneImpl() {
         }
         .fops-scroll::-webkit-scrollbar-thumb:hover { background-color: var(--ui-stroke-primary); }
       ` }),
-      jsxs35("div", {
+      jsxs37("div", {
         ref: scrollerRef,
         className: "h-full w-full fops-scroll",
         // `overflowAnchor:'none'` (2026-09-14, найдено по трейсу) — гасит браузерный scroll
@@ -9384,27 +10083,30 @@ function FileOpsPaneImpl() {
           // Распорки окна рендера — ПУСТЫЕ div'ы нужной оценочной высоты, замещающие то, что не
           // смонтировано (см. renderWindow/core.js). Высота 0 — не рендерить вовсе, лишний узел
           // в DOM ради нуля ничего не стоит, но и не даёт ничего измерить.
-          jsx36("div", { key: "top-spacer", style: { height: win.topSpacer, pointerEvents: "none" } }),
+          jsx42("div", { key: "top-spacer", style: { height: win.topSpacer, pointerEvents: "none" } }),
           list,
-          jsx36("div", { key: "bottom-spacer", style: { height: win.bottomSpacer, pointerEvents: "none" } }),
+          jsx42("div", { key: "bottom-spacer", style: { height: win.bottomSpacer, pointerEvents: "none" } }),
           // Распорка — ПРЯМОЙ ребёнок скроллера, не padding у списка: процент высоты считается от
           // родителя с определённой высотой, а у списка она auto (по содержимому) и процент бы
           // просто схлопнулся в ноль. У скроллера высота определённая (h-full), поэтому здесь он
           // работает. flexShrink не нужен — блочная раскладка, не флекс.
-          jsx36("div", { key: "tail-space", style: { height: TAIL_SPACE2, pointerEvents: "none" } })
+          jsx42("div", { key: "tail-space", style: { height: TAIL_SPACE2, pointerEvents: "none" } })
         ]
       }),
-      jsx36(GlobalHoverTip, {}),
+      jsx42(GlobalHoverTip, {}),
       // Фильтры — ПОД скроллером, последней строкой панели: они про то, что показывать, а не
       // про то, что делать (действия живут в полосе сверху).
-      jsx36(FilterBar, { showErased: !!view.showErased, hidden: shown.hidden })
+      jsx42(FilterBar, { showErased: !!view.showErased, hidden: shown.hidden })
     ]
   });
 }
-var FileOpsPane = memo(FileOpsPaneImpl);
+function FileOpsPaneRoot() {
+  return jsxs37(Fragment, { children: [jsx42(FileOpsPaneImpl, {}, "pane"), jsx42(LLMOpsHost, {}, "llmops")] });
+}
+var FileOpsPane = memo(FileOpsPaneRoot);
 
 // desktop/src/plugin.entry.js
-import { jsx as jsx37 } from "react/jsx-runtime";
+import { jsx as jsx43 } from "react/jsx-runtime";
 import * as sdk9 from "@hermes/plugin-sdk";
 var plugin_entry_default = {
   id: "hermes-filetools",
@@ -9422,15 +10124,6 @@ var plugin_entry_default = {
     if (adapter2.hasEvents) {
       const off = sdk9.host.onEvent("tool.complete", handleToolComplete);
       adapter2.onDispose(typeof off === "function" ? off : () => {
-      });
-      const offInterim = sdk9.host.onEvent("message.interim", handleInterim);
-      adapter2.onDispose(typeof offInterim === "function" ? offInterim : () => {
-      });
-      const offDelta = sdk9.host.onEvent("message.delta", handleDelta);
-      adapter2.onDispose(typeof offDelta === "function" ? offDelta : () => {
-      });
-      const offStart = sdk9.host.onEvent("message.start", handleTurnStart);
-      adapter2.onDispose(typeof offStart === "function" ? offStart : () => {
       });
       const offEnd = sdk9.host.onEvent("message.complete", handleTurnEnd);
       adapter2.onDispose(typeof offEnd === "function" ? offEnd : () => {
@@ -9458,7 +10151,7 @@ var plugin_entry_default = {
         collapsible: true,
         revealAliases: ["filetools"]
       },
-      render: () => jsx37(FileOpsPane, {})
+      render: () => jsx43(FileOpsPane, {})
     });
     refresh();
   }

@@ -18,8 +18,11 @@ description: >
   line back. Each response includes
   a {read_file.file_tag}: short content hash tag for this file (may coincide with other
   files) — helps identify tool markers, not content; {block_open}/{block_close} carry the
-  same tag. Use "--line N --count N" in `flags` to page through large files
-  instead of reading everything at once.
+  same tag. Use "--line N --count N" in `flags` to page through large files;
+  for code the output may be slightly extended. For code and markdown files
+  use "--get-codeblock" first: "--get-codeblock --outline" for the table of
+  contents, then "--get-codeblock --line N --query" for the block you need.
+  Before the first read of a code file, call flags="--help" once.
 required: [path, flags]
 properties:
   path:
@@ -33,18 +36,26 @@ properties:
       itself. Space-separated
       modifiers written like a terminal command, values after a space and
       never with "=": "--line 400 --count 200". Paging: "--line N" starts at
-      that line (1-indexed, default 1), "--count N" reads at most N lines
-      (default 2000, max 2000; "--count 0" returns only the header — size,
-      encoding, {read_file.file_tag} — and no file content). "--numbered" prefixes every
+      that line (1-indexed, default 1); "--line 120,450 --count 30" reads 30
+      lines from each of those lines; "--count N" reads about N lines. One
+      answer carries at most {read_file.max_tokens} tokens. "--count 0" returns only
+      the header — size, encoding, {read_file.file_tag} — and no file content.
+      "--get-codeblock" is the mode for code and markdown — use it first
+      there, line ranges after.
+      "--get-codeblock --outline" gives the file's table of contents;
+      "--get-codeblock --line N --query" returns the block at line N; "--level
+      1" picks the outermost block around that line, "--level 2" the next one
+      inside, and so on. "--numbered" prefixes every
       returned line with its absolute number "N|"; without it the content is
       verbatim and occasional "{anchor_symbol} {anchor_word}: N" signposts stand in for lines that
       were already blank, so line numbers are still available (e.g. for
       patch's `line`) without a number on every line — the {block_open} header
-      states the exact range either way. "--force" reads a file that looks
-      binary or whose encoding can't be confirmed (refused by default, with a
-      reason). "--encoding NAME" (e.g. "--encoding cp866") decodes with
+      states the exact range either way. "--force" enforces the operation: it
+      overrides a refusal that comes with a reason (a file that looks binary,
+      an encoding that can't be confirmed, a block over the answer limit).
+      "--encoding NAME" (e.g. "--encoding cp866") decodes with
       exactly that codec, skipping auto-detection — use it when the
       auto-guessed encoding looks wrong. An unrecognised flag is refused by
-      name, never ignored. "--help" lists every flag with full descriptions
-      instead of reading anything — call it whenever a flag might exist for
-      what you need.
+      name, never ignored. "--help" lists every flag with full descriptions,
+      and the full guide to "--get-codeblock", instead of reading anything —
+      call it whenever a flag might exist for what you need.

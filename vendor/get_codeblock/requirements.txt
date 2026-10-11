@@ -1,0 +1,42 @@
+# get_codeblock — Python dependencies
+#
+# REQUIRES PYTHON >= 3.10. Floor set by the dependencies themselves (tree-sitter,
+# tree-sitter-css/-yaml/-python all declare Requires-Python >=3.10) and by our own
+# code (PEP 604 `str | None` in runtime-evaluated signatures, no `from __future__
+# import annotations`). Reference interpreter for a FULL test run: T:\AgentsWork\venv
+# (3.12) — the only one that has every grammar below.
+#
+# Python (.py), Markdown (.md) and plain text (.txt) work with ZERO third-party
+# packages. The packages below add tree-sitter powered navigation. Install them into
+# the SAME interpreter you run get_codeblock with:
+#
+#     <python> -m pip install -r requirements.txt
+#
+# get_codeblock checks these automatically: if a language you use needs a package
+# that isn't installed, it prints the exact install command for your interpreter
+# (instead of a traceback). Markdown/plain text need nothing from this list.
+
+tree-sitter>=0.23        # core parsing engine (needed by every grammar below)
+tree-sitter-cpp>=0.23    # C / C++   (.cpp .cc .cxx .c++ .hpp .hh .hxx .h .c)
+tree-sitter-c-sharp>=0.23 # C#        (.cs)
+tree-sitter-typescript>=0.23 # TypeScript / JavaScript (.ts .js .tsx .jsx)
+tree-sitter-css>=0.23    # CSS / SCSS / Sass (.css .scss .sass)
+tree-sitter-yaml>=0.6    # YAML (.yaml .yml)
+tree-sitter-bash>=0.23   # Shell (.sh .bash)
+tree-sitter-powershell>=0.26 # PowerShell (.ps1 .psm1)
+tree-sitter-python>=0.23 # Python (.py) — OPTIONAL UPGRADE, not a hard requirement:
+                         # without it `.py` falls back to stdlib `ast` (works, but
+                         # loses comments and file-level bands). The golden oracle's
+                         # OUTLINE expectations are recorded WITH this grammar, so a
+                         # full `test/check.py` run needs it — see env_check.py, where
+                         # LANGUAGE_MODULES["python"] stays [] on purpose to keep the
+                         # fallback silent-capable rather than a hard error.
+
+# tree-sitter-scss — выделенная SCSS-грамматика (`@mixin`/`@function`/`$var` без ~ERROR).
+# ОТКЛЮЧЕНО намеренно: единственный релиз на PyPI (1.0.0) отдаёт старый-ABI language(),
+# который переполняется с tree-sitter >= 0.26 (см. css_handler.py). Тяжёлый скачивающий
+# `tree-sitter-language-pack` — тоже мимо (докачивает грамматики по сети в рантайме).
+# Пока SCSS навигируется через tree-sitter-css (деградация, но структура читается).
+# КОГДА выйдет починенная версия — раскомментировать строку ниже и подключить в
+# reader/profiles/ (registry: .scss -> scss-профиль на этой грамматике).
+# tree-sitter-scss>=1.1   # SCSS/Sass (.scss .sass) — раскомментировать после фикса ABI

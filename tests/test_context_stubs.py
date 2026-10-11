@@ -20,7 +20,7 @@ import json
 
 import pytest
 
-from hermes_filetools.context_ctl import _alternation, _apply, _command, _select, _stubs
+from hermes_filetools.context_ctl import _alternation, _apply, _command, _stubs
 from hermes_filetools.context_ctl.engine import ContextCtlEngine
 from conftest import their_loader   # their get_messages_as_conversation (Plan26)
 
@@ -226,7 +226,6 @@ def test_m7_the_engine_never_touches_history(monkeypatch):
     """
     engine = ContextCtlEngine()
     engine._session_id = "s-engine-identity"
-    _select.write_selection("s-engine-identity", [{"tool_call_id": "call_1", "op": "0156"}])
     msgs = history()
     for focus in (None, "важная тема", _stubs.FOCUS_MARKER, "ctxdrop:0156"):
         assert engine.compress(msgs, focus_topic=focus, force=True) is msgs, focus
@@ -311,19 +310,45 @@ def one_live_session(monkeypatch):
     return engine, session
 
 
-def test_c1_no_arguments_changes_nothing(one_live_session):
-    _select.write_selection("s-cmd", [])
+def test_c1_no_arguments_changes_nothing(one_live_session, monkeypatch):
+    """Пустой ввод — только подсказка формата (файла выбора больше нет, Plan23)."""
+    called = []
+    monkeypatch.setattr(_command, "run_addresses", lambda *a, **kw: called.append(a) or {})
     out = _command.handle("")
-    assert "ничего не отмечено" in out
-    assert "отмечено:" not in out, "пустой ввод не должен рапортовать о выборе"
-    assert _select.read_selection("s-cmd")["items"] == []
+    assert "ИТОГ: ничего не задано" in out
+    assert "op0156" in out and "m0042" in out, "подсказка называет все три формы имени"
+    assert called == []
 
 
-def test_c1b_no_arguments_shows_the_price_of_applying(one_live_session):
-    _select.write_selection("s-cmd", [{"tool_call_id": "call_1", "op": "0156"}])
-    out = _command.handle("")
-    assert "отмечено: 1" in out and "0156" in out
-    assert "останется" in out
+def test_c1b_names_split_into_addresses_and_operation_numbers():
+    """`m` не шестнадцатеричная цифра — адрес от номера отличается без догадок."""
+    assert _command._split_names(["0156", "op0157", "M0042"]) == (
+        ["m0042"], ["0156", "0157"])
+
+
+def test_c1d_their_request_estimator_still_answers():
+    """Шов `ctxctl.request_token_estimator`: ИХ `estimate_request_tokens_rough` с нашими
+    слагаемыми даёт число, и промпт со схемами его увеличивают. Ноль значит «шов умер»: мы
+    печатаем его как «неизвестно», и без этого теста смерть была бы тихой (прежний тест шва
+    удалили в Plan23, полная проверка 2026-10-11 из-за этого не прогнала ни одного теста)."""
+    pytest.importorskip("agent.model_metadata")
+    msgs = [{"role": "user", "content": "привет " * 200}, {"role": "assistant", "content": "ok"}]
+    bare = _apply._estimate(object(), msgs)
+    agent = type("A", (), {"_cached_system_prompt": "system " * 500,
+                           "tools": [{"type": "function", "function": {"name": "t", "parameters": {}}}]})()
+    full = _apply._estimate(agent, msgs)
+    assert bare > 0, "their estimator returned 0 — renamed or its signature changed"
+    assert full > bare, "the system prompt and the tool schemas must count"
+
+
+def test_c1c_the_command_goes_through_the_address_door(one_live_session, monkeypatch):
+    """Один транспорт: команда зовёт ту же дверь, что панель, номера — отдельным списком."""
+    seen = []
+    monkeypatch.setattr(_command, "run_addresses",
+                        lambda sid, engine, addrs, op, ops=(): seen.append((addrs, op, ops))
+                        or {"lines": ["ИТОГ: тест"]})
+    _command.handle("0156, op0157 m0003")
+    assert seen == [(["m0003"], "content", ["0156", "0157"])]
 
 
 def test_c2_the_command_names_the_session_it_chose(one_live_session):
@@ -510,7 +535,6 @@ def test_c8_every_answer_ends_with_a_verdict_line(monkeypatch, one_live_session)
     """
     monkeypatch.setattr(_apply, "commit_replacement",
                         lambda session, agent, rows, memory=None, **kw: (True, "применено"))
-    _select.write_selection("s-cmd", [])
     for args in ("", "0156", "ffff", "0156,ffff"):
         out = _command.handle(args)
         assert out.startswith("── ctx-drop ──"), args
@@ -862,22 +886,6 @@ def test_c10d_the_guard_does_not_go_blind_when_something_is_erased(one_live_sess
     assert "call_2" in why or "ответ 2" in why, why
 
 
-def test_c10e_erase_reports_the_rows_it_removed(one_live_session):
-    """Отчёт механизма обязан НАЗЫВАТЬ удалённое — иначе предохранителю нечего пропускать."""
-    msgs = [
-        {"role": "assistant", "content": "", "tool_calls": [
-            {"id": "call_1", "type": "function",
-             "function": {"name": "read_file", "arguments": "{}"}}]},
-        {"role": "tool", "tool_call_id": "call_1", "tool_name": "read_file",
-         "content": "тело"},
-    ]
-    _out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "call_1", "op": "0001"}])
-    removed = report["removed"]
-    # Обе половины пары: и tool-строка, и опустевшая оболочка хода.
-    assert {m.get("role") for m in removed} == {"assistant", "tool"}
-    assert any(m.get("tool_call_id") == "call_1" for m in removed)
-
-
 def test_c10f_drop_content_declares_nothing_removed(one_live_session):
     """Механизм 1 строк не удаляет — значит и амнистии просить не должен."""
     body = chr(10).join(["# Size: 1 lines", "# ○○○", "тело"])
@@ -959,132 +967,6 @@ def test_c14_a_divergence_between_database_and_memory_is_named(one_live_session)
     assert "расхождение" in out and "снимок памяти неполон" in out
 
 
-# --- E: механизм 2, `erase tool` ------------------------------------------------------
-#
-# Единица — ПАРА (вызов + результат), а не весь мини-ход. Это исправление владельца
-# 2026-09-09: я утверждал, что из «провайдер требует результат на каждый tool_call» следует
-# «удалять можно только батч целиком». Не следует — следует лишь то, что удалять надо ОБЕ
-# половины пары, переписав массив `tool_calls` у строки ассистента.
-
-
-def _turn(call_ids, content="", args_by_id=None):
-    """Мини-ход: одна строка ассистента с N вызовами и по одной tool-строке на каждый."""
-    args_by_id = args_by_id or {}
-    calls = [{"id": cid, "type": "function",
-              "function": {"name": "read_file",
-                           "arguments": args_by_id.get(cid, '{"path": "/w/x.py"}')}}
-             for cid in call_ids]
-    msgs = [{"role": "assistant", "content": content, "tool_calls": calls}]
-    for cid in call_ids:
-        msgs.append({"role": "tool", "tool_call_id": cid, "tool_name": "read_file",
-                     "content": f"# Operation ID: {cid}\n# ○○○\nbody of {cid}"})
-    return msgs
-
-
-def test_e1_a_pair_goes_and_the_siblings_stay():
-    """Удаляется ровно названная пара. Соседи по ходу остаются — батч тут не единица."""
-    msgs = _turn(["c1", "c2", "c3"])
-    out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "c2", "op": "0002"}])
-
-    assert [m["role"] for m in out] == ["assistant", "tool", "tool"]
-    assert [c["id"] for c in out[0]["tool_calls"]] == ["c1", "c3"], "переписан не тот массив"
-    assert [m["tool_call_id"] for m in out if m["role"] == "tool"] == ["c1", "c3"]
-    assert report["problems"] == [], "пара не должна рассогласоваться"
-    assert [r["op"] for r in report["applied"]] == ["0002"]
-
-
-def test_e2_the_pair_is_gone_from_both_halves_not_stubbed():
-    """След не остаётся ВОВСЕ — ни заголовка, ни штампа состояния (решение владельца)."""
-    msgs = _turn(["c1"])
-    out, _ = _stubs.erase_tools(msgs, [{"tool_call_id": "c1", "op": "0001"}])
-    text = json.dumps(out, ensure_ascii=False)
-    assert "c1" not in text and "Operation ID" not in text
-    assert "removed_from_context" not in text, "это не заглушка, состояние ставить некуда"
-
-
-def test_e3_an_emptied_shell_with_text_survives_without_the_key():
-    """Слова модели — её собственные, человек выбирал операцию, а не реплику.
-
-    И ключ убирается ЦЕЛИКОМ, не в `[]`: на половине памяти гейтвея нет writer'а, который
-    превратил бы пустой список в NULL, и `tool_calls: []` уехал бы к провайдеру как есть.
-    """
-    msgs = _turn(["c1"], content="Сейчас прочитаю файл.")
-    out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "c1", "op": "0001"}])
-    assert len(out) == 1 and out[0]["role"] == "assistant"
-    assert out[0]["content"] == "Сейчас прочитаю файл."
-    assert "tool_calls" not in out[0], "пустой массив вместо снятого ключа"
-    assert len(report["shells_emptied"]) == 1
-    assert report["shells_removed"] == []
-
-
-def test_e4_an_emptied_shell_without_text_goes_too():
-    """Ни вызовов, ни текста — это их же «otherwise-empty message», такой ход не отправить."""
-    msgs = _turn(["c1"], content="")
-    out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "c1", "op": "0001"}])
-    assert out == []
-    assert len(report["shells_removed"]) == 1
-    assert report["shells_emptied"] == []
-
-
-def test_e4b_whitespace_only_text_is_not_text():
-    msgs = _turn(["c1"], content="   \n  ")
-    out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "c1", "op": "0001"}])
-    assert out == [] and len(report["shells_removed"]) == 1
-
-
-def test_e5_savings_count_both_halves():
-    """У записи всё содержимое лежит в аргументах — отчёт по одному ответу показал бы мало."""
-    big = '{"path": "/w/x.py", "content": "' + "x" * 5000 + '"}'
-    msgs = _turn(["c1"], args_by_id={"c1": big})
-    _out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "c1", "op": "0001"}])
-    row = report["applied"][0]
-    assert row["saved_args"] == len(big)
-    assert row["saved_result"] > 0
-    assert row["saved"] == row["saved_args"] + row["saved_result"]
-    assert report["chars_saved"] == row["saved"]
-    assert row["chars_after"] == 0, "после удаления не остаётся ничего"
-
-
-def test_e6_an_unknown_address_is_reported_not_guessed():
-    msgs = _turn(["c1"])
-    out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "нет-такого", "op": "0009"}])
-    assert out == msgs, "ничего не тронуто"
-    assert report["not_found"] == ["нет-такого"]
-    assert report["applied"] == []
-
-
-def test_e7_a_half_pair_is_finished_off_not_left_orphaned():
-    """Результат без вызова (разрыв был ДО нас) — удаление его только починит."""
-    msgs = [{"role": "tool", "tool_call_id": "c9", "tool_name": "read_file", "content": "тело"}]
-    out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "c9", "op": "0009"}])
-    assert out == []
-    assert report["problems"] == []
-    assert [r["op"] for r in report["applied"]] == ["0009"]
-
-
-def test_e8_a_lint_hole_that_predates_us_is_reported():
-    """Мы дыр не создаём; если линт что-то нашёл — это было до нас, и молчать нельзя."""
-    msgs = _turn(["c1", "c2"])
-    del msgs[2]  # результат c2 пропал сам, до нас
-    _out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "c1", "op": "0001"}])
-    assert report["problems"], "разрыв обязан быть назван"
-    assert report["problems"][0]["tool_call_id"] == "c2"
-
-
-def test_e9_erasing_every_call_of_a_multi_tool_turn_takes_the_shell():
-    msgs = _turn(["c1", "c2"], content="")
-    out, report = _stubs.erase_tools(
-        msgs, [{"tool_call_id": "c1", "op": "0001"}, {"tool_call_id": "c2", "op": "0002"}])
-    assert out == []
-    assert sorted(report["shells_removed"][0]["calls"]) == ["c1", "c2"]
-    assert len(report["applied"]) == 2
-
-
-def test_e10_the_mechanism_is_named_in_the_report():
-    _out, report = _stubs.erase_tools(_turn(["c1"]), [{"tool_call_id": "c1"}])
-    assert report["mechanism"] == "tool"
-
-
 def test_c15_the_api_content_check_survives_a_shortened_list():
     """Сверка сайдкара по АДРЕСУ, а не по позиции: `erase tool` укорачивает список.
 
@@ -1126,22 +1008,6 @@ def test_c15c_an_unmatchable_row_loses_its_sidecar():
     assert "api_content" not in out[0]
 
 
-def test_e11_erase_reports_an_address_with_no_row_as_absent():
-    """Адрес нашёлся, строки нет — ДОКАЗАННОЕ отсутствие, и панель снимает по нему карточку."""
-    msgs = [{"role": "tool", "tool_call_id": "c1", "tool_name": "read_file", "content": "тело"}]
-    _out, report = _stubs.erase_tools(
-        msgs, [{"tool_call_id": "c1", "op": "0001"},
-               {"tool_call_id": "c-gone", "op": "0009"}])
-    assert report["absent"] == ["0009"], report
-    assert [r["op"] for r in report["applied"]] == ["0001"]
-
-
-def test_e11b_an_item_without_an_op_is_not_reported_as_absent():
-    """Снимать карточку нечем: без номера её не назвать. Пустых строк в списке не держим."""
-    _out, report = _stubs.erase_tools([], [{"tool_call_id": "c-gone", "op": ""}])
-    assert report["absent"] == []
-
-
 def test_e11c_drop_content_never_reports_absent():
     """Механизм 1 карточек не снимает — значит и списка на снятие у него быть не должно."""
     _out, report = _stubs.apply_stubs([], [{"tool_call_id": "c-gone", "op": "0009"}])
@@ -1178,7 +1044,7 @@ def test_c16c_the_report_carries_an_english_summary_for_the_panel(one_live_sessi
     """Панели — короткая английская фраза ИЗ ФАКТОВ, а не пересказ русской прозы."""
     engine, _session = one_live_session
     monkeypatch.setattr(_apply, "commit_replacement", lambda *a, **kw: (True, "применено"))
-    report = _command.run(engine._session_id, engine, ["0156"])
+    report = _command.run_addresses(engine._session_id, engine, [], "content", ops=["0156"])
     assert report["ok"] is True
     summary = report["summary"]
     assert summary.startswith("dropped "), summary
@@ -1192,8 +1058,8 @@ def test_c16d_every_outcome_has_a_summary_and_it_is_english(one_live_session, mo
     monkeypatch.setattr(_apply, "commit_replacement",
                         lambda *a, **kw: (False, "их линт отказал"))
     for ops, mode in ((["0156"], "content"), (["нет-такого"], "content"),
-                      (["0156"], "tool"), (["0156"], "turn")):
-        report = _command.run(engine._session_id, engine, ops, mode)
+                      (["0156"], "erase"), (["0156"], "shred")):
+        report = _command.run_addresses(engine._session_id, engine, [], mode, ops=ops)
         summary = report.get("summary") or ""
         assert summary, (ops, mode)
         assert not any("а" <= ch.lower() <= "я" for ch in summary), (mode, summary)
@@ -1210,11 +1076,11 @@ def test_c17_erase_writes_a_tombstone(one_live_session, monkeypatch):
     monkeypatch.setattr(_apply, "commit_replacement", lambda *a, **kw: (True, "применено"))
     written = []
     monkeypatch.setattr(_stubs, "note_erased",
-                        lambda session, ops, by="erase tool": written.append((session, list(ops), by))
+                        lambda session, ops, by="erase": written.append((session, list(ops), by))
                         or len(list(ops)))
-    report = _command.run(engine._session_id, engine, ["0156"], "tool")
+    report = _command.run_addresses(engine._session_id, engine, [], "erase", ops=["0156"])
     assert report["ok"] is True
-    assert written == [("s-cmd", ["0156"], "erase tool")], written
+    assert written == [("s-cmd", ["0156"], "erase")], written
 
 
 def test_c17b_drop_content_leaves_no_tombstone(one_live_session, monkeypatch):
@@ -1224,7 +1090,7 @@ def test_c17b_drop_content_leaves_no_tombstone(one_live_session, monkeypatch):
     calls = []
     monkeypatch.setattr(_stubs, "note_erased",
                         lambda *a, **kw: calls.append(a) or 0)
-    _command.run(engine._session_id, engine, ["0156"], "content")
+    _command.run_addresses(engine._session_id, engine, [], "content", ops=["0156"])
     assert calls == []
 
 
@@ -1234,7 +1100,7 @@ def test_c17c_a_refused_commit_writes_no_tombstone(one_live_session, monkeypatch
     monkeypatch.setattr(_apply, "commit_replacement", lambda *a, **kw: (False, "их линт отказал"))
     calls = []
     monkeypatch.setattr(_stubs, "note_erased", lambda *a, **kw: calls.append(a) or 0)
-    report = _command.run(engine._session_id, engine, ["0156"], "tool")
+    report = _command.run_addresses(engine._session_id, engine, [], "erase", ops=["0156"])
     assert report["ok"] is False
     assert calls == []
 
@@ -1248,7 +1114,7 @@ def test_c17d_an_unwritable_ledger_does_not_undo_the_erase(one_live_session, mon
         raise OSError("disk full")
 
     monkeypatch.setattr("hermes_filetools.file_ops._ledger.note_erased", boom)
-    report = _command.run(engine._session_id, engine, ["0156"], "tool")
+    report = _command.run_addresses(engine._session_id, engine, [], "erase", ops=["0156"])
     assert report["ok"] is True, "надгробие — свидетельство, а не сама операция"
     assert report["tombstones"] == 0
 
@@ -1275,85 +1141,6 @@ def test_c18_a_message_record_does_not_shadow_the_operation_in_the_index(tmp_pat
     assert index["op:0001"].get("path") == "/w/x.py"
 
 
-# --------------------------------------------------------------------------
-# T1-T4 — механизм 3, `erase turn` (Plan14-Task06)
-#
-# Шаг, а не полный turn: реплика ассистента со ВСЕМИ её вызовами и ответами.
-# Полный turn в их смысле кончается возвратом управления человеку — это другое,
-# и владелец имеет в виду именно шаг (поправка 1 к контракту записей).
-# --------------------------------------------------------------------------
-
-def step_history(*call_ids, prose="думаю", tail=True):
-    calls = [{"id": cid, "type": "function",
-              "function": {"name": "read_file",
-                           "arguments": json.dumps({"path": f"/x/{cid}.py"})}}
-             for cid in call_ids]
-    out = [{"role": "user", "content": "сделай"},
-           {"role": "assistant", "content": prose, "tool_calls": calls}]
-    out += [{"role": "tool", "tool_call_id": cid, "content": f"ответ {cid}"}
-            for cid in call_ids]
-    if tail:
-        out.append({"role": "assistant", "content": "готово"})
-    return out
-
-
-def test_t1_one_named_call_takes_the_whole_step():
-    """Отметка на ОДНОЙ операции уносит весь шаг — решение владельца."""
-    msgs = step_history("c1", "c2", "c3")
-    out, report = _stubs.erase_turn(msgs, [{"tool_call_id": "c2", "op": "0002"}])
-    assert [m["role"] for m in out] == ["user", "assistant"]
-    assert out[-1]["content"] == "готово", "соседний шаг не тронут"
-    assert sorted(report["widened"]) == ["c1", "c3"]
-    assert report["mechanism"] == "turn"
-    assert report["problems"] == []
-
-
-def test_t2_the_prose_of_the_step_goes_with_it():
-    """У `erase tool` слова модели остаются: человек выбрал операцию. Здесь он
-    выбрал ход, а проза шага — его часть."""
-    msgs = step_history("c1", prose="сейчас посмотрю файл")
-    out, report = _stubs.erase_turn(msgs, [{"tool_call_id": "c1"}])
-    assert not any(m.get("content") == "сейчас посмотрю файл" for m in out)
-    assert report["prose_chars"] == len("сейчас посмотрю файл")
-    assert report["shells_emptied"] == []
-    assert report["shells_removed"] and report["shells_removed"][0]["prose_chars"] > 0
-
-
-def test_t2b_erase_tool_still_keeps_the_prose():
-    """Проверка, что флаг не поменял поведение механизма 2 заодно."""
-    msgs = step_history("c1", prose="сейчас посмотрю файл")
-    out, report = _stubs.erase_tools(msgs, [{"tool_call_id": "c1"}])
-    assert any(m.get("content") == "сейчас посмотрю файл" for m in out)
-    assert report["prose_chars"] == 0
-    assert report["shells_emptied"] and not report["shells_removed"]
-
-
-def test_t3_a_neighbouring_step_is_not_widened_into():
-    """Расширение идёт по `tool_calls` СВОЕЙ строки, а не по соседству."""
-    msgs = step_history("c1", tail=False) + step_history("c9", tail=False)[1:]
-    out, report = _stubs.erase_turn(msgs, [{"tool_call_id": "c1"}])
-    assert report["widened"] == []
-    assert any(m.get("tool_call_id") == "c9" for m in out)
-    assert report["problems"] == []
-
-
-def test_t4_the_removed_rows_are_named_for_the_commit_guard():
-    """Предохранитель коммита сверяет наш список с активными строками и отказывает
-    при нехватке. Удаление СОЗДАЁТ нехватку, и отличить его от потери можно ровно
-    одним способом — назвать удалённое явно."""
-    msgs = step_history("c1", "c2")
-    out, report = _stubs.erase_turn(msgs, [{"tool_call_id": "c1"}])
-    removed = report["removed"]
-    assert len(removed) == 3, "две тул-строки и оболочка шага"
-    assert all(m not in out for m in removed)
-
-
-def test_t4b_nothing_named_nothing_erased():
-    msgs = step_history("c1")
-    out, report = _stubs.erase_turn(msgs, [])
-    assert out == msgs and report["applied"] == [] and report["widened"] == []
-
-
 # ── O1..O7: операции над m-АДРЕСАМИ (Plan16-Task08, `_command.run_addresses`) ──────────────
 #
 # Лента фикстуры: m0001 user · m0002 assistant «читаю» + call_1 · m0003 tool call_1 ·
@@ -1361,8 +1148,8 @@ def test_t4b_nothing_named_nothing_erased():
 
 @pytest.fixture
 def by_address(monkeypatch):
-    from hermes_filetools.context_ctl import _compact
-    monkeypatch.setattr(_compact, "_index",
+    from hermes_filetools.context_ctl import _compact, _insert
+    monkeypatch.setattr(_insert, "_index",
                         lambda session_id, rows: {f"m{i + 1:04d}": row for i, row in enumerate(rows)})
     monkeypatch.setattr(_stubs, "index_messages", lambda session_id, rows: {})
 

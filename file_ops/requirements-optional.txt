@@ -1,0 +1,2 @@
+# Moved to the plugin root - see ../requirements.txt (same optional-degrades-
+# cleanly-without-it contract, just consolidated into one file).

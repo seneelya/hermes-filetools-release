@@ -1,0 +1,36 @@
+--get-codeblock: code and markdown by BLOCKS (functions, classes, sections) instead of
+line numbers. Use it first there, line ranges after. Works for
+.py .ts .js .tsx .jsx .cs .c .cpp .h .css .scss .md .yaml .sh .ps1 .bat .txt; any other
+format is refused with a reason - read it with --line/--count.
+
+What you want                                   flags
+"What is in this file? Where do I go?"          --get-codeblock --outline
+"The text of the block at line N"               --get-codeblock --line N --query
+"Where does line N sit?" (the blocks around it) --get-codeblock --line N
+"I know the NAME, not the line"                 --get-codeblock --name NAME
+"Several blocks in one call"                    --get-codeblock --line A,B,C --query
+"The map of just the block at line N"           --get-codeblock --line N --outline
+"Its parent block, not the innermost one"       add --ancestor-level 1 (2 = grandparent)
+"The block at depth K counted from the top"     add --level K (1 = top level)
+"A big file - only the top levels of the map"   --get-codeblock --outline --level 2
+
+Usual path: --outline first, find the line, then --line N --query.
+
+How to read the answers:
+- A map (table of contents, the blocks around a line, name candidates) comes under a
+  "Map:" line. It is NOT file text: no {block_open} frame, nothing in it to copy into a
+  file. Each row: depth, [first-last line], the block's name. A "." instead of a depth =
+  an unnamed band (imports, constants, comments).
+- --outline shows an overview: its first line says the full depth and how many blocks
+  each level has ("max depth 3, L1=1 L2=5 L3=1, showing levels 1..2"). --level N shows
+  exactly N levels.
+- --query returns file text in the same {block_open}/{block_close} frame as any read.
+  Several blocks that touch merge into one. A block that is too small to say anything
+  (a lone import line) grows with its neighbours, and a Hint line says so; --force
+  returns exactly the block asked for.
+- A block over the answer limit is not cut in half: you get its map instead - read it in
+  parts by --line, or add --force for the whole block.
+- --name: an exact match returns that block; otherwise the closest names come as a map
+  with their lines - then use --line N --query. "*" lists a family: --name "parse_*".
+- --level and --ancestor-level pick WHICH block at --line; with --outline and no --line,
+  --level is how deep the map goes.

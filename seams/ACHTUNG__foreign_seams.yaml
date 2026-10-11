@@ -27,7 +27,21 @@
 # yet — write that down instead of a guess.
 
 meta:
-  # Rebased 2026-10-06 to b79c45bd3e after the live update from 54bc5e509c
+  # Rebased 2026-10-11 to c0ef5af520 after the live update from b79c45bd3e
+  # (2556 commits; live HEAD = the audited TO exactly). Prepared by
+  # HowTo__PrepareForUpdate.md: no risks, 3 ATTENTION (forced_compress_entry:
+  # new optional kwarg overflow_reason; patch_result_has_no_counter: new
+  # private _writes, still no counter; aux_task_registration: rebuilt inside,
+  # new optional inherit_from) - all hold. The panel's SDK surface (ui.*, 10
+  # seams) was added this day on b79c45bd3e and checked by hand on TO by the
+  # agent: all 9 exports and the react/sdk shims unchanged. Full check found
+  # its OWN bug: ctxctl.request_token_estimator pointed at a test deleted in
+  # Plan23, pytest exited 4 with nothing run, and the verdict still said
+  # "tests passed". Now a test that did not run is FAIL (check.run /
+  # run_tests), the seam has a new test (test_c1d). Green after: 68 OK +
+  # 2 TEST-OK, 179 tests; no count moved.
+  #
+  # Before that: rebased 2026-10-06 to b79c45bd3e after the live update from 54bc5e509c
   # (1567 commits). Prepared by HowTo__PrepareForUpdate.md up to 79af3f6cea:
   # no risks, 3 seams reviewed (forced_compress_entry: new kwarg
   # snapshot_is_current, None = current; alternation_repair_count: new
@@ -76,8 +90,8 @@ meta:
   # bridge.tool_stubs's tuple shape changed (name dropped, was redundant
   # with the dict key) - file_ops/_execute_code_bridge.py now detects the
   # shape instead of assuming it.
-  baseline_taken: "2026-10-06"
-  baseline_head: "b79c45bd3e"
+  baseline_taken: "2026-10-11"
+  baseline_head: "c0ef5af520"
   # Fallback only. The checker resolves the live checkout itself:
   # HERMES_AGENT_ROOT, else <HERMES_HOME>/hermes-agent (installer layout).
   prod_root: "Y:/Hermess/body/hermes-agent"
@@ -502,27 +516,6 @@ seams:
       sidecar's rules changed - re-read them, do not assume it got simpler.
     asserted_by: tests/test_context_stubs.py::test_c13_a_rewritten_row_loses_its_api_content_sidecar
 
-  - id: ctxctl.text_token_estimator
-    level: 4
-    file: agent/model_metadata.py
-    kind: symbol
-    symbol: def estimate_tokens_rough
-    baseline_count: 1
-    we_do: >-
-      Price ONE operation for the checkbox next to it (dashboard/plugin_api.py
-      ::_tokens_of): the weight of its own two halves, answer plus call
-      arguments. Deliberately the same function the totals go through, so the
-      number under a checkbox and the number in the apply report cannot
-      disagree - a panel that prices an operation differently from the command
-      that removes it would make the human distrust both.
-    breaks: >-
-      Renamed -> we fall back to their documented non-CJK rule (ceil(UTF-8
-      bytes / 4)) in the same function, so a number is still shown; it may
-      drift from their totals if they recalibrate the estimator. NOT
-      chars-over-4: for Cyrillic that halves the figure, and under-pricing what
-      the human is weighing is the wrong way to be wrong.
-    asserted_by: tests/test_ops_route.py::test_o8c_the_estimate_falls_back_when_upstream_is_missing
-
   - id: ctxctl.request_token_estimator
     level: 4
     file: agent/model_metadata.py
@@ -540,7 +533,7 @@ seams:
       silent: a confident-looking 0 is worse than an absent figure, which is
       why the estimator returning 0 is treated as "unknown" everywhere it is
       printed.
-    asserted_by: tests/test_context_stubs.py::test_c1b_no_arguments_shows_the_price_of_applying
+    asserted_by: tests/test_context_stubs.py::test_c1d_their_request_estimator_still_answers
 
   - id: data.hermes_home
     level: 2
@@ -929,6 +922,136 @@ seams:
       execute_code's description while still being dispatchable.
     asserted_by: null
 
+  - id: ui.sdk_message_text_content
+    level: 2
+    file: apps/desktop/src/sdk/index.ts
+    kind: symbol
+    symbol: MessageTextContent
+    baseline_count: 1
+    we_do: >-
+      `desktop/src/markdown.js` renders markdown with the chat's own message
+      renderer `sdk.MessageTextContent({text, media: false})` (added
+      2026-10-11): the LLMOps window's book view and the mirror's assistant
+      replies. Feature-detected: missing -> bare `sdk.Streamdown`, missing
+      too -> plain text.
+    breaks: >-
+      Renamed or dropped -> nothing fails; the panel quietly falls back to
+      bare Streamdown (worse code blocks) or our `desktop/src/md-lite.js`
+      (simpler code blocks, no highlighting). Props changed (e.g.
+      `media` gone, `text` renamed) -> an empty or raw block. Look at the
+      book view after an update; no test of ours can see this.
+    asserted_by: null
+
+  - id: ui.sdk_streamdown
+    level: 2
+    file: apps/desktop/src/sdk/index.ts
+    kind: symbol
+    symbol: Streamdown
+    baseline_count: 2
+    we_do: >-
+      Second link of `desktop/src/markdown.js` (bare markdown, when MessageTextContent is gone).
+    breaks: >-
+      Feature-detected where used -> the piece quietly disappears or falls back; nothing raises. Look at the panel after an update. Without it AND MessageTextContent our md-lite renders.
+    asserted_by: null
+
+  - id: ui.sdk_status_dot
+    level: 2
+    file: apps/desktop/src/sdk/index.ts
+    kind: symbol
+    symbol: StatusDot
+    baseline_count: 4
+    min_count: 1
+    we_do: >-
+      Status dots in the panel (`sdk.StatusDot`).
+    breaks: >-
+      Feature-detected where used -> the piece quietly disappears or falls back; nothing raises. Look at the panel after an update.
+    asserted_by: null
+
+  - id: ui.sdk_scroll_area
+    level: 2
+    file: apps/desktop/src/sdk/index.ts
+    kind: symbol
+    symbol: ScrollArea
+    baseline_count: 1
+    we_do: >-
+      Scroll containers of panel panes (`sdk.ScrollArea`).
+    breaks: >-
+      Feature-detected where used -> the piece quietly disappears or falls back; nothing raises. Look at the panel after an update.
+    asserted_by: null
+
+  - id: ui.sdk_empty_state
+    level: 2
+    file: apps/desktop/src/sdk/index.ts
+    kind: symbol
+    symbol: EmptyState
+    baseline_count: 2
+    min_count: 1
+    we_do: >-
+      Empty-pane placeholder (`sdk.EmptyState`).
+    breaks: >-
+      Feature-detected where used -> the piece quietly disappears or falls back; nothing raises. Look at the panel after an update.
+    asserted_by: null
+
+  - id: ui.sdk_copy_button
+    level: 2
+    file: apps/desktop/src/sdk/index.ts
+    kind: symbol
+    symbol: CopyButton
+    baseline_count: 1
+    we_do: >-
+      Copy buttons (`sdk.CopyButton`).
+    breaks: >-
+      Feature-detected where used -> the piece quietly disappears or falls back; nothing raises. Look at the panel after an update.
+    asserted_by: null
+
+  - id: ui.sdk_use_value
+    level: 2
+    file: apps/desktop/src/sdk/index.ts
+    kind: symbol
+    symbol: "useStore as useValue"
+    baseline_count: 1
+    we_do: >-
+      Every panel atom is read through `sdk.useValue` (nanostores `useStore`).
+    breaks: >-
+      Imported at the panel's top level -> the WHOLE panel fails to load (the plugin's desktop half is gone). Loud.
+    asserted_by: null
+
+  - id: ui.sdk_atom
+    level: 2
+    file: apps/desktop/src/sdk/index.ts
+    kind: symbol
+    symbol: "export { atom"
+    baseline_count: 1
+    we_do: >-
+      Panel state atoms are made with `sdk.atom` (nanostores).
+    breaks: >-
+      Imported at the panel's top level -> the WHOLE panel fails to load (the plugin's desktop half is gone). Loud.
+    asserted_by: null
+
+  - id: ui.sdk_host
+    level: 2
+    file: apps/desktop/src/sdk/index.ts
+    kind: symbol
+    symbol: "export const host"
+    baseline_count: 1
+    we_do: >-
+      `sdk.host`: `onEvent` (live tool events) and `state.focusedStoredSessionId` (which chat the panel follows).
+    breaks: >-
+      Gone or reshaped -> the panel follows no session and hears no events; adapter.js guards the calls, so it is a dead panel, not a crash.
+    asserted_by: null
+
+  - id: ui.runtime_react_shim
+    level: 2
+    file: apps/desktop/src/sdk/runtime.ts
+    kind: symbol
+    symbol: __HERMES_REACT__
+    baseline_count: 2
+    we_do: >-
+      Our bundle imports bare `react`, `react/jsx-runtime`, `@hermes/plugin-sdk`; the runtime loader maps them to shims of their live namespaces (`sdkImportMap`).
+    breaks: >-
+      Imported at the panel's top level -> the WHOLE panel fails to load (the plugin's desktop half is gone). Loud. Same for __HERMES_REACT_JSX__ / __HERMES_PLUGIN_SDK__ (one check stands for the scheme).
+    asserted_by: null
+
   # ---- level 3: the dispatch contract ----
 
   - id: dispatch.coerce_tool_args
@@ -995,8 +1118,8 @@ seams:
       tools.approval_context FIRST, then tools.approval (older Hermes).
     breaks: >-
       Renamed -> the read ledger keeps writing entries, just without
-      tool_call_id, and /reads starts reporting `unknown` instead of the real
-      state. No error anywhere above debug level. Functional probe: step 3b of
+      tool_call_id, and /context-state starts reporting `unknown` instead of
+      the real state (and the Mirror chip loses the operation's `msg`). No error anywhere above debug level. Functional probe: step 3b of
       HowTo__Verify_after_hermes_update.md.
       IT ALREADY HAPPENED, 2026-09-08, AND THIS ENTRY DID NOT SAVE US - read
       this before trusting a green run. Upstream moved the vars into

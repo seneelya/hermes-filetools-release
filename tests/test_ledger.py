@@ -315,7 +315,8 @@ def test_l10_read_records_the_file_length_not_the_slice(home):
     bug: a read of 12-20 says nothing about how long the file is, so without
     `total` the bar had no denominator at all."""
     out = view_file_new_core.view_file_tool_new(
-        path=str(EDGE_PY), flags="--line 2 --count 3", session_id="s")
+        path=str(EDGE_PY), flags="--line 2 --count 3", session_id="s",
+        align_blocks=False)    # exactly 3 lines: block alignment (Plan30) is not this test
     assert not out.startswith("ERROR")
 
     entry = _ledger.read_ledger("s")[0]
@@ -826,3 +827,47 @@ def test_l10j_two_instances_over_one_file_never_repeat_an_address(home):
         _sys.modules.pop(name, None)
     assert handed == ["m0001", "m0002", "m0003", "m0004"]
     assert len(set(handed)) == 4
+
+
+def test_l10k_parallel_writers_lose_no_record_and_share_no_number(home):
+    """Live 2026-10-06 (`deferred/20`): five parallel `read_file` in one millisecond, mode
+    `"a"` is seek-then-write on Windows, `0042` landed on `0041` and the record was lost.
+    Parallel calls and subagents are threads — both instances of this module (package and
+    by path) must take ONE lock, or the panel's writes still tear the engine's."""
+    import contextvars
+    import importlib.util
+    import sys as _sys
+    import threading
+    _ledger._counters.clear()
+    name = "test_third_ledger_instance"
+    spec = importlib.util.spec_from_file_location(name, Path(_ledger.__file__))
+    twin = importlib.util.module_from_spec(spec)
+    _sys.modules[name] = twin
+    try:
+        spec.loader.exec_module(twin)
+        assert twin._WRITE_LOCK is _ledger._WRITE_LOCK
+        ops, msgs = [], []
+        start = threading.Barrier(16)
+
+        def worker(mod, n):
+            start.wait()
+            for i in range(25):
+                op = _ledger.next_op("s11")   # op numbers: the engine's instance only (`_bump`)
+                ops.append(op)
+                mod.note_op(text="x" * 300, path=f"/w/{n}_{i}.md", session="s11", op=op)
+                msgs.append(mod.next_msg("s11"))
+
+        # The home override is a context variable: a bare thread would not see it.
+        threads = [threading.Thread(target=contextvars.copy_context().run,
+                                    args=(worker, _ledger if n % 2 else twin, n))
+                   for n in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        _sys.modules.pop(name, None)
+    lines = _ledger.ledger_path("s11").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 400 and all(json.loads(line) for line in lines), "a torn line"
+    assert len(set(ops)) == 400 and len(set(msgs)) == 400
+    assert sorted(e["op"] for e in _ledger.read_ledger("s11")) == sorted(ops)

@@ -142,6 +142,24 @@ def flag_int(parsed: dict, name: str, default: int) -> int:
         return _raise_needs_number(name, raw)
 
 
+def flag_int_list(parsed: dict, name: str, default: int) -> list:
+    """`{'line': '120,450'}` -> [120, 450]; a single number is a one-element list (Plan30:
+    `--line` takes several points). Junk anywhere in the list raises FlagError, same as
+    `flag_int` — one bad element must not silently drop out of the read."""
+    raw = parsed.get(name)
+    if raw is None:
+        return [default]
+    if raw is True:
+        return [_raise_needs_number(name)]
+    parts = [p.strip() for p in str(raw).split(",")]
+    try:
+        out = [int(p) for p in parts if p]
+    except ValueError:
+        raise FlagError(f'--{name} expects a number or numbers separated by commas, '
+                        f'e.g. "--{name} 20" or "--{name} 20,140". got "{raw}".') from None
+    return out or [_raise_needs_number(name, raw)]
+
+
 def _raise_needs_number(name: str, raw=None) -> int:
     got = "" if raw is None else f' got "{raw}".'
     raise FlagError(f'--{name} expects a number, e.g. "--{name} 20".{got}')

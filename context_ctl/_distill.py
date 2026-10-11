@@ -23,6 +23,9 @@ import threading
 import time
 
 from . import _apply, _compact, _cut, _llm, _md, _pairs, _progress, _prompts, _render, _settings, _state
+from . import _insert, _questionnaires, _scenario
+# Названия списком и «главные/филер» живут в реестре вместе с вопросами сессии (`Plan32.1`).
+from ._questionnaires import resolve_split, titles_block as _titles_block  # noqa: F401
 
 NL_ = chr(10)
 
@@ -48,12 +51,6 @@ _thread_lock = threading.Lock()
 _state_now: dict = {}
 
 
-def _titles_block(titles) -> str:
-    """Список названий для подстановки в вопрос. Нумерация для человека в отчёте; модель
-    отвечает НАЗВАНИЯМИ, не номерами, — индексы она сдвигает молча."""
-    return NL_.join(f"{i}. {t}" for i, t in enumerate(titles, 1))
-
-
 def positions_for(rows, wanted_last: int) -> list:
     """Какие строки базы уезжают в модель.
 
@@ -64,45 +61,6 @@ def positions_for(rows, wanted_last: int) -> list:
     start = 0 if ALWAYS_FROM_START else max(0, wanted_last - 1)
     stop = min(len(rows), wanted_last + 1 + RESERVE_ROWS)
     return list(range(start, stop))
-
-
-def resolve_split(titles: list, parsed: dict) -> tuple:
-    """Ответ про главные/филер → `(полный разбор, филер)`. Отдельной функцией, потому что
-    вырожденные случаи разрешает КОД, а не лишний вопрос модели.
-
-    Тема не попала никуда — идёт в полный разбор: разобрать лишнее дешевле, чем потерять.
-    Попала в оба списка — главная побеждает. Порядок сохраняется исходный, чтобы ответ на
-    вопрос про классы (массив по порядку) ложился на те же темы.
-    """
-    parsed = parsed or {}
-    filler = [t for t in parsed.get("filler") or [] if t in titles]
-    main = [t for t in parsed.get("main") or [] if t in titles]
-    full = [t for t in titles if t in main or t not in filler]
-    return full, [t for t in titles if t in filler and t not in full]
-
-
-def _ask_text(data: str, question: str, note: dict, system: str = "") -> str:
-    """Свободный ответ прозой. Схемы нет НАРОЧНО: `{"type": "string"}` не ограничивает
-    ничего, а JSON вокруг длинной прозы только добавляет экранирования (`Vision06`)."""
-    started = time.monotonic()
-    answer = _llm.ask(data + NL_ * 2 + question, system=system or _prompts.sys_cold())
-    note.update({"ms": int((time.monotonic() - started) * 1000),
-                 "tokens": answer.get("tokens", 0), "error": answer.get("error", ""),
-                 "ok": bool(answer.get("ok"))})
-    return str(answer.get("text") or "")
-
-
-def _ask_json(data: str, question: str, schema_and_name: tuple, note: dict,
-              system: str = ""):
-    """Ответ, ограниченный схемой. Возвращает разобранный объект либо `None`."""
-    schema, name = schema_and_name
-    started = time.monotonic()
-    answer = _llm.ask_structured(data, question, schema, schema_name=name,
-                                 system=system or _prompts.sys_cold())
-    note.update({"ms": int((time.monotonic() - started) * 1000),
-                 "tokens": answer.get("tokens", 0), "error": answer.get("error", ""),
-                 "ok": bool(answer.get("ok")), "raw": answer.get("text", "")})
-    return answer.get("parsed")
 
 
 def section_parts(topic: dict) -> list:
@@ -118,6 +76,12 @@ def section_parts(topic: dict) -> list:
              (_prompts.doc_errors_head(), topic.get("errors")),
              (_prompts.doc_values_head(), topic.get("values")),
              (_prompts.doc_pack_head(topic.get("class")), topic.get("pack"))]
+    # СВОИ РАЗДЕЛЫ НАБОРА (`Plan32.1`): поле, которого документ не знает, встаёт после известных,
+    # в порядке опросника и под заголовком из его описания (`topic["heads"]`, пишет
+    # `Questionnaire.run`). Иначе новый набор — «персонажи», «мир» — спрашивал бы впустую.
+    known = {"talk", "pending", "settled", "open", "errors", "values", "pack"}
+    pairs += [(head, topic.get(field)) for field, head in topic.get("heads") or ()
+              if field not in known]
     # Разделы темы лежат под нашим `###`, значит заголовкам модели остаётся `####` и глубже.
     return [(head, _md.normalize(_strip_heading(body), _md.FLOOR))
             for head, body in pairs if str(body or "").strip()]
@@ -312,7 +276,7 @@ def _run(session_id: str, engine, raw_args: str = "") -> dict:
         lines.append(rows_why)
         return facts
 
-    by_msg = _compact._index(session_id, rows)
+    by_msg = _insert._index(session_id, rows)
     if not by_msg:
         lines.append("адресов сообщений нет — индексатор не разметил сессию")
         return facts
@@ -334,10 +298,10 @@ def _run(session_id: str, engine, raw_args: str = "") -> dict:
         chosen = list(range(len(rows)))
     else:
         # Диапазон режет ленту по ПОЛОЖЕНИЮ концов — то же правило, что у боевой команды.
-        chosen, _bad, gone = _compact.positions_for_spec(rows, by_msg, spec)
+        chosen, _bad, gone = _insert.positions_for_spec(rows, by_msg, spec)
         if gone:
             lines.append("концы или адреса не найдены: "
-                         + ", ".join(_compact._addr(n) for n in gone[:8]))
+                         + ", ".join(_insert._addr(n) for n in gone[:8]))
     if not chosen:
         lines.append("ИТОГ: не спрошено — в выбранном нет ни одной строки")
         return facts
@@ -381,7 +345,7 @@ def _span(addr_of, chunk) -> str:
     выбивается чужой — значит вставлен позже. Это подпорка логической цепочке за нулевую
     цену; сотня адресов в префиксе никого не разорит.
     """
-    names = [(addr_of.get(i, ""), _compact._addr_number(addr_of.get(i, "")))
+    names = [(addr_of.get(i, ""), _insert._addr_number(addr_of.get(i, "")))
              for i in chunk if addr_of.get(i, "")]
     if not names:
         return ""
@@ -451,6 +415,7 @@ def interrogate(session_id: str, rows, positions, addr_of, lines=None, kept=None
     вовсе и остаётся заботой вызывающего — путать их нельзя (`Vision08`, два множества).
 
     В базу здесь не пишется ничего и никогда. Отчёт на диск — пишется, после каждого ответа.
+    Сам опрос — сценарий `_compaction` на примитивах `_scenario` (`Plan32.1`).
     """
     facts = {"ok": False, "session": session_id, "asked": 0, "topics": 0,
              "text": "", "path": ""}
@@ -474,40 +439,18 @@ def interrogate(session_id: str, rows, positions, addr_of, lines=None, kept=None
                  f"(реплик {shape['prose']}, ответов тулов {shape['tool_results']}, "
                  f"вызовов {shape['calls']})")
 
-    steps: list = []
     folder = dump_dir(session_id)
-    document = ""
+    doc = {"text": ""}
 
     def save():
         """Отчёт на диск прямо сейчас. Падение записи прогон не отменяет."""
         try:
-            write_dump(folder, session_id, data, steps, document, lines)
+            write_dump(folder, session_id, data, run.steps, doc["text"], lines)
             _state_now["path"] = str(folder / FILE_RESULT)
         except Exception as exc:  # noqa: BLE001
             _state_now["error"] = f"отчёт не пишется: {exc}"
 
-    # Ход для панели (`_progress`): всего вопросов по плану и число тем — уточняются по ходу.
-    plan = {"total": 0, "topics": 0}
-
-    def step(key: str, question: str, schema_and_name=None):
-        """Один вопрос: задать, записать, сохранить. Единственная точка вызова модели."""
-        label, n = _progress.label_of(key)
-        _progress.progress(session_id, stage="questions", step=len(steps) + 1,
-                           total=max(plan["total"], len(steps) + 1) if plan["total"] else 0,
-                           label=label, topic=f"{n}/{plan['topics']}" if n else "")
-        note = {"key": key, "q": question}
-        if schema_and_name is None:
-            note["answer"] = _ask_text(data, question, note, system)
-            note["parsed"] = None
-        else:
-            note["parsed"] = _ask_json(data, question, schema_and_name, note, system)
-        steps.append(note)
-        _state_now["done"] = len(steps)
-        mark = "✓" if note.get("ok") else "✗"
-        lines.append(f"  {mark} {key}: {note.get('ms', 0)} мс"
-                     + (f" — {note['error']}" if note.get("error") else ""))
-        save()
-        return note
+    run = _scenario.Run(session_id, data, system, lines, _state_now, save)
 
     if WARMUP:
         _progress.progress(session_id, stage="warmup")
@@ -524,33 +467,36 @@ def interrogate(session_id: str, rows, positions, addr_of, lines=None, kept=None
             return facts
         time.sleep(SETTLE_S)
 
-    # ── Маршрут ──────────────────────────────────────────────────────────────
-    zone = _prompts.zone_note()
-    parsed = step("q1_count", _prompts.q1_count() + zone, _prompts.s1_count())["parsed"]
-    count = int((parsed or {}).get("count") or 0) or 1
+    span = set(work or positions)
+    work_rows = sum(1 for i in positions if min(span) <= i <= max(span)) if span else 0
+    _compaction(_scenario.View(run), run, facts, lines, doc, save, work_rows)
+    if facts["ok"]:
+        facts["path"] = str(folder / FILE_RESULT)
+        lines.append(f"результат: {folder / FILE_RESULT}")
+        save()
+    return facts
 
-    parsed = step("q2_titles", _prompts.q2_titles(count) + zone,
-                  _prompts.s2_titles())["parsed"]
-    titles = [str(t).strip() for t in (parsed or {}).get("titles") or [] if str(t).strip()]
+
+def _compaction(s, run, facts: dict, lines: list, doc: dict, save, work_rows: int = 0) -> None:
+    """СЦЕНАРИЙ компакции: темы → фильтры → выбор опросника каждой теме → опросники → филер,
+    запреты, добавления. Пишет итог в `facts`, документ — в `doc["text"]`."""
+    count = s.ask(_questionnaires.Q_COUNT) or 1
+    titles = s.ask(_questionnaires.Q_TITLES, count=count)
     if not titles:
         lines.append("ИТОГ: тем не названо — дальше идти не с чем")
-        failed = next((s["error"] for s in reversed(steps) if s.get("error")), "")
+        failed = next((st["error"] for st in reversed(run.steps) if st.get("error")), "")
         facts["error"] = f"тем не названо — {failed}" if failed else "модель не назвала ни одной темы"
-        facts["asked"] = len(steps)
-        return facts
+        facts["asked"] = len(run.steps)
+        return
     # РАСХОЖДЕНИЕ ЧИСЛА И СПИСКА. Прежде принимали массив как есть, и живой прогон
     # 2026-09-21 показал цену: на тех же данных модель насчитала одну тему и нарезала много,
     # раздув отчёт. Спрашиваем только когда список ДЛИННЕЕ — в эту сторону тянет форма
     # вопроса; когда он короче, модель просто успокоилась, и это не подозрительно.
     if len(titles) > count >= 1:
         lines.append(f"  тем названо {len(titles)}, а насчитано {count} — разбираем")
-        verdict = step("q2_recount", _prompts.q2_recount(count, _titles_block(titles)),
-                       _prompts.s2_recount())["parsed"] or {}
-        if _prompts.recount_says_merge(verdict.get("verdict", "")):
-            parsed = step("q2_merge", _prompts.q2_titles_merge(count, _titles_block(titles)),
-                          _prompts.s2_titles())["parsed"]
-            merged = [str(t).strip() for t in (parsed or {}).get("titles") or []
-                      if str(t).strip()]
+        verdict = s.ask(_questionnaires.Q_RECOUNT, count=count, names=titles)
+        if _prompts.recount_says_merge(verdict):
+            merged = s.ask(_questionnaires.Q_MERGE, count=count, names=titles)
             # Пустой ответ на слияние — беда слияния, а не повод остаться без тем.
             if merged:
                 lines.append(f"  сведено: {len(titles)} → {len(merged)}")
@@ -563,115 +509,47 @@ def interrogate(session_id: str, rows, positions, addr_of, lines=None, kept=None
         lines.append(f"  тем {len(titles)} — разбираем первые {MAX_TOPICS}")
         titles = titles[:MAX_TOPICS]
 
-    filler: list = []
-    if len(titles) == 1:
-        # Тема одна — вопроса про склейку нет вовсе, филера не существует.
-        full = list(titles)
-    else:
-        parsed = step("q3_split", _prompts.q3_split(_titles_block(titles)) + zone,
-                      _prompts.s3_split(titles))["parsed"]
-        full, filler = resolve_split(titles, parsed)
+    # Тема одна — вопроса про склейку нет вовсе, филера не существует.
+    full, filler = (list(titles), []) if len(titles) == 1 else s.ask(
+        _questionnaires.Q_SPLIT, names=titles)
     facts["topics"] = len(full)
     lines.append(f"тем: {len(titles)} | полный разбор: {len(full)} | филер: {len(filler)}")
 
-    # ВКУС каждой темы. Заменил прежний `q4_classes` (владелец, 2026-09-21): тот выбирал
-    # «какую пачку добавить», а выбирать надо, НА КАКОМ ЯЗЫКЕ спрашивать вообще. Вопрос про
-    # ошибки и файлы в разговоре про жизнь не просто пустой — технический словарь
-    # разворачивает модель в техническую рамку и портит ответ.
-    #
-    # Ключи схемы — САМИ НАЗВАНИЯ тем: грамматика обязывает дать ровно по одной записи на
-    # тему. Массив пар этого не давал, и длина уплывала живьём.
-    parsed = step("q_kinds", _prompts.q_kinds(_titles_block(full)) + zone,
-                  _prompts.s_kinds(full))["parsed"] or {}
-    kinds = {t: _prompts.kind_of(parsed.get(t, "")) for t in full}
-    plan["topics"] = len(full)
-    plan["total"] = _progress.planned(len(steps), [kinds[t] for t in full], bool(filler))
+    # УЗЕЛ ВЫБОРА (`Plan32.1`, замысел владельца 2026-10-11): фильтры убирают неуместные наборы,
+    # модели показываем оставшиеся — для чего каждый и что он спросит, — и она выбирает набор
+    # каждой теме. Вопрос про ошибки и файлы в разговоре про жизнь не просто пустой: технический
+    # словарь разворачивает модель в техническую рамку и портит ответ (владелец, 2026-09-21).
+    sets = _questionnaires.offered({"work_rows": work_rows, "topics": full})
+    picked = s.ask(_questionnaires.which_set(sets), names=full)
+    # КЛАССИФИКАЦИЯ — в итог прогона и дальше в запись о поглощении (владелец, 2026-10-11: «на
+    # всякий случай, вдруг пригодится»): какой набор модель выбрала каждой теме.
+    facts["sets"] = [{"topic": t, "set": picked[t].name} for t in full]
+    lines.append("наборы: " + "; ".join(f"{x['topic']} → {x['set']}" for x in facts["sets"]))
+    run.plan["topics"] = len(full)
+    run.plan["total"] = (len(run.steps) + sum(picked[t].max_steps for t in full)
+                         + (1 if filler else 0) + _progress.FINAL_STEPS)
 
-    # ── Полный разбор каждой темы ────────────────────────────────────────────
+    # ── Каждая тема — своим опросником ──────────────────────────────────────
     topics: list = []
     for n, title in enumerate(full):
-        scope = _prompts.topic_scope(title, n + 1, len(full))
-        kind = kinds.get(title, "other")
-        # РАЗГОВОР НЕ ДОПРАШИВАЕМ. Технические вопросы здесь вредны: модель начнёт
-        # пересказывать болтовню как отладку (замысел владельца 2026-09-21).
-        if kind == "talk":
-            topics.append({"title": title, "class": kind, "suspect": "",
-                           "talk": step(f"q_talk[{n + 1}]",
-                                        scope + _prompts.q_talk())["answer"]})
-            document = build_document(topics, "", "")
-            save()
-            continue
-        # ВОРОТА. Дешёвые булевы решают, какие дорогие вопросы задавать вовсе: секция, на
-        # которую пришло `false`, не создаётся и не спрашивается (владелец, 2026-09-21).
-        gate = step(f"q_gate[{n + 1}]", _prompts.q_gate(title, n + 1, len(full)),
-                    _prompts.s_gate())["parsed"] or {}
-        plan["total"] -= _progress.skipped_by_gate(gate)
-
-        def maybe(field, key, question, _n=n, _scope=scope, _gate=gate):
-            """Вопрос — только если ворота его пропустили. Ворот нет (сбой схемы) —
-            спрашиваем: потерять секцию дороже, чем задать лишний вопрос."""
-            if field in _gate and not _gate.get(field):
-                return ""
-            return step(f"{key}[{_n + 1}]", _scope + question)["answer"]
-
-        # «Пришли» не за воротами: тема без единого итога — не тема.
-        settled = step(f"q5_settled[{n + 1}]",
-                       scope + _prompts.q5_settled())["answer"]
-        pending = maybe("pending_task", "q_pending_task", _prompts.q_pending_task())
-        open_text = maybe("open_items", "q6_open", _prompts.q6_open())
-        errors = maybe("errors_fixes", "q_errors_fixes", _prompts.q_errors_fixes())
-        values = maybe("critical_values", "q_critical_values", _prompts.q_critical_values())
-        pack = maybe("class_details", "q7_pack",
-                     _prompts.q7_pack(kind, settled, open_text))
-        # Шага «склей свои ответы» больше нет — склеивает КОД (см. `build_document`).
-        topic = {"title": title, "class": kind, "settled": settled, "pending": pending,
-                 "open": open_text, "errors": errors, "values": values, "pack": pack,
-                 "suspect": ""}
-        # Проверяем ТО, ЧТО ПОЕДЕТ ДАЛЬШЕ: собранный раздел, а не отдельный пересказ.
-        check = step(f"q10_check[{n + 1}]", _prompts.q10_selfcheck(section_text(topic)),
-                     _prompts.s10_selfcheck())["parsed"] or {}
-        # Ключ вердикта — целая фраза, и его имя берётся из одного места: имя ключа тут не
-        # оформление, а те токены, которыми модель приходит к суждению (`_prompts`).
-        if check.get(_prompts.selfcheck_key()):
-            topic["suspect"] = str(check.get("what_exactly")
-                                   or check.get("what") or "").strip()
-        topics.append(topic)
-        document = build_document(topics, "", "")
+        topics.append(picked[title].run(s.about(title, n + 1, len(full)), section_text))
+        doc["text"] = build_document(topics, "", "")
         save()
 
-    # ── Филер и добавления ───────────────────────────────────────────────────
-    filler_text = ""
-    if filler:
-        filler_text = step("q11_filler", _prompts.q11_filler(_titles_block(filler)))["answer"]
-
-    # Запреты и ограничения — ОДИН раз на сессию, а не по темам: правило, сказанное в одной
-    # теме, действует во всех. Дословно, потому что пересказ запрета запретом не является.
-    parsed = step("q_constraints", _prompts.q_constraints_verbatim(),
-                  _prompts.s_constraints_verbatim())["parsed"] or {}
-    constraints = str(parsed.get("text") or "").strip() \
-        if parsed.get(_prompts.CONSTRAINTS_KEY) else ""
-
-    document = build_document(topics, filler_text, "", constraints)
+    # ── Филер, запреты, добавления ──────────────────────────────────────────
+    filler_text = s.ask(_questionnaires.Q_FILLER, names=filler) if filler else ""
+    constraints = s.ask(_questionnaires.Q_CONSTRAINTS).text
+    doc["text"] = build_document(topics, filler_text, "", constraints)
     # Найденное самопроверкой отдаём вопросу о добавлениях: иначе он честно перескажет его
     # своими словами, и половина абзаца уйдёт на уже сказанное (живой прогон 2026-09-21).
     known = NL_.join(f"- {t['title']}: {t['suspect']}" for t in topics if t.get("suspect"))
-    parsed = step("q12_additions", _prompts.q12_additions(document, known),
-                  _prompts.s12_additions())["parsed"] or {}
-    # НЕЧЕГО ДОБАВИТЬ — НЕ ПИШЕМ НИЧЕГО (владелец, 2026-09-21). Раньше код дописывал сюда
-    # свою строку про «дополнений нет», и она была неверна дважды: захардкожена по-русски,
-    # хотя язык документа задаёт сессия, — и пустой раздел через следующую компакцию читается
-    # как содержание. Признак полноты остаётся булевым, просто `false` означает молчание.
-    additions = str(parsed.get("text") or "").strip() if parsed.get("has_additions") else ""
-    document = build_document(topics, filler_text, additions, constraints)
+    additions = s.ask(_questionnaires.Q_ADDITIONS, document=doc["text"], known=known).text
+    doc["text"] = build_document(topics, filler_text, additions, constraints)
     save()
 
-    facts.update({"ok": True, "asked": len(steps), "text": document,
-                  "path": str(folder / FILE_RESULT)})
-    lines.append(f"ИТОГ опроса: шагов {len(steps)}, тем разобрано {len(topics)}. "
-                 f"Документ {len(document)} символов")
-    lines.append(f"результат: {folder / FILE_RESULT}")
-    save()
-    return facts
+    facts.update({"ok": True, "asked": len(run.steps), "text": doc["text"]})
+    lines.append(f"ИТОГ опроса: шагов {len(run.steps)}, тем разобрано {len(topics)}. "
+                 f"Документ {len(doc['text'])} символов")
 
 
 def status_lines() -> list:

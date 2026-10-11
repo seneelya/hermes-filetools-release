@@ -22,7 +22,7 @@ the refusal to do any real work at import.
 
 **Read-only, with ONE named exception.** This half never touches ``state.db``
 except to read and never talks to the model. It reported and nothing else until
-2026-09-08, when ``POST /context-select`` (Plan13-Task02) became the first
+2026-09-08, when ``POST /context-select`` (Plan13-Task02, removed 2026-10-06) became the first
 writing route: a human's decision about what leaves the context has to be
 recorded somewhere the engine can read it, and the panel has no other way to
 reach it. That route writes exactly one file of our own under
@@ -75,23 +75,25 @@ PLUGIN_ID = "hermes-filetools"
 #
 # `terminal` joined on 2026-09-02, and it must be listed here as well as in the
 # desktop half's own OUR_TOOLS (desktop/src/core.js): the two lists are read by
-# different halves — this one gates /ops (history out of the DB), that one gates
-# the live event stream. Adding a tool to only one of them yields exactly the
-# symptom seen live: new calls appear as cards, older ones never load.
+# different halves — this one gates `_is_ours` (whose row is ours: `/messages` names an unrecorded
+# row of ours apart from a foreign one), that one gates the live event stream.
 OUR_TOOLS = frozenset({
     "read_file", "write_file", "patch", "search_files", "terminal",
     # 2026-09-02: the two remaining tools that answer in OUR text and were
-    # missing from the panel. `process_manage` is deliberately NOT here — the
-    # owner left it behind the tool_search bridge, so it produces no rows to
-    # show; add it here AND in the desktop half if that ever changes.
+    # missing from the panel.
     "execute_code", "vision_analyze",
+    # 2026-10-06 (`deferred/20`): it sits behind the tool_search bridge, but a call
+    # through their `tool_call` stores an ordinary row named `process_manage` — and
+    # without it here that row was never found and its chip read `unknown`.
+    # Moves together with OUR_TOOLS in `desktop/src/core.js`.
+    "process_manage",
 })
 
 # Signals that identify OUR response, chosen to avoid configurable symbols.
 #
 # The framing marks (block/anchor/separator) come from plugin.yaml's `formatting:` section and a
 # profile can override any of them, so matching on "■"/"○○○" silently stops working the moment
-# someone changes them — and silently is the operative word: /ops would just return fewer rows.
+# someone changes them — and silently is the operative word: our rows would stop being recognised.
 # Meta FIELD names are literals in our own code and are not configurable, so they are the stable
 # signal. Per tool, because the four responses share no single field.
 # Keys that only OUR envelope carries (ui_envelope passes facts through from the tool cores).
@@ -130,6 +132,21 @@ def _header_re(key: str):
         _HEADER_RES["file"] = re.compile(re.escape(file_word) + r":\s*(\S.*)")
         _HEADER_RES["file_word"] = file_word + ":"
     return _HEADER_RES[key]
+
+
+def _unframe(value: str, content: str, op_m) -> str:
+    """A header value without the comment closer (`<!-- File: a.md -->` → `a.md`).
+
+    The closer is taken from the op line of the same row, never guessed from the
+    path — same rule as `file_ops/_tool_text.py::frame_of`.
+    """
+    value = value.strip()
+    if op_m:
+        end = content.find("\n", op_m.end())
+        closer = content[op_m.end(): end if end != -1 else len(content)].strip()
+        if closer and value.endswith(closer):
+            value = value[: -len(closer)].rstrip()
+    return value
 
 
 # Signals are header ROLES (Plan28): the word is the dictionary's, `role:` is searched.
@@ -314,9 +331,9 @@ def _declared_state(content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# /ops — pure logic. Kept as module-level functions with no DB and no FastAPI
-# in them, so the tests can drive them on hand-built rows and the route stays
-# a thin shell. Same discipline the desktop half is held to.
+# Row recognition — pure logic (whose row is ours, what it ended with). Kept as module-level
+# functions with no DB and no FastAPI in them, so the tests can drive them on hand-built rows.
+# The `/ops` route they once served is gone (Plan23, 2026-10-06); `/messages` uses them now.
 # ---------------------------------------------------------------------------
 
 def _tool_signals(tool: str) -> tuple:
@@ -395,71 +412,6 @@ def _is_ours(row) -> bool:
     return any(sig in body for sig in _tool_signals(tool))
 
 
-def _args_index(rows) -> dict:
-    """Map ``tool_call_id`` -> parsed arguments dict.
-
-    The arguments are NOT on the tool-result row — that row has only
-    ``tool_name``, ``tool_call_id`` and the response text. They live on the
-    preceding ASSISTANT row, inside its ``tool_calls`` JSON
-    (``[{id, call_id, function: {name, arguments}}]``, arguments itself a JSON
-    string). So the index is built once per session and joined by id, rather
-    than re-scanning per row.
-
-    Every layer is tolerant: a row without tool_calls, malformed JSON, or an
-    entry missing an id is skipped. A missing entry costs us a path we then
-    recover from our own header — it must never cost the whole response.
-    """
-    out: dict = {}
-    for row in rows:
-        raw = row.get("tool_calls")
-        if not raw:
-            continue
-        try:
-            calls = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
-            continue
-        if not isinstance(calls, list):
-            continue
-        for call in calls:
-            if not isinstance(call, dict):
-                continue
-            call_id = call.get("id") or call.get("call_id")
-            fn = call.get("function")
-            if not call_id or not isinstance(fn, dict):
-                continue
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except Exception:
-                args = {}
-            if isinstance(args, dict):
-                out[str(call_id)] = args
-    return out
-
-
-def _path_from_header(content: str):
-    """Path from the FIRST meta line of our own response (``File: <path>``).
-
-    Fallback only, used when the tool_call join found no arguments. This reads
-    OUR format, which we are allowed to do — the panel is not, and neither is
-    anything here allowed to touch the body. Scans a few lines, not the whole
-    text: the header is at the top by construction, and a `File:` occurring
-    later would be file CONTENT, not our metadata.
-    """
-    for line in (content or "").split("\n", 6)[:6]:
-        word = _header_re("file_word")
-        idx = line.find(word)
-        if idx == -1:
-            continue
-        tail = line[idx + len(word):].strip()
-        # Strip the language-aware comment closer (`-->`, `*/`, ...) that the
-        # commenter may have appended.
-        for closer in ("-->", "*/", "--}}", "#}"):
-            if tail.endswith(closer):
-                tail = tail[: -len(closer)].strip()
-        return tail or None
-    return None
-
-
 def _op_from_header(content: str):
     """This operation's address (`Operation ID: 0156xab`) off the FIRST lines of our own
     response — Plan09.
@@ -510,8 +462,8 @@ _EXIT_LINE_RE = re.compile(r"^\W*Exit code:\s*(-?\d+)", re.MULTILINE)
 def _row_kind(content: str) -> str:
     """Исход ЛЮБОЙ тул-строки ленты, нашей и чужой (Plan23-Task03, чип зеркала).
 
-    Наше решает `_kind` — тот же, что у стакана (`/ops`). Сверх него две вещи, которых стакан
-    не видит, потому что чужих строк у него нет: код выхода в шапке (`Exit code: 1`) и чужой
+    Наше решает `_kind` (наш конверт и наше `ERROR`). Сверх него две вещи, которых `_kind` не
+    видит: код выхода в шапке (`Exit code: 1`) и чужой
     JSON-ответ (`{"success": false}`, `{"error": "..."}`, `{"exit_code": 2}` — так отвечают
     `terminal`, `memory`, `web_*` Hermes). Ничего не угадываем по словам в тексте: только поля.
     """
@@ -534,38 +486,6 @@ def _row_kind(content: str) -> str:
                     or (isinstance(code, int) and not isinstance(code, bool) and code != 0):
                 return "error"
     return kind
-
-
-def _tokens_of(*texts) -> int:
-    """Rough token weight of some text, by THEIR estimator when it is importable.
-
-    Same function the engine's totals use (`agent.model_metadata
-    .estimate_tokens_rough`), on purpose: the number next to a checkbox and the
-    number in the apply report have to come from one place, or the panel and the
-    command will quietly disagree about what an operation costs.
-
-    The fallback is their documented non-CJK rule (ceil(UTF-8 bytes / 4)) rather
-    than chars/4 — for Cyrillic the two differ by about 2x, and under-reporting
-    the cost of exactly the operations the owner is trying to weigh would be the
-    wrong way to be wrong.
-    """
-    try:
-        from agent.model_metadata import estimate_tokens_rough
-    except Exception:  # noqa: BLE001 - bare python / no upstream: estimate ourselves
-        estimate_tokens_rough = None
-    total = 0
-    for text in texts:
-        if not text:
-            continue
-        text = text if isinstance(text, str) else str(text)
-        if estimate_tokens_rough is not None:
-            try:
-                total += int(estimate_tokens_rough(text))
-                continue
-            except Exception:  # noqa: BLE001
-                pass
-        total += (len(text.encode("utf-8", "replace")) + 3) // 4
-    return total
 
 
 _TOKENS_MODULE = "hermes_filetools_dashboard_tokens"
@@ -637,360 +557,10 @@ def _session_estimator(tk, session: str) -> dict:
             "mult": (entry or {}).get("mult") or 1.0, "markup": (entry or {}).get("markup") or {}}
 
 
-def _count_lines(text) -> int:
-    """Строки в тексте вызова: пусто — 0, завершающий перевод строки новой не добавляет."""
-    if not isinstance(text, str) or text == "":
-        return 0
-    n = text.count("\n") + 1
-    return n - 1 if text.endswith("\n") else n
-
-
-# Ответ, после которого файл НЕ менялся: правки не было или это пробный прогон.
-_NOTHING_WRITTEN_RE = re.compile(r"^\W*(Unchanged|Dry run):", re.MULTILINE)
-
-
-def _diff_from_args(tool, args):
-    """Сколько строк вызов ЗАЯВЛЯЕТ изменить — когда конверта с фактами нет (`ui_json: off`).
-
-    Парная к `desktop/src/core.js::diffFromArgs` (контракт C1: живой поток и `/ops` не разъезжаются).
-    Оценка, не факт; точные числа — журнал (`fact.added` / `fact.removed`).
-    """
-    args = args or {}
-    if tool == "patch" and (isinstance(args.get("new_string"), str) or isinstance(args.get("old_string"), str)):
-        return {"added": _count_lines(args.get("new_string")), "removed": _count_lines(args.get("old_string"))}
-    if tool == "write_file" and isinstance(args.get("content"), str):
-        return {"added": _count_lines(args["content"]),
-                "removed": 0 if args.get("insert_line") is not None else None}
-    return None
-
-
-def _brick(row, args) -> dict:
-    """One operation, in the shape the panel consumes (contract C1).
-
-    `title`/`subtitle` are assembled from the CALL (tool name + arguments),
-    never from the response text. That is the rule the whole design rests on:
-    the moment a title depends on parsing our own output, improving the output
-    becomes a breaking change.
-    """
-    tool = row.get("tool_name") or ""
-    facts, content = split_envelope(row.get("content") or "")
-    args = args or {}
-
-    path = args.get("path") or _path_from_header(content)
-    subtitle_bits = []
-    if tool == "read_file":
-        if args.get("line"):
-            subtitle_bits.append(f"line {args['line']}")
-        if args.get("count") is not None:
-            subtitle_bits.append(f"count {args['count']}")
-    elif tool == "search_files" and args.get("pattern"):
-        subtitle_bits.append(f"pattern {args['pattern']!r}")
-    elif tool == "patch" and args.get("line"):
-        subtitle_bits.append(f"line {args['line']}")
-    if args.get("flags"):
-        subtitle_bits.append(str(args["flags"]))
-
-    # active=0 with compacted=1 means the row survived in-place compaction —
-    # its `content` may already be a rewritten shortening. Flagging it stops
-    # the panel from presenting a truncated remnant as the full output.
-    was_compacted = not row.get("active") and bool(row.get("compacted"))
-
-    kind = _kind_from(facts, content)
-    # Без конверта (`ui_json: off`) счётчики строк — оценка по аргументам вызова.
-    guess = (_diff_from_args(tool, args)
-             if not facts and kind == "ok" and not _NOTHING_WRITTEN_RE.search(content or "") else None)
-
-    return {
-        "tool": tool,
-        "ts": row.get("timestamp"),
-        "session_id": row.get("session_id"),
-        "tool_id": row.get("tool_call_id"),
-        "title": f"{tool} {path}" if path else tool,
-        "subtitle": " · ".join(subtitle_bits),
-        "body": content,
-        # Факты уже сняты выше — передаём их, а не заставляем _kind искать конверт заново
-        # в уже очищенном теле (иначе он не найдёт ничего и решит "ok").
-        "kind": kind,
-        "meta": {
-            "row_id": row.get("id"),
-            # Counters from our own envelope — the panel shows them as "+1 −1 ×1" instead of
-            # making the human expand the card to find out what happened.
-            "replacements": (facts or {}).get("replacements"),
-            "added": (facts or {}).get("added", guess["added"] if guess else None),
-            "removed": (facts or {}).get("removed", guess["removed"] if guess else None),
-            "compacted": was_compacted,
-            "args_matched": bool(args),
-            # The state the row DECLARES about itself (`State: removed_from_context`), for
-            # ANY tool. `/reads` cannot answer this — it covers read tools only
-            # (`is_read_entry`) — and the panel needs it for every card: an already-dropped
-            # operation must not be offered `drop content` again, while `erase tool` on it is
-            # both legal and the most useful case there is (the header still costs tokens).
-            # Read, never inferred: the envelope is the authority (Plan13, amendment 5).
-            "state": _declared_state(row.get("content") or "") or None,
-            # What this operation WEIGHS in the request, both halves together
-            # (owner, 2026-09-09: "just how many tokens this operation weighs",
-            # not what removing it would save). Both halves because a write
-            # answers in one line and carries the whole file in its arguments —
-            # counting only the answer would show the heaviest operations in the
-            # session as the cheapest. Re-serialized arguments, so escaping may
-            # differ from the wire by a hair; the body is verbatim.
-            "tokens": _tokens_of(row.get("content") or "",
-                                 json.dumps(args, ensure_ascii=False) if args else ""),
-            # The address a human or the model can NAME to point at this
-            # operation (Plan09). None for a row that predates it, or for an
-            # answer whose address was never issued (a refusal).
-            "op": _op_from_header(content),
-        },
-    }
-
-
-def _row_ts_by_op(rows) -> dict:
-    """`Operation ID -> timestamp строки`. Порядок В БАЗЕ, а не по журналу."""
-    out = {}
-    for row in rows:
-        found = _op_from_header(row.get("content") or "")
-        ts = row.get("timestamp")
-        if found and isinstance(ts, (int, float)) and not isinstance(ts, bool):
-            out.setdefault(str(found), ts)
-    return out
-
-
-# Шаг, которым надгробие сдвигается вправо от своего якоря. Меньше любого осмысленного
-# интервала между сообщениями и больше нуля — то есть на порядок сортировки влияет, а на
-# показанное время нет (его всё равно берут из `meta.erased_at`).
-_ANCHOR_STEP = 1e-4
-
-# Насколько далеко от СВОЕГО записанного времени разрешено утаскивать надгробие ради якоря.
-#
-# Якорь лечит порядок ВНУТРИ хода: там журнал груб, а строки точны. Между ходами записанное
-# время точное (расхождение база/журнал живьём ≤ 0.8 с), и подменять его соседом нельзя —
-# живая находка 2026-09-09: операцию `0014` стёрли, её сосед по журналу лежал ЧАСОМ раньше, и
-# надгробие уехало в середину старого хода. Порог заведомо больше измеренного расхождения
-# часов и заведомо меньше паузы между ходами.
-_ANCHOR_MAX_GAP = 5.0
-
-
-def _tombstone_ts(op: str, tomb: dict, entry, order, row_ts) -> float:
-    """Время, по которому надгробие ВСТАНЕТ НА МЕСТО стёртой операции.
-
-    ПОЧЕМУ НЕ ВРЕМЯ ИЗ ЖУРНАЛА, хотя оно и есть. Замерено на живой сессии 2026-09-09:
-    операции параллельного батча (`0005`..`0013`, девять штук) записаны журналом внутри
-    ОДНОЙ секунды, и его доли секунды не совпадают с долями строк базы — журнал ставит
-    `...535.2` там, где строки соседей стоят на `...535.28`–`...535.30`. Часы при этом
-    сходятся (расхождение база/журнал ≤ 0.8 с): дело не в них, а в том, что ВНУТРИ батча
-    порядок задаёт последовательность строк, а не время. Отсортированное по журналу надгробие
-    уезжало на пару карточек вверх — владелец это и увидела.
-
-    Поэтому якорь — строка ПРЕДЫДУЩЕЙ операции по журналу, у которой строка ещё есть, плюс
-    крошечный шаг. Нет предыдущей (стёрли первую) — берём следующую и встаём ПЕРЕД ней.
-
-    НО ТОЛЬКО ВНУТРИ ХОДА (`_ANCHOR_MAX_GAP`). Якорь уточняет доли секунды, а не переносит
-    операцию по разговору: сосед, отстоящий от записанного времени на час, — не сосед, и
-    доверять ему больше, чем собственному времени операции, значит менять маленькую неправду
-    на большую. Не нашлось подходящего соседа — время из журнала; нет и его — время стирания.
-    """
-    own = (entry or {}).get("ts")
-    own = own if isinstance(own, (int, float)) and not isinstance(own, bool) else None
-
-    def near(ts):
-        """Сосед годится, если он в пределах хода. Своего времени нет — верим соседу."""
-        return own is None or abs(ts - own) <= _ANCHOR_MAX_GAP
-
-    if op in order:
-        i = order.index(op)
-        back = 0
-        for prev in reversed(order[:i]):
-            if prev in row_ts:
-                if near(row_ts[prev]):
-                    # Шаг растёт, если подряд стёрли несколько: иначе две могилы получат
-                    # одно время и порядок между ними станет делом случая.
-                    return row_ts[prev] + _ANCHOR_STEP * (back + 1)
-                break
-            back += 1
-        ahead = 0
-        for nxt in order[i + 1:]:
-            if nxt in row_ts:
-                if near(row_ts[nxt]):
-                    return row_ts[nxt] - _ANCHOR_STEP * (ahead + 1)
-                break
-            ahead += 1
-    if own is not None:
-        return own
-    return tomb.get("ts")
-
-
-def _tombstone_brick(op: str, tomb: dict, entry, ts=None) -> dict:
-    """Карточка стёртой операции. Строки под ней нет и никогда больше не будет.
-
-    ПОПРАВКА 8 к контракту: у этого кирпичика нет ни `tool_id`, ни `row_id`, ни тела. Всё,
-    что он знает, приходит из леджера — имя тула и путь из записи об операции (она append-only
-    и осталась), время и действие из надгробия. Отсюда и `body: ""`: показывать нечего, а
-    придумать нечего честно.
-
-    `ts` — МЕСТО в разговоре, а не факт о времени: надгробие обязано стоять там, где стояла
-    операция, иначе история перестанет читаться сверху вниз. Считает его `_tombstone_ts` по
-    соседям из журнала, и почему не по записанному времени — там же. Время стирания уходит в
-    `meta.erased_at`, и вот ОНО факт: его и показывают человеку.
-    """
-    entry = entry if isinstance(entry, dict) else {}
-    tool = str(entry.get("tool") or "") or "operation"
-    path = str(entry.get("path") or "")
-    return {
-        "tool": tool,
-        "ts": ts if ts is not None else tomb.get("ts"),
-        "session_id": str(entry.get("session") or ""),
-        "tool_id": "",
-        "title": f"{tool} {path}" if path else tool,
-        "subtitle": "",
-        "body": "",
-        "kind": "ok",
-        "meta": {
-            "op": op,
-            # То же состояние, что в вердикте `/context-state`, тем же словом. Клиент
-            # рисует по нему формат `#L7` и прячет за фильтром `show erased`.
-            "state": STATE_ERASED,
-            "erased_at": tomb.get("ts"),
-            "erased_by": tomb.get("by") or "",
-            "row_id": None,
-            "args_matched": False,
-            "compacted": False,
-            # Ноль, а не отсутствие: стёртая операция весит в контексте ровно ноль, и это
-            # факт, а не «мы не смогли посчитать».
-            "tokens": 0,
-        },
-    }
-
-
-def _ts_key(brick):
-    """Сортировочный ключ по времени, терпимый к чужому типу. Не число — в начало."""
-    ts = brick.get("ts")
-    return ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0
-
-
-def _step_keys(rows) -> dict:
-    """`tool_call_id -> ключ шага`. Ключ — первый вызов строки ассистента.
-
-    Первый вызов, а не выдуманный номер: он уже уникален, он есть на обеих
-    сторонах связи, и переживает пересборку ответа — в отличие от позиции.
-    Строка ассистента без вызовов шага здесь не образует: у неё нет карточки, а
-    группировать в стакане нечего.
-    """
-    out = {}
-    for row in rows or []:
-        if not isinstance(row, dict) or row.get("role") != "assistant":
-            continue
-        ids = []
-        for call in (row.get("tool_calls") or []):
-            if isinstance(call, dict):
-                cid = call.get("id") or (call.get("function") or {}).get("id")
-            else:
-                cid = getattr(call, "id", "")
-            if cid:
-                ids.append(str(cid))
-        for cid in ids:
-            out[cid] = ids[0]
-    return out
-
-
-def build_ops(rows, entries=(), limit: int = 200) -> dict:
-    """Bricks for one session, oldest first. Pure — takes rows, returns data.
-
-    `entries` — записи леджера этой сессии, и нужны они ровно за надгробиями: у стёртой
-    операции строки в базе нет, поэтому из `rows` она не соберётся никак. Пустой список
-    легален и даёт в точности прежний ответ.
-    """
-    index = _args_index(rows)
-    ours = [r for r in rows if _is_ours(r)]
-    total = len(ours)
-    selected = ours[:limit] if limit and limit > 0 else ours
-    bricks = [_brick(r, index.get(str(r.get("tool_call_id") or ""))) for r in selected]
-
-    # К какому ШАГУ принадлежит карточка (Plan14-Task06). Нужно клиенту, чтобы
-    # отметка на одной карточке разъехалась на весь ход ДО нажатия: расширение
-    # делает сервер, но увидеть его человек обязан заранее.
-    step_of = _step_keys(rows)
-    for brick in bricks:
-        key = step_of.get(str(brick.get("tool_id") or ""))
-        if key:
-            brick["meta"]["step"] = key
-
-    # Надгробия НЕ входят ни в `total`, ни в лимит. `total` — это «сколько наших операций в
-    # контексте», и стёртой там нет; а лимит защищает от тяжёлого ответа, тогда как надгробие
-    # пустое. Смешать их значило бы, что после стирания счётчик не уменьшился.
-    op_entries, tombs = _ledger_split(entries)
-    if tombs:
-        by_op = {str(e.get("op") or "").strip(): e for e in op_entries if e.get("op")}
-        # Только те, чьей строки в базе действительно нет: если строка на месте, значит
-        # надгробие про другую сессию или стирание не состоялось, и рисовать могилу над
-        # живой операцией — худшая из возможных неправд.
-        #
-        # Смотрим по ВСЕМ строкам, а не по собранным кирпичикам: `_is_ours` отбрасывает и
-        # строки, чей текст перестал быть похож на наш (их компакция переписывает результат
-        # записи своей сводкой). Такая строка в контексте есть и токены тратит — надгробию
-        # над ней делать нечего, хотя карточки у неё и нет.
-        row_ts = _row_ts_by_op(rows)
-        alive = set(row_ts)
-        for row in rows:
-            found = _op_from_header(row.get("content") or "")
-            if found:
-                alive.add(str(found))
-        # Порядок ЖУРНАЛА — то, по чему ищется сосед-якорь. Он и есть последовательность
-        # операций сессии: `op` для этого не годится, `next_op` уникален, но не упорядочен.
-        order = [str(e.get("op") or "").strip() for e in op_entries if e.get("op")]
-        bricks += [_tombstone_brick(op, tomb, by_op.get(op),
-                                    _tombstone_ts(op, tomb, by_op.get(op), order, row_ts))
-                   for op, tomb in tombs.items() if op and op not in alive]
-        bricks.sort(key=_ts_key)
-
-    return {"ops": bricks, "truncated": total > len(selected), "total": total}
-
-
-@router.get("/ops")
-def ops(session: str = "", limit: int = 200):
-    """Our file operations from ANY session, current or long finished.
-
-    This is the half the panel cannot do for itself: the desktop's REST door
-    is locked to this namespace, and the gateway's session history RPC needs a
-    LIVE session. Reading `state.db` here is the only way a reopened chat
-    shows what was done in it.
-
-    Read-only and fail-closed: the database may be held by a running agent, so
-    any failure is reported as a field, never raised.
-    """
-    if not session:
-        return {"ops": [], "truncated": False, "total": 0,
-                "error": "session is required"}
-    try:
-        from hermes_state import SessionDB
-        # include_compacted=True is not optional: without it every turn that
-        # in-place compaction touched disappears, and the panel would show a
-        # confident, incomplete history — worse than an empty one.
-        rows = SessionDB().get_messages(session, include_compacted=True)
-    except Exception as exc:  # noqa: BLE001 - report, never raise
-        return {"ops": [], "truncated": False, "total": 0,
-                "error": f"{type(exc).__name__}: {exc}"}
-
-    # Леджер — за надгробиями, и его отсутствие тут НЕ ошибка: без него ответ ровно такой,
-    # каким был до надгробий. Живые операции собираются из базы и в журнале не нуждаются.
-    ledger = _load_ledger()
-    entries = []
-    if ledger is not None:
-        try:
-            entries = ledger.read_ledger(session) or []
-        except Exception:  # noqa: BLE001 - журнал не читается: остаются живые операции
-            entries = []
-
-    result = build_ops([dict(r) for r in rows], entries=entries, limit=limit)
-    if result["total"] == 0 and not result["ops"]:
-        result["note"] = ("no operations from this plugin in that session "
-                          "(the session may predate it, or ran with it disabled)")
-    return result
-
-
 # ---------------------------------------------------------------------------
-# /reads — the point of the whole plan. Our ledger is the REFERENCE (what we
-# handed the model); their row is the OBSERVATION (what survived). The
-# difference is the answer, and neither source can produce it alone.
+# Ledger against rows — our ledger is the REFERENCE (what we handed the model); their row is
+# the OBSERVATION (what survived). The difference is the answer, and neither source can produce
+# it alone. Served `/reads` until Plan23 (2026-10-06); `/context-state` is its one reader now.
 # ---------------------------------------------------------------------------
 
 def _rows_by_call_id(rows) -> dict:
@@ -1125,118 +695,6 @@ def _state_for(entry, row) -> tuple:
     )
 
 
-# The ledger records write_file and patch too (2026-08-27). /reads answers
-# "what did the model READ and can it still lean on it", so those entries are
-# not part of this question and are filtered out here rather than at the
-# writer: dropping them at write time would throw away the only surviving
-# description of a write, which is exactly why they are recorded.
-# Entries written before the `tool` field existed are reads by definition.
-READ_TOOLS = frozenset({"read_file"})
-
-
-def is_read_entry(entry) -> bool:
-    """Is this entry a READ we can join to a row.
-
-    THE EVENT CHECK COMES FIRST, and it was paid for on screen 2026-09-09. The
-    rule below — "an entry without `tool` is a read by definition" — was written
-    when the only records were operations, and the oldest of those predate the
-    `tool` field. A record of a MESSAGE has no `tool` either, so every one of them
-    became a phantom read: it even joined to a real row through `tool_call_id`,
-    and then `_state_for` compared a `sha8` it does not carry against the row and
-    said `unknown`, "row neither matches nor is shorter (0 -> N chars)". The whole
-    stack went grey and the file tiles with it, on a session where nothing was
-    wrong. Exactly the failure the record contract names: a reader that takes a new
-    kind for an old one gives neither an error nor a line in the log.
-    """
-    if not isinstance(entry, dict):
-        return False
-    ledger = _load_ledger()
-    if ledger is not None and ledger.is_event(entry):
-        return False
-    return (entry.get("tool") or "read_file") in READ_TOOLS
-
-
-def build_reads(entries, rows) -> dict:
-    """Join the ledger against the stored rows. Pure: no DB, no FastAPI."""
-    entries = [e for e in entries if is_read_entry(e)]
-    index = _rows_by_call_id(rows)
-    by_op = _rows_by_op(rows)
-    reads = []
-    unmatched = 0
-
-    for entry in entries:
-        call_id = entry.get("tool_call_id")
-        row = _row_for(entry, index, by_op)
-        if row is None:
-            unmatched += 1
-        state, reason = _state_for(entry, row)
-
-        # An entry matchable by NEITHER key — say WHY it is unknown, so a missing
-        # id is not read as "the read vanished".
-        if row is None and not call_id:
-            reason = ("no tool_call_id recorded, and the operation number was "
-                      "not found in any row's text either (e.g. a read issued "
-                      "through the execute_code sandbox, which Hermes never "
-                      "stores as a read_file row)")
-
-        reads.append({
-            "path": entry.get("path"),
-            "from": entry.get("from"),
-            "to": entry.get("to"),
-            "lines": entry.get("lines"),
-            "ts": entry.get("ts"),
-            "turn": entry.get("turn"),
-            "state": state,
-            "reason": reason,
-            "bytes_then": entry.get("chars"),
-            "bytes_now": len(row.get("content") or "") if row else None,
-            "meta": {
-                "row_id": row.get("id") if row else None,
-                "tool_call_id": call_id,
-                # An inferred session is not an asserted one — see _ledger.
-                "session_src": entry.get("session_src"),
-            },
-        })
-
-    return {"reads": reads, "unmatched": unmatched, "total": len(entries)}
-
-
-@router.get("/reads")
-def reads(session: str = ""):
-    """What the model read, and whether it can still lean on it.
-
-    Deliberately NOT sourced from `session.context_breakdown`: that reports
-    categories of usage, which is a different question and one we have
-    measured to be unreliable (see `__HQ/recon/Recon12`). Here every line is
-    backed by two independent records.
-    """
-    if not session:
-        return {"reads": [], "unmatched": 0, "total": 0,
-                "error": "session is required"}
-
-    ledger = _load_ledger()
-    if ledger is None:
-        return {"reads": [], "unmatched": 0, "total": 0,
-                "error": "ledger module could not be loaded"}
-
-    entries = ledger.read_ledger(session)
-    if not entries:
-        return {"reads": [], "unmatched": 0, "total": 0,
-                "note": ("no ledger for this session — it ran before the "
-                         "ledger existed, or no file was read. This is NOT "
-                         "the same as 'nothing was read'.")}
-
-    try:
-        from hermes_state import SessionDB
-        rows = [dict(r) for r in
-                SessionDB().get_messages(session, include_compacted=True)]
-    except Exception as exc:  # noqa: BLE001 - report, never raise
-        return {"reads": [], "unmatched": 0, "total": len(entries),
-                "error": f"{type(exc).__name__}: {exc}"}
-
-    return build_reads(entries, rows)
-
-
 @router.get("/ping")
 def ping():
     """Health probe: is this namespace mounted, and can it see the ledger?
@@ -1299,24 +757,35 @@ def ping():
 # plus our sha8) and a file's length (only the ledger or the disk knows it).
 # The fold into current coordinates, recency rank and overlap percentage all
 # live in `core.js::buildContextView`, because the panel must redraw on EVERY
-# operation and the stack already lives on the event stream: a server-side fold
-# would mean a network round trip per operation.
-#
-# `/reads` is deliberately left alone. It has a live consumer and answers a
-# different question; adding patches to it would change the meaning of an
-# existing answer under working code.
+# operation: a server-side fold would mean a network round trip per operation.
 # ---------------------------------------------------------------------------
 
 # Ledger keys copied through verbatim. Listed rather than passed as `**entry`
 # so a new ledger field cannot leak into a frozen contract by accident: the
 # contract is the promise, and the ledger is free to grow behind it.
 _FACT_KEYS = ("op", "tool", "path", "from", "to", "total", "ts",
-              "nested", "seen", "out_lines", "cmd_head", "cmd_sidecar")
+              "nested", "seen", "out_lines", "cmd_head", "cmd_sidecar",
+              # several shown ranges of one read (Plan30, ledger amendment 8, panel 22)
+              "parts")
 
 # The state of an operation that was DELIBERATELY erased, and we have the record to prove it
 # (`_ledger.EVENT_ERASED`). Not the same as "the ledger remembers it and the database has no
 # row": that is `missing_row` and it covers everything, including losses we cannot explain.
 STATE_ERASED = "erased"
+
+
+def _msg_by_call_id(entries) -> dict:
+    """`tool_call_id -> m-адрес` по записям о сообщениях журнала (их пишет индексация
+    `/messages`). Последняя запись побеждает — то же правило, что у `/messages`."""
+    ledger = _load_ledger()
+    if ledger is None or not hasattr(ledger, "message_records"):
+        return {}
+    out = {}
+    for rec in ledger.message_records(entries):
+        call_id, msg = str(rec.get("tool_call_id") or ""), str(rec.get("msg") or "")
+        if call_id and msg:
+            out[call_id] = msg
+    return out
 
 
 def _ledger_split(entries):
@@ -1409,6 +878,7 @@ def build_context_state(entries, rows) -> dict:
     """
     index = _rows_by_call_id(rows)
     by_op = _rows_by_op(rows)
+    msg_of = _msg_by_call_id(entries)
     # Надгробия отделяются ЗДЕСЬ, и `seq` считается по операциям: события в леджере лежат
     # вперемешку с ними, а `seq` — это порядок ОПЕРАЦИЙ, по которому клиент сортирует всё.
     # Считай мы его по сырому списку, номера поехали бы у всех операций после первого
@@ -1451,6 +921,11 @@ def build_context_state(entries, rows) -> dict:
         fact["removed"] = int(counts.get("removed") or 0)
         fact["state"] = state
         fact["reason"] = reason
+        # m-АДРЕС строки-результата (Plan23, поправка 20): зеркало находит факт по адресу, а не
+        # по номеру операции. У вложенной операции своей строки нет — адреса нет.
+        msg = msg_of.get(str(call_id or "")) if not entry.get("nested") else None
+        if msg:
+            fact["msg"] = msg
         # THE LEDGER REMEMBERS THE OPERATION AND THE DATABASE HAS NO ROW FOR IT. A flag, not
         # a phrase to be re-parsed on the client: the panel acts on this (it removes the
         # card), and hanging an action off matching the wording of `reason` would break the
@@ -1497,7 +972,7 @@ def build_context_state(entries, rows) -> dict:
 def context_state(session: str = ""):
     """Every operation of ours still visible to the model, as plain facts.
 
-    Same honesty rules as `/reads`: a `note`/`error` string rather than a bare
+    Honesty rule: a `note`/`error` string rather than a bare
     empty list, because "there is no ledger for this session" and "nothing was
     ever read" are different answers and a caller cannot tell them apart from
     `[]`.
@@ -1546,6 +1021,31 @@ def context_state(session: str = ""):
 # ---------------------------------------------------------------------------
 
 _MSG_KEYS = ("msg", "role", "msg_ts", "tool_call_id")
+
+
+def _split_call_tokens(fact: dict, msg: dict, tk, estimator: dict, carriers: dict) -> None:
+    """Вес для ПОКАЗА на чипе (владелец, 2026-10-06): тул — вызов + ответ, реплика — только проза.
+
+    `tokens` строки не трогаем: итоги (полоса, «отмечено», вагон) честно считаются по строкам, и
+    стирание ответа всё равно уносит его вызов. Здесь только две добавки:
+    - строке `tool` — `call_tokens`, цена её вызова в строке-носителе (у `write_file` ответ в одну
+      строку, а весь файл — в аргументах вызова);
+    - строке `assistant` с вызовами — `prose_tokens`, её вес без вызовов.
+    Носителя или вызова не нашли — поля нет, чип показывает строку как есть."""
+    mult, markup = estimator["mult"], estimator["markup"]
+    role = str(msg.get("role") or "")
+    if role == "tool":
+        call_id = str(msg.get("tool_call_id") or "")
+        carrier = carriers.get(call_id) if call_id else None
+        for call in (tk.row_calls(carrier) if isinstance(carrier, dict) else []):
+            if isinstance(call, dict) and str(call.get("id") or (call.get("function") or {}).get("id") or "") == call_id:
+                fact["call_tokens"] = tk.call_tokens(call, mult, markup)
+                break
+    elif role == "assistant":
+        calls = [c for c in tk.row_calls(msg) if isinstance(c, dict)]
+        if calls:
+            spent = sum(tk.call_tokens(c, mult, markup) for c in calls)
+            fact["prose_tokens"] = max(0, int(fact.get("tokens") or 0) - spent)
 
 
 def _their_repairs(msgindex, rows) -> dict:
@@ -1758,7 +1258,7 @@ def messages(session: str = "", index: int = 1, preview: int = 0, full: str = ""
     `preview=N` adds `text` — the first N characters of the row, cut bluntly at
     the character. Off by default, so the plain answer stays what it was: pure
     addressing. The "no texts" rule is about the LEDGER — nothing of this reaches
-    a record; the route already reads the base, and `/ops` has always shown
+    a record; the route already reads the base, and the old `/ops` had always shown
     bodies. `chars` stays the full length, so the cut is visible.
 
     WE READ THE BASE BY THEIR RULE, WE DO NOT CALL THEIR ASSEMBLER. The rule is
@@ -1844,6 +1344,7 @@ def messages(session: str = "", index: int = 1, preview: int = 0, full: str = ""
         fact["chars"] = len(content)
         if estimator is not None:
             fact["tokens"] = tk.row_tokens(msg, estimator["mult"], estimator["markup"])
+            _split_call_tokens(fact, msg, tk, estimator, carriers)
         if body:
             fact["sent_as"] = "api_content"
             stored = len(str(msg.get("content") or ""))
@@ -1860,11 +1361,11 @@ def messages(session: str = "", index: int = 1, preview: int = 0, full: str = ""
                 fact["op"] = op_m.group(1)
             file_m = _header_re("file").search(content)
             if file_m:
-                full_path = file_m.group(1).strip().replace("\\", "/")
+                full_path = _unframe(file_m.group(1), content, op_m).replace("\\", "/")
                 fact["file"] = full_path.rsplit("/", 1)[-1]
                 fact["path"] = full_path
             # Статусы чипа (Plan23-Task03): исход и объявленное состояние — у КАЖДОЙ тул-строки,
-            # не только у наших операций (у тех то же самое есть в `/ops`). Пустое — не кладём.
+            # не только у наших операций. Пустое — не кладём.
             kind = _row_kind(content)
             if kind != "ok":
                 fact["kind"] = kind
@@ -2011,8 +1512,8 @@ async def events(ws):
     invented traffic. That was true while nothing had anything to say. Now
     something does, and it cannot reach us any other way: `/ctx-drop` runs in the
     AGENT process, these routes are mounted in the dashboard's web server, and
-    the only thing the two share is the file tree — the same door the selection
-    already goes through. The panel's other two triggers cannot cover it either:
+    the only thing the two share is the file tree — the same door the focus
+    file already goes through. The panel's other two triggers cannot cover it either:
     our own is `tool.complete` (a slash command is not a tool call) and theirs is
     `status.update` with `kind: "compacted"`, which their compaction pipeline
     emits and we deliberately no longer go through. Without this the panel showed
@@ -2102,23 +1603,15 @@ def _ledger_dir_or_none():
 
 
 # ---------------------------------------------------------------------------
-# /context-select (Plan13-Task02) — the panel's PENDING SELECTION.
+# /context-focus — which chat the panel has open (`context_ctl/_select.py`).
 #
-# THE FIRST WRITING ROUTE IN THIS FILE, and that is a deliberate change to the
-# invariant stated in the module docstring above ("Read-only. This half never
-# writes a file."). It held while the panel only reported. Plan13's whole point
-# is a human deciding what leaves the context, and a decision has to be
-# recorded where both halves can see it: the panel cannot hand anything to the
-# engine directly (renderer vs agent), and the engine is deep-copied per
-# session, so its attributes are invisible from here (ACHTUNG:
-# ctxctl.engine_is_deepcopied_per_agent).
+# Writes ONE file of OUR OWN under `<hermes home>/filetools/ctxctl/select/`, never
+# touches `state.db`, never rewrites the ledger, never talks to the model. The
+# slash command reads it to know which chat it was typed in.
 #
-# What stays true: this writes ONE file of OUR OWN under
-# `<hermes home>/filetools/ctxctl/select/`, never touches `state.db`, never
-# rewrites the ledger, and never talks to the model. APPLYING the selection is
-# a separate explicit action (Task 4) — a POST here changes nothing about the
-# live conversation, which is exactly why the checkbox and the button are two
-# steps and not one.
+# The panel's PENDING SELECTION (`/context-select`, Plan13-Task02) lived here too
+# and is gone (Plan23, 2026-10-06): operations travel by m-address in the body of
+# `POST /context-operation`, one transport, no selection file.
 #
 # Auth: none of its own, on purpose. Every route here relies on the dashboard's
 # own gate at the mount point, and a bespoke check beside it is the mistake
@@ -2203,7 +1696,7 @@ def context_revision_route(session: str = ""):
     the push did not arrive — twice, in the field, for two different reasons (a gateway
     still serving the previous version of the websocket, and once more with everything
     deployed). REST to these routes is PROVEN to work in the same panel at the same moment:
-    /ops, /reads and /context-state all answer. A channel that works beats a channel that
+    /context-state and /messages answer. A channel that works beats a channel that
     is architecturally nicer, and the human should not have to restart the client to see
     what she just did.
 
@@ -2212,28 +1705,6 @@ def context_revision_route(session: str = ""):
     if not session:
         return {"revision": 0, "error": "session is required"}
     return {"revision": context_revision(session), "session": session}
-
-
-@router.get("/context-select")
-def context_select_get(session: str = ""):
-    """What is currently marked for removal in this session, if anything.
-
-    A missing file answers `items: []` plus a `note`, not a bare empty list:
-    "nothing selected yet" and "the panel never wrote here" are different
-    facts — the same honesty rule the read routes above follow.
-    """
-    if not session:
-        return {"items": [], "error": "session is required"}
-    select = _load_select()
-    if select is None:
-        return {"items": [], "error": "select module could not be loaded"}
-    try:
-        current = select.read_selection(session)
-    except Exception as exc:  # noqa: BLE001 - report, never raise
-        return {"items": [], "error": f"{type(exc).__name__}: {exc}"}
-    if not current["items"] and not current["updated_at"]:
-        return {**current, "note": "no selection recorded for this session yet"}
-    return current
 
 
 @router.post("/context-focus")
@@ -2271,53 +1742,14 @@ def context_focus_get():
     return select.read_focus()
 
 
-@router.post("/context-select")
-async def context_select_post(request: Request):
-    """Replace this session's selection with the body's `items`.
-
-    REPLACE, not merge: the panel holds the full set of checkboxes on screen
-    and sends exactly that, so merging would make unticking impossible.
-
-    Rejected items come back in `rejected` WITH a reason instead of being
-    dropped quietly — a client that sent something unusable has to be able to
-    tell, or the human keeps looking at a checkbox the server does not have.
-
-    Takes the raw request instead of declaring a Pydantic body model because
-    this module must stay importable with no FastAPI at all (see the stub at
-    the top of the file): a model in the signature is evaluated at import time
-    and would break that. The `Request` ANNOTATION, however, is mandatory —
-    without it FastAPI treats the parameter as a query field and the body can
-    never be read (see the import block for the whole story).
-    """
-    select = _load_select()
-    if select is None:
-        return {"items": [], "error": "select module could not be loaded"}
-
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001 - a malformed body is a client error, not a 500
-        return {"items": [], "error": "body must be JSON"}
-    if not isinstance(body, dict):
-        return {"items": [], "error": "body must be a JSON object"}
-
-    session = str(body.get("session") or "").strip()
-    if not session:
-        return {"items": [], "error": "session is required"}
-
-    try:
-        stored, rejected = select.write_selection(session, body.get("items"))
-    except Exception as exc:  # noqa: BLE001 - report, never raise
-        return {"items": [], "error": f"{type(exc).__name__}: {exc}"}
-    return {**stored, "rejected": rejected}
-
-
 # ---------------------------------------------------------------------------
-# Apply. The SECOND writing route, and the only one that changes the model's
-# context rather than a file of our own.
+# Apply. The routes that change the model's context rather than a file of our own.
 #
-# Why a route and not only the slash command (owner, 2026-09-09): "the panel is
+# Why routes and not only the slash command (owner, 2026-09-09): "the panel is
 # where context work is done; commands are hyper-inconvenient". The command
-# stays as a fallback.
+# stays, and since Plan23 (2026-10-06) it goes through the SAME door: one
+# transport by m-address (`POST /context-operation` -> `apply_addresses`); the
+# operation-number route `POST /context-apply` is gone.
 #
 # Why this does not import our engine: this file is loaded BY PATH, outside the
 # package, so a relative import is impossible and guessing our package name in
@@ -2325,7 +1757,7 @@ async def context_select_post(request: Request):
 # live engine, however, is already reachable the way THEIR own dispatcher
 # reaches it -- `_sessions[key]["agent"]` -- and the engine object is part of
 # our package, where imports are ordinary. So we look the engine up and call one
-# duck-typed method on it: `apply_drop(ops)`.
+# duck-typed method on it: `apply_addresses(operation, msgs)`.
 # ---------------------------------------------------------------------------
 
 def _engine_for(session: str):
@@ -2352,7 +1784,7 @@ def _engine_for(session: str):
         engine = getattr(entry.get("agent"), "context_compressor", None)
         if engine is None or getattr(engine, "name", "") != "ctxctl":
             return None
-        return engine if callable(getattr(engine, "apply_drop", None)) else None
+        return engine if callable(getattr(engine, "apply_addresses", None)) else None
 
     entry = registry.get(session)
     if entry is not None:
@@ -2375,56 +1807,32 @@ def _engine_for(session: str):
                   + (", ".join(live) if live else "none"))
 
 
-@router.post("/context-apply")
-async def context_apply_post(request: Request):
-    """Apply the human's choice: drop the named operations from the model's context.
+def _engine_from_bridge(session: str):
+    """`(engine, reason)` from OUR process registry of engines — for READING only.
 
-    IRREVERSIBLE, and deliberately not idempotent-by-omission: with no `ops` in
-    the body this falls back to the stored selection, and an empty selection is
-    answered with a refusal rather than "applied nothing". A button that reports
-    success when nothing happened is the one failure mode worth engineering out.
+    A subagent's agent is built by the agent itself (`delegate_task`), never enters the
+    gateway's `_sessions`, so `_engine_for` cannot see it — yet its engine runs and decides on
+    compaction like any other (live 2026-10-11, `platform: subagent`). Every engine registers
+    itself at session start (`context_ctl/_bridge.py::remember_engine`) in the bridge state kept
+    on `run_agent.AIAgent.__init__._ctxctl_state` (the bridge's own seam). Used by `/tokens`
+    only: the writing routes keep `_engine_for` — a manual compaction or LLMOps needs the
+    gateway session that a subagent does not have.
     """
     try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001 - a malformed body is a client error, not a 500
-        return {"ok": False, "error": "body must be JSON"}
-    if not isinstance(body, dict):
-        return {"ok": False, "error": "body must be a JSON object"}
-
-    session = str(body.get("session") or "").strip()
-    if not session:
-        return {"ok": False, "error": "session is required"}
-
-    ops = body.get("ops")
-    if ops is None:
-        # No explicit list: apply what the panel last ticked.
-        select = _load_select()
-        stored = select.read_selection(session) if select is not None else {}
-        ops = [str(item.get("op") or "") for item in (stored.get("items") or [])]
-    if not isinstance(ops, list):
-        return {"ok": False, "error": "ops must be a list of operation ids"}
-    ops = [str(op).strip().lstrip("#") for op in ops if str(op).strip()]
-    if not ops:
-        return {"ok": False, "error": "nothing to apply: no operation is ticked"}
-
-    # WHICH action, by its object: `content` drops the payload and keeps the header, `tool`
-    # erases the call/result pair outright. Same word the button carries. An unknown mode is
-    # refused BY NAME rather than treated as the default: these edits are irreversible, and
-    # doing a different one than the human pressed is the worst possible answer.
-    mode = str(body.get("mode") or "content").strip() or "content"
-
-    engine, reason = _engine_for(session)
-    if engine is None:
-        return {"ok": False, "session": session, "error": reason}
+        import run_agent
+        state = getattr(run_agent.AIAgent.__init__, "_ctxctl_state", None)
+        engine = (state or {}).get("engines", {}).get(session) if isinstance(state, dict) else None
+    except Exception:  # noqa: BLE001 - no bridge is a reason, not a 500
+        return None, "the engine registry is not reachable"
+    if engine is None or getattr(engine, "name", "") != "ctxctl":
+        return None, f"session {session} has no engine in the registry"
     try:
-        report = engine.apply_drop(ops, mode)
-    except Exception as exc:  # noqa: BLE001 - report, never raise
-        return {"ok": False, "session": session, "ops": ops,
-                "error": f"{type(exc).__name__}: {exc}"}
-    if not isinstance(report, dict):
-        return {"ok": False, "session": session, "ops": ops,
-                "error": "the engine returned something other than a report"}
-    return {**report, "engine": reason}
+        alive = engine.live_agent() is not None
+    except Exception:  # noqa: BLE001
+        alive = False
+    if not alive:
+        return None, f"session {session}: its agent is gone"
+    return engine, f"session {session} (not in the gateway — a subagent; read from our engine registry)"
 
 
 @router.post("/context-operation")
@@ -2433,7 +1841,7 @@ async def context_operation_post(request: Request):
 
     One door for every operation whose subject is messages (`m0007`) rather than our operation
     numbers (owner, 2026-09-29). `content` drops the body of tool results — ours AND foreign,
-    which have no operation number and so were unreachable by `/context-apply`. `erase` removes
+    which have no operation number. The ONLY door since Plan23 (2026-10-06). `erase` removes
     any message by the ownership rule (`_pairs.settle`): a result takes its call with it.
 
     Body: `{session, operation, msgs}`. IRREVERSIBLE; an unknown operation is refused by name.
@@ -2658,7 +2066,11 @@ async def tokens_post(request: Request):
         return {"ok": False, "error": "session is required"}
     engine, reason = _engine_for(session)
     if engine is None:
-        return {"ok": False, "session": session, "error": reason}
+        # A subagent is not in the gateway; its engine is in ours (reading only).
+        engine, why = _engine_from_bridge(session)
+        if engine is None:
+            return {"ok": False, "session": session, "error": f"{reason}; {why}"}
+        reason = why
     if not callable(getattr(engine, "token_report", None)):
         return {"ok": False, "session": session,
                 "error": "the live engine has no token counter yet — restart the Hermes client"}
@@ -2675,11 +2087,11 @@ async def tokens_post(request: Request):
 # ---------------------------------------------------------------------------
 # /context-compact-start, /context-compact-status (Plan16-Task03) — the Mirror's fourth
 # rail, compaction. The subject is MESSAGE addresses (`m0007`), not `ops`, and the rail
-# already speaks in those — no resolution step like `/context-apply`'s needed.
+# already speaks in those — no resolution step needed.
 #
 # Compaction runs minutes, in the background, on the AGENT half's own thread
 # (`context_ctl._compact._worker`). This route only STARTS it (`engine.start_compact`,
-# same "method on the live engine" trick `apply_drop` uses, for the same reason — this
+# same "method on the live engine" trick `apply_addresses` uses, for the same reason — this
 # module cannot import our package). The SECOND route reads the run's progress from a
 # FILE (`context_ctl/_compact_state.py`), because the agent half's own in-memory status
 # (`_compact._state_now`) lives in a module this half cannot see: two Python halves of the
@@ -2751,6 +2163,150 @@ async def context_compact_start_post(request: Request):
     return {**report, "engine": reason}
 
 
+# ---------------------------------------------------------------------------
+# LLMOps window (Plan31 Task 2): data, chat, models, presets. Same "method on the live engine"
+# trick as compaction — this half cannot import our package. The model route is compaction's
+# interrogation route (session's or our own).
+# ---------------------------------------------------------------------------
+
+
+def _llmops_engine(session: str, method: str):
+    """`(engine, None)` or `(None, error answer)`."""
+    session = str(session or "").strip()
+    if not session:
+        return None, {"ok": False, "error": "session is required"}
+    engine, reason = _engine_for(session)
+    if engine is None:
+        return None, {"ok": False, "session": session, "error": reason}
+    if not callable(getattr(engine, method, None)):
+        return None, {"ok": False, "session": session,
+                      "error": f"the live engine has no {method} yet — restart the Hermes client"}
+    return engine, None
+
+
+@router.get("/llmops-data")
+def llmops_data(session: str = "", addrs: str = ""):
+    """`GET /llmops-data?session&addrs=m0034,m0035` — the window's input, cut as compaction cuts it:
+    `{ok, prefix, target, bubbles, suffix, frames, addrs, lines}`. A message: `{addr, role, text,
+    tokens, tool?, calls?}`. `frames` — directive frames stripped from the target; `addrs` — what a
+    replace will eat (service rows included)."""
+    engine, err = _llmops_engine(session, "llmops_data")
+    if err:
+        return err
+    wanted = [a.strip() for a in str(addrs or "").split(",") if a.strip()]
+    if not wanted:
+        return {"ok": False, "error": "addrs is required"}
+    try:
+        return engine.llmops_data(wanted)
+    except Exception as exc:  # noqa: BLE001 - report, never raise
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@router.post("/llmops-chat")
+async def llmops_chat(request: Request):
+    """`POST /llmops-chat {session, messages, model?, think?}` — the WHOLE window conversation in one
+    request: `{ok, text, model, tokens}` or `{ok: False, error}`."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": "body must be JSON"}
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "body must be a JSON object"}
+    engine, err = _llmops_engine(body.get("session"), "llmops_chat")
+    if err:
+        return err
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return {"ok": False, "error": "messages must be a non-empty list"}
+    import asyncio
+    try:
+        # The model answers in minutes — off the event loop.
+        return await asyncio.to_thread(engine.llmops_chat, messages,
+                                       str(body.get("model") or ""), bool(body.get("think")))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@router.get("/llmops-models")
+def llmops_models(session: str = ""):
+    """`GET /llmops-models?session` — `{ok, session: <route model>, list}`; no list from the server —
+    the route model alone plus `note`."""
+    engine, err = _llmops_engine(session, "llmops_models")
+    if err:
+        return err
+    try:
+        return engine.llmops_models()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@router.get("/llmops-presets")
+def llmops_presets(session: str = ""):
+    """`GET /llmops-presets?session` — `{ok, presets: [{key, label, system, user, wrap, settings}], frames}`;
+    `frames` — wrap texts the server puts around the body (`compaction` head/tail + `*_kept`,
+    `summarisation` head/tail), shown around the window's result field;
+    `user` holds `{{data}}`, `wrap: null` = «as it was». Texts: `context_ctl/_prompts/_llmops.py`."""
+    engine, err = _llmops_engine(session, "llmops_presets")
+    if err:
+        return err
+    try:
+        frames = engine.llmops_frames() if callable(getattr(engine, "llmops_frames", None)) else {}
+        return {"ok": True, "presets": engine.llmops_presets(), "frames": frames}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@router.post("/llmops-replace")
+async def llmops_replace_post(request: Request):
+    """`POST /llmops-replace` — LLMOps window's `Replace` (Plan31 Task 1).
+
+    Body: `{session, addrs, text, wrap, preset?}` — `addrs` the window's target m-addresses, `text` the
+    BODY from the result field, `wrap` one of `compaction` / `summarisation` / `none` (the window
+    resolves «as it was» before sending). The server wraps: with bubbles the compaction frame's
+    closing line goes as a separate message after them, which only the compaction plan knows.
+    Runs as a compaction run (same lock, same state file): `{"ok": True}` = started, the outcome
+    is `GET /context-compact-status`. `preset` — the window's preset key, recorded in the
+    ledger's absorption record only (ledger contract amendment 10).
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - a malformed body is a client error, not a 500
+        return {"ok": False, "error": "body must be JSON"}
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "body must be a JSON object"}
+    session = str(body.get("session") or "").strip()
+    if not session:
+        return {"ok": False, "error": "session is required"}
+    addrs = body.get("addrs")
+    if not isinstance(addrs, list):
+        return {"ok": False, "error": "addrs must be a list of message addresses"}
+    addrs = [str(a).strip() for a in addrs if str(a).strip()]
+    if not addrs:
+        return {"ok": False, "error": "nothing to replace: no message address"}
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return {"ok": False, "error": "text is empty"}
+    wrap = str(body.get("wrap") or "").strip()
+    if wrap not in ("compaction", "summarisation", "none", "as-it-was"):
+        return {"ok": False, "error": "wrap must be compaction, summarisation, none or as-it-was"}
+    preset = str(body.get("preset") or "").strip()[:64]
+
+    engine, reason = _engine_for(session)
+    if engine is None:
+        return {"ok": False, "session": session, "error": reason}
+    if not callable(getattr(engine, "start_ready", None)):
+        return {"ok": False, "session": session,
+                "error": "the live engine has no start_ready yet — restart the Hermes client"}
+    try:
+        report = engine.start_ready(addrs, text, wrap, preset)
+    except Exception as exc:  # noqa: BLE001 - report, never raise
+        return {"ok": False, "session": session, "error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(report, dict):
+        return {"ok": False, "session": session,
+                "error": "the engine returned something other than a report"}
+    return {**report, "engine": reason}
+
+
 @router.get("/context-compact-status")
 def context_compact_status(session: str = ""):
     """`GET /context-compact-status?session=<id>` — how the background run is doing.
@@ -2758,7 +2314,7 @@ def context_compact_status(session: str = ""):
     Reads a FILE, not the live engine — deliberately: the run outlives any single request,
     and a poll must still answer after the agent process reconnects/restarts. No record at
     all is `running: False` (never started), not an error — same honesty convention as
-    `/context-select`/`/context-revision`.
+    `/context-focus`/`/context-revision`.
     """
     mod = _load_compact_state()
     if mod is None:

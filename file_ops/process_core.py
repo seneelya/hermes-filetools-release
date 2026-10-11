@@ -87,6 +87,7 @@ def render_process_result(raw: str, symbols: dict = None, op: str = "") -> str:
         head_keys=_HEAD_KEYS,
         symbols=symbols,
         op=op,
+        count_body=True,   # `list`: `Processes: N` in the header, `0` included
     )
 
 

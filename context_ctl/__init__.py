@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from . import _bridge, _command, _compact, _distill, _llm, _select, _state
+from . import _insert
 from .engine import ContextCtlEngine
 
 handle_drop = _command.handle
@@ -93,7 +94,7 @@ def setup(ctx, *, plugin_version: str = "", enabled: bool = True,
     # `compact_distillate_role: assistant` в конфиге. Настройка, которая молча не
     # применяется, хуже отсутствующей: она создаёт уверенность, что выбор сделан.
     from . import _compact, _settings
-    role_why = _compact.set_distillate_role((config or {}).get("compact_distillate_role"))
+    role_why = _insert.set_distillate_role((config or {}).get("compact_distillate_role"))
 
     # Действующие пределы: plugin.yaml + settings.yaml. Секция `config` этого вызова — только
     # то, что Hermes отдал при загрузке, без правок панели.

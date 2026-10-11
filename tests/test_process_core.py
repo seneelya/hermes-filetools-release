@@ -122,6 +122,13 @@ def test_tool_error_shape_renders_as_an_error_line():
 
 # ── action="list": the collection IS the answer ────────────────────────────
 
+def _rows(text):
+    """The list body: the lines below the separator (the count is in the header)."""
+    head, sep, body = text.partition("○○○\n")
+    assert sep, f"no separator in:\n{text}"
+    return head, body.splitlines()
+
+
 def test_list_renders_one_line_per_process():
     raw = json.dumps({"processes": [
         {"session_id": "proc_a", "command": "npm run dev", "cwd": "/srv",
@@ -131,9 +138,9 @@ def test_list_renders_one_line_per_process():
          "pid": 2, "uptime_seconds": 5, "status": "exited",
          "output_preview": "", "exit_code": 1},
     ]})
-    body = render(raw)
-    lines = body.splitlines()
-    assert len(lines) == 2, f"one line per process, got:\n{body}"
+    head, lines = _rows(render(raw))
+    assert head == "◆Processes: 2\n◆"
+    assert len(lines) == 2, f"one line per process, got:\n{lines}"
     assert lines[0].startswith("Session id=proc_a  Command=npm run dev  Cwd=/srv")
     assert "Exit code=1" in lines[1]
     # An empty output_preview costs a pair for no information -> dropped.
@@ -148,7 +155,7 @@ def test_list_row_newlines_are_flattened_not_leaked():
         {"session_id": "proc_a", "output_preview": "first\nsecond\nthird"},
         {"session_id": "proc_b", "output_preview": "only"},
     ]})
-    lines = render(raw).splitlines()
+    _head, lines = _rows(render(raw))
     assert len(lines) == 2
     assert lines[0] == "Session id=proc_a  Output preview=first ⏎ second ⏎ third"
 
@@ -158,13 +165,18 @@ def test_list_key_order_stable_when_a_row_lacks_a_key():
         {"session_id": "a", "pid": 1, "status": "running"},
         {"session_id": "b", "status": "exited", "exit_code": 2},
     ]})
-    lines = render(raw).splitlines()
+    _head, lines = _rows(render(raw))
     assert lines[0] == "Session id=a  Pid=1  Status=running"
     assert lines[1] == "Session id=b  Status=exited  Exit code=2"
 
 
-def test_list_empty_renders_nothing_rather_than_an_empty_blob():
-    assert render(json.dumps({"processes": []})) == ""
+def test_list_empty_is_counted_not_silent():
+    """Live 2026-10-06 (`deferred/20`): an empty list came back as the bare op line —
+    the model could not tell "nothing running" from "nothing said". Counted like search's
+    `Found: 0`; no separator, there is nothing under it."""
+    assert render(json.dumps({"processes": []})) == "◆Processes: 0"
+    _op, rest = split_op_line(render(json.dumps({"processes": []}), op="0007"))
+    assert rest == "◆Processes: 0"
 
 
 # ── plumbing ───────────────────────────────────────────────────────────────

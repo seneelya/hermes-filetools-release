@@ -1,5 +1,5 @@
 name: hermes-filetools
-version: "0.40.0"
+version: "0.45.1"
 # THIS FILE IS THE DEFAULTS (since 2026-09-30). A plugin update / our deploy overwrites it.
 # YOUR changes live in <HERMES_HOME>/filetools/settings.yaml - the Config panel writes only the
 # differences from the values below there; delete a key in that file to get the default back.
@@ -54,6 +54,21 @@ pip_dependencies:
   - charset-normalizer>=3.3
   - filetype>=1.2
   - pytest>=9.1
+  # Not ours: Hermes' own `web_search` backend 'ddgs' (an optional extra on their side,
+  # `ddgs==9.16.0` in pyproject) is not installed by their installer, and the search then
+  # falls back to the keyless tier with "ddgs package is not installed" (owner, 2026-10-06).
+  - ddgs>=9.16
+  # Grammars for get_codeblock (vendor/get_codeblock, Plan30): block-aligned reads. `.py`,
+  # `.md`, `.txt` work without them; the rest fall back to a plain read until installed.
+  - tree-sitter>=0.23
+  - tree-sitter-python>=0.23
+  - tree-sitter-typescript>=0.23
+  - tree-sitter-cpp>=0.23
+  - tree-sitter-c-sharp>=0.23
+  - tree-sitter-css>=0.23
+  - tree-sitter-yaml>=0.6
+  - tree-sitter-bash>=0.23
+  - tree-sitter-powershell>=0.26
 
 # Per-tool DEFAULTS - actual values, not just a type description. This is
 # what a fresh install runs with, no profile config.yaml edits needed.
@@ -91,6 +106,13 @@ tools:
       mtime: true
       anchors: true
       anchor_gap: 25
+      # Plan30 - reading by blocks (vendor/get_codeblock). Each switch is here because the
+      # model may do better WITHOUT it (owner): turned off, read_file reads as before.
+      align_blocks: true
+      cut_note: true
+      gcb_hint: true
+      gcb_escalate: true
+      max_tokens: 10000
     # anchors/anchor_gap are config-level ON PURPOSE, not model-facing flags: the
     # marks are passive, and a switch the model can flip stops being passive
     # (CONTRACT.md §18 - live 2026-08-26, an agent that saw such a flag spent its
@@ -100,6 +122,11 @@ tools:
       mtime: "\"new\" path only: appends a \"Modified: ...\" line. No effect on \"old\"."
       anchors: "\"new\" path only: sparse line-number marks in already-blank lines - a precondition for patch's line hint."
       anchor_gap: "Minimum lines between two anchor marks. Higher = rarer/quieter, lower = denser."
+      align_blocks: "--line/--count snap to whole code/markdown blocks (about --count lines). Off = exactly the lines asked for."
+      cut_note: "When a range had to end inside a block, its END line says which block (\"| cut inside block 69-270 |\")."
+      gcb_hint: "A partial read of code/markdown suggests --get-codeblock --outline (the file's table of contents)."
+      gcb_escalate: "--get-codeblock --query grows a too-small block with its neighbours (get_codeblock's own rule). --force always turns it off."
+      max_tokens: "Answer limit in tokens; a bigger read stops there and says where to continue. --force lifts it. Restart to update the tool description."
   write_file:
     enabled: true
     icon: "✚"

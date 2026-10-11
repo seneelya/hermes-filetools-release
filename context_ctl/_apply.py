@@ -6,8 +6,8 @@ str)`», и вызов в `gateway/run_inbound.py::_hm_dispatch_quick_and_plugin
 передаёт ровно один аргумент). Ни сессии, ни агента, ни истории. Поэтому:
 
 1. **Какая сессия — СПРАШИВАЕМ У ПАНЕЛИ.** Она единственная, кто знает это наверняка: она
-   сама подставляет сессию в каждый маршрут, который зовёт (`/ops?session=...`, файл
-   выбора). Поэтому панель записывает открытый чат (`POST /context-focus` →
+   сама подставляет сессию в каждый маршрут, который зовёт (`/messages?session=...`).
+   Поэтому панель записывает открытый чат (`POST /context-focus` →
    `_select.write_focus`), а команда его читает.
 
    Так было не всегда, и путь сюда стоит помнить. Сначала мы угадывали по активности («где
@@ -261,27 +261,6 @@ def _estimate(agent, messages) -> int:
         return 0
 
 
-def preview(agent, messages, items, session_id) -> dict:
-    """Сухой прогон: что будет, если применить. Ничего не меняет.
-
-    Именно эти две цифры владелец хочет видеть у галочек: сколько выбросим и сколько
-    ОСТАНЕТСЯ — второе и есть фактическая цена холодного пересчёта после применения.
-    """
-    index = _stubs.ledger_index(session_id)
-    after_messages, report = _stubs.apply_stubs(messages, items, index)
-    before = _estimate(agent, messages)
-    after = _estimate(agent, after_messages)
-    return {
-        "tokens_before": before,
-        "tokens_after": after,
-        "tokens_dropped": max(0, before - after),
-        "chars_saved": report.get("chars_saved", 0),
-        "would_stub": len(report.get("stubbed") or []),
-        "not_found": report.get("not_found") or [],
-        "problems": report.get("problems") or [],
-    }
-
-
 def db_history(agent) -> tuple:
     """Активные строки базы как список сообщений: `(строки, пояснение)`.
 
@@ -384,7 +363,7 @@ def commit_replacement(session, agent, db_messages, **kwargs) -> tuple:
 # ОТКАЗЫ, КОТОРЫЕ ПРОХОДЯТ САМИ (2026-09-30): запись отбита, потому что сессия живёт — идёт ход
 # (их аренда хода проверяется В ТОЙ ЖЕ транзакции, что и запись: гонки нет) или ход уже дописал в
 # базу строки, которых нет в нашей ленте. Ручная компакция на такой отказ не выбрасывает
-# результат, а ждёт конца хода и пересобирает ленту (`_compact._assemble_until_written`).
+# результат, а ждёт конца хода и пересобирает ленту (`_insert._assemble_until_written`).
 # Причина начинается с одного из этих слов — по ним вызывающий и узнаёт.
 BUSY_TURN = "идёт ход"
 BUSY_MOVED = "база ушла вперёд"
@@ -572,9 +551,3 @@ def history_of(session) -> list:
         return list(session.get("history") or [])
     with lock:
         return list(session.get("history") or [])
-
-
-def selection_for(session_id: str) -> list:
-    """Отмеченное в режиме `drop content` — единственном, который умеет применяться."""
-    return [item for item in (_select.read_selection(session_id).get("items") or [])
-            if item.get("mode") == _select.MODE_CONTENT]

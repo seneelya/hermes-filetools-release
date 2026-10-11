@@ -17,14 +17,14 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_filetools.context_ctl import _compact, _prompts
+from hermes_filetools.context_ctl import _compact, _insert, _prompts
 from hermes_filetools.file_ops import _ledger
 
 
 # ── K1 ───────────────────────────────────────────────────────────────────────
 
 def test_k1_ranges_and_single_numbers_parse_to_the_same_number_set():
-    wanted, bad = _compact.parse_spec("m0001-m0003, m0007, 12")
+    wanted, bad = _insert.parse_spec("m0001-m0003, m0007, 12")
     assert wanted == {1, 2, 3, 7, 0x12}
     assert bad == []
 
@@ -36,25 +36,25 @@ def test_k1_addresses_are_hexadecimal_like_the_ledger_writes_them():
     каждый адрес с буквой — из 235 адресов сессии разбиралось 99, и человек получал бы
     сводку не по тому диапазону, который назвал.
     """
-    wanted, bad = _compact.parse_spec("m000a, m00eb")
+    wanted, bad = _insert.parse_spec("m000a, m00eb")
     assert wanted == {10, 235}
     assert bad == []
     # И диапазон считается по той же базе: m0001-m0041 это 65 сообщений, не 41.
-    wanted, _bad = _compact.parse_spec("m0001-m0041")
+    wanted, _bad = _insert.parse_spec("m0001-m0041")
     assert len(wanted) == 65
-    assert _compact._addr(63) == "m003f"
+    assert _insert._addr(63) == "m003f"
 
 
 def test_k1b_a_reversed_range_is_read_as_a_range_not_as_an_error():
     # `m0010-m0001` — описка, а не намерение; отказывать за неё значило бы заставить
     # человека печатать заново то, что и так однозначно.
-    wanted, bad = _compact.parse_spec("m0010-m000e")
+    wanted, bad = _insert.parse_spec("m0010-m000e")
     assert wanted == {0x0e, 0x0f, 0x10}
     assert bad == []
 
 
 def test_k1c_garbage_is_reported_and_does_not_cancel_the_rest():
-    wanted, bad = _compact.parse_spec("m0002, ой, m0004")
+    wanted, bad = _insert.parse_spec("m0002, ой, m0004")
     assert wanted == {2, 4}
     assert bad == ["ой"]
 
@@ -62,8 +62,8 @@ def test_k1c_garbage_is_reported_and_does_not_cancel_the_rest():
 # ── K2 ───────────────────────────────────────────────────────────────────────
 
 def test_k2_prose_is_the_words_of_both_sides():
-    assert _compact.is_prose({"role": "user", "content": "вопрос"})
-    assert _compact.is_prose({"role": "assistant", "content": "ответ"})
+    assert _insert.is_prose({"role": "user", "content": "вопрос"})
+    assert _insert.is_prose({"role": "assistant", "content": "ответ"})
 
 
 def test_k2_a_tool_call_does_not_disqualify_the_models_own_words():
@@ -74,7 +74,7 @@ def test_k2_a_tool_call_does_not_disqualify_the_models_own_words():
     шестнадцати сообщений уехало ДВА, оба человеческих. Сводка получилась по двум строкам
     вместо всего разговора, и никакой ошибки при этом не возникло.
     """
-    assert _compact.is_prose({"role": "assistant", "content": "сейчас прочитаю",
+    assert _insert.is_prose({"role": "assistant", "content": "сейчас прочитаю",
                               "tool_calls": [{"id": "c1"}]})
 
 
@@ -84,7 +84,7 @@ def test_k2_a_tool_call_does_not_disqualify_the_models_own_words():
     {"role": "system", "content": "правила"},
 ])
 def test_k2b_everything_else_is_not_prose(row):
-    assert not _compact.is_prose(row)
+    assert not _insert.is_prose(row)
 
 
 # ── K3 ───────────────────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ def _rows_and_index():
 def test_k3_a_gap_in_the_selection_splits_the_run():
     rows, by_msg = _rows_and_index()
     # m0006 НЕ выбран — значит m0007 отдельный пробег, а не хвост первого.
-    runs, skipped, missing = _compact.build_runs(rows, by_msg, {1, 2, 5, 7})
+    runs, skipped, missing = _insert.build_runs(rows, by_msg, {1, 2, 5, 7})
     assert [r["addresses"] for r in runs] == [["m0001", "m0002"], ["m0005"], ["m0007"]]
     assert missing == []
 
@@ -123,7 +123,7 @@ def test_k3b_the_whole_run_is_eaten_but_only_prose_reaches_the_model():
     суммаризатору не показываем).
     """
     rows, by_msg = _rows_and_index()
-    runs, skipped, _missing = _compact.build_runs(rows, by_msg, {1, 2, 3, 4, 5})
+    runs, skipped, _missing = _insert.build_runs(rows, by_msg, {1, 2, 3, 4, 5})
     assert len(runs) == 1
     run = runs[0]
     assert run["addresses"] == ["m0001", "m0002", "m0003", "m0004", "m0005"]
@@ -136,7 +136,7 @@ def test_k3b_the_whole_run_is_eaten_but_only_prose_reaches_the_model():
 
 def test_k3c_an_address_that_does_not_exist_is_named_not_ignored():
     rows, by_msg = _rows_and_index()
-    runs, _skipped, missing = _compact.build_runs(rows, by_msg, {1, 99})
+    runs, _skipped, missing = _insert.build_runs(rows, by_msg, {1, 99})
     assert missing == [99]
     assert [r["addresses"] for r in runs] == [["m0001"]]
 
@@ -155,7 +155,7 @@ def test_k3d_a_selection_without_prose_is_compacted_like_any_other():
     взяться.
     """
     rows, by_msg = _rows_and_index()
-    runs, skipped, _missing = _compact.build_runs(rows, by_msg, {4})
+    runs, skipped, _missing = _insert.build_runs(rows, by_msg, {4})
     assert skipped == [], "выбор человека не обсуждается"
     assert [r["addresses"] for r in runs] == [["m0004"]]
     assert runs[0]["prose"] == [] and runs[0]["mute"] == [3]
@@ -168,7 +168,7 @@ def test_k3d_a_selection_without_prose_is_compacted_like_any_other():
     ("assistant", "assistant"), ("user", "user"), ("", ""),
 ])
 def test_k4_the_summary_role_never_equals_a_neighbour(before, after):
-    role = _compact.summary_role({"role": before} if before else None,
+    role = _insert.summary_role({"role": before} if before else None,
                                  {"role": after} if after else None)
     assert role in ("user", "assistant")
     assert role != after
@@ -178,9 +178,9 @@ def test_k4_the_summary_role_never_equals_a_neighbour(before, after):
 
 def test_k5_the_summary_lands_where_the_first_eaten_row_was():
     rows, by_msg = _rows_and_index()
-    runs, _skipped, _missing = _compact.build_runs(rows, by_msg, {1, 2, 3, 4, 5})
+    runs, _skipped, _missing = _insert.build_runs(rows, by_msg, {1, 2, 3, 4, 5})
     answers = [{"text": "СВОДКА"}]
-    new_rows, new_history, eaten = _compact._rebuild(rows, list(rows), runs, answers)
+    new_rows, new_history, eaten = _insert._rebuild(rows, list(rows), runs, answers)
 
     # Сводка ПЕРВАЯ: её пробег начинался с m0001, то есть с самого начала списка.
     assert _prompts.is_distillate(new_rows[0]["content"])
@@ -192,16 +192,16 @@ def test_k5_the_summary_lands_where_the_first_eaten_row_was():
 def test_k5b_the_input_lists_are_not_mutated():
     rows, by_msg = _rows_and_index()
     before = [dict(r) for r in rows]
-    runs, _s, _m = _compact.build_runs(rows, by_msg, {1, 2})
-    _compact._rebuild(rows, list(rows), runs, [{"text": "СВОДКА"}])
+    runs, _s, _m = _insert.build_runs(rows, by_msg, {1, 2})
+    _insert._rebuild(rows, list(rows), runs, [{"text": "СВОДКА"}])
     assert rows == before
 
 
 def test_k5c_two_runs_get_two_summaries_with_distinct_coordinates():
     rows, by_msg = _rows_and_index()
-    runs, _s, _m = _compact.build_runs(rows, by_msg, {1, 2, 5, 7})
+    runs, _s, _m = _insert.build_runs(rows, by_msg, {1, 2, 5, 7})
     answers = [{"text": "A"}, {"text": "B"}, {"text": "C"}]
-    new_rows, _hist, _eaten = _compact._rebuild(rows, list(rows), runs, answers)
+    new_rows, _hist, _eaten = _insert._rebuild(rows, list(rows), runs, answers)
     stamps = [r["timestamp"] for r in new_rows
               if _prompts.is_distillate(str(r.get("content", "")))]
     assert len(stamps) == 3
@@ -232,6 +232,30 @@ def test_k7_an_absorption_record_is_an_event_its_reader_sees(tmp_path, monkeypat
     assert _ledger.erased_ops(entries) == {}
 
 
+def test_k7c_the_absorption_keeps_the_interrogation_classification(tmp_path, monkeypatch):
+    """Поправка 9 журнала (2026-10-11): какой набор вопросов модель выбрала каждой теме —
+    в записи о поглощении; нет классификации — нет поля."""
+    monkeypatch.setattr(_ledger, "ledger_dir", lambda: tmp_path)
+    sets = [{"topic": "Мир «Вода»", "set": "general"}, {"topic": "Скрипт", "set": "work"}]
+    assert _ledger.note_absorbed("s-3", "m0015", ["m0002"], sets=sets) is True
+    assert _ledger.note_absorbed("s-3", "m0016", ["m0004"]) is True
+    got = _ledger.absorptions(_ledger.read_ledger("s-3"))
+    assert got["m0015"]["sets"] == sets
+    assert "sets" not in got["m0016"]
+
+
+def test_k7d_the_llmops_absorption_keeps_preset_and_wrap(tmp_path, monkeypatch):
+    """Поправка 10 журнала (2026-10-11): вставка окна LLMOps — каким пресетом и в какой обёртке;
+    нет — полей нет."""
+    monkeypatch.setattr(_ledger, "ledger_dir", lambda: tmp_path)
+    assert _ledger.note_absorbed("s-4", "m0035", ["m0033"], by="llmops",
+                                 preset="dedup", wrap="as-it-was") is True
+    assert _ledger.note_absorbed("s-4", "m0036", ["m0035"], by="llmops") is True
+    got = _ledger.absorptions(_ledger.read_ledger("s-4"))
+    assert (got["m0035"]["preset"], got["m0035"]["wrap"]) == ("dedup", "as-it-was")
+    assert "preset" not in got["m0036"] and "wrap" not in got["m0036"]
+
+
 def test_k7b_an_absorption_without_members_is_not_written(tmp_path, monkeypatch):
     monkeypatch.setattr(_ledger, "ledger_dir", lambda: tmp_path)
     # «Сводка не поглотила ничего» — не факт, а пустая запись; писать её значило бы
@@ -260,7 +284,7 @@ def test_k8_no_arguments_means_preview_the_model_is_not_called(monkeypatch):
     rows, by_msg = _rows_and_index()
     monkeypatch.setattr(_apply, "find_gateway_session", lambda agent: ({}, "тестовая"))
     monkeypatch.setattr(_apply, "db_history", lambda agent: (rows, ""))
-    monkeypatch.setattr(_compact, "_index", lambda session, rows: by_msg)
+    monkeypatch.setattr(_insert, "_index", lambda session, rows: by_msg)
 
     class _Engine:
         def live_agent(self):
@@ -297,7 +321,7 @@ def test_b1_start_background_refuses_with_nothing_to_compact():
 def test_b2_start_background_refuses_a_second_run_while_one_is_locked(monkeypatch):
     # Замок ЗАНЯТ значит «`acquire` не даётся», а не «`locked()` вернул True»: с 2026-09-22
     # `start_background` сам захватывает, а не спрашивает (`__HQ/deferred/03`).
-    monkeypatch.setattr(_compact, "_busy",
+    monkeypatch.setattr(_insert, "_busy",
                         type("L", (), {"acquire": lambda self, blocking=True: False})())
     out = _compact.start_background("s-1", object(), "m0001")
     assert out["ok"] is False and "уже идёт" in out["error"]
@@ -329,7 +353,7 @@ def test_b2b_the_lock_is_taken_where_the_decision_is_made_not_later_in_the_threa
         assert _compact._state_now["session"] == "s-1", "прогресс первого не затёрт вторым"
     finally:
         _compact._busy_since = 0.0
-        _compact._busy.release()
+        _insert._busy.release()
 
 
 def test_b3_start_background_answers_immediately_and_persists_the_outcome(tmp_path, monkeypatch):
@@ -387,7 +411,7 @@ def test_e1_deliver_mode_hands_the_tape_back_and_never_writes(monkeypatch):
     # Сессии гейтвея нет — в режиме автомата она и не нужна.
     monkeypatch.setattr(_apply, "find_gateway_session", lambda agent: (None, "нет гейтвея"))
     monkeypatch.setattr(_apply, "db_history", lambda agent: (rows, ""))
-    monkeypatch.setattr(_compact, "_index", lambda session, rows: by_msg)
+    monkeypatch.setattr(_insert, "_index", lambda session, rows: by_msg)
     monkeypatch.setattr(_compact, "distill_summary",
                         lambda *a, **kw: {"ok": True, "text": "СВОДКА", "input_chars": 10,
                                           "provider": "p", "model": "m", "tokens": 1})
@@ -429,7 +453,7 @@ def test_e2_the_tape_is_spliced_from_the_db_and_the_turn_tail(monkeypatch):
     monkeypatch.setattr(_llm, "available", lambda: (True, "тест"))
     monkeypatch.setattr(_apply, "find_gateway_session", lambda agent: (None, "нет гейтвея"))
     monkeypatch.setattr(_apply, "db_history", lambda agent: (rows, ""))
-    monkeypatch.setattr(_compact, "_index", lambda session, rows: by_msg)
+    monkeypatch.setattr(_insert, "_index", lambda session, rows: by_msg)
     monkeypatch.setattr(_compact, "distill_summary",
                         lambda *a, **kw: {"ok": True, "text": "СВОДКА", "input_chars": 10,
                                           "provider": "p", "model": "m", "tokens": 1})
@@ -469,7 +493,7 @@ def test_e3_eaten_empty_call_does_not_drag_the_tail_along():
             {"role": "assistant", "content": "снова готово"}]
     history = [dict(r) for r in rows]
     runs = [{"eaten": [0, 1, 2, 3], "kept": []}]
-    _, new_history, _ = _compact._rebuild(rows, history, runs, [{"text": "СВОДКА"}])
+    _, new_history, _ = _insert._rebuild(rows, history, runs, [{"text": "СВОДКА"}])
     tail = [m for m in new_history if m.get("tool_calls")]
     assert [m["tool_calls"][0]["id"] for m in tail] == ["c2"], "вызов хвоста на месте"
     assert any(m.get("tool_call_id") == "c2" for m in new_history)
@@ -495,12 +519,12 @@ def _wait_setup(monkeypatch, commits):
     monkeypatch.setattr(_apply, "find_gateway_session", lambda agent: (session, ""))
     monkeypatch.setattr(_apply, "history_of", lambda s: [dict(r) for r in db["rows"]])
     monkeypatch.setattr(_apply, "db_history", lambda agent: (list(db["rows"]), ""))
-    monkeypatch.setattr(_compact, "_index",
+    monkeypatch.setattr(_insert, "_index",
                         lambda session_id, rs: {f"m{i + 1:04d}": r for i, r in enumerate(rs)})
     monkeypatch.setattr(_compact, "distill_summary",
                         lambda *a, **kw: {"ok": True, "text": "СВОДКА", "input_chars": 10,
                                           "provider": "p", "model": "m", "tokens": 1})
-    monkeypatch.setattr(_compact, "WAIT_TURN_POLL_S", 0)
+    monkeypatch.setattr(_insert, "WAIT_TURN_POLL_S", 0)
 
     def commit(session_, agent, new_rows, **kw):
         written.append([str(r.get("content")) for r in new_rows])
@@ -566,6 +590,6 @@ def test_k9_splice_check_compares_like_with_like():
     history = [{"role": "user", "content": u1["content"]}, merged,
                {"role": "user", "content": u3["content"]}, {"role": "assistant", "content": a3["content"]},
                {"role": "user", "content": u4["content"]}, {"role": "assistant", "content": a4["content"]}]
-    out, why = _compact.splice_for_delivery(rows, new_rows, history)
+    out, why = _insert.splice_for_delivery(rows, new_rows, history)
     assert out is not None, why
     assert [m["role"] for m in out][-2:] == ["user", "assistant"]

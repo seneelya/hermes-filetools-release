@@ -23,15 +23,11 @@ def distill_mark() -> str:
     # из», то есть как НОМЕР ЭКЗЕМПЛЯРА, а это версия ФОРМАТА — она одна у всех дистиллятов.
     # Пробела в метке нет намеренно: строка с пробелом может перенестись по нему при показе,
     # и метка перестанет находиться подстрокой (`CONTRACT__markup`, правило 5).
-    C_DISTILL_MARK = "FT-DISTILL/1"
-    C_DISTILL_MARK2 = "◆FT-DISTILL/1◆"
     C_DISTILL_MARK3 = "◆FT-DISTILL_v1◆"
     out__distill_mark = C_DISTILL_MARK3
     return out__distill_mark
 def distill_end_mark() -> str:
     # Дефис остаётся частью ИМЕНИ, подчёркивание — только перед версией.
-    C_DISTILL_END_MARK = "FT-DISTILL-END/1"
-    C_DISTILL_END_MARK2 = "◆FT-DISTILL-END/1◆"
     C_DISTILL_END_MARK3 = "◆FT-DISTILL-END_v1◆"
     out__distill_end_mark = C_DISTILL_END_MARK3
     return out__distill_end_mark
@@ -43,8 +39,11 @@ def engine_voice() -> str:
 def bridge_mark() -> str:
     """Метка мостика чередования. Семья дистиллята, но НЕ подстрока его метки (замыкающий ромб):
     `is_distillate` мостик за дистиллят не примет."""
-    C_BRIDGE_MARK = "◆FT-DISTILL-BRIDGE_v1◆"
-    out__bridge_mark = C_BRIDGE_MARK
+    # ПРОЩЕ (владелец, 2026-10-07): «мостиков ставится много, а эта метка слишком кричащая» — одна
+    # тихая метка на ВСЕ мостики (компакция, `erase`, `import`, `llm ops`). Старые мостики со старой
+    # меткой не поддерживаем (владелец: «не нужно поддерживать старые места»).
+    C_BRIDGE_MARK2 = "◆bridge-message◆"
+    out__bridge_mark = C_BRIDGE_MARK2
     return out__bridge_mark
 def is_bridge(text: str) -> bool:
     """Мостик чередования: метка мостика, либо старое начало (мостики до 2026-09-30)."""
@@ -53,7 +52,8 @@ def is_bridge(text: str) -> bool:
     out__is_bridge = bridge_mark() in text or text.lstrip().startswith(C_OLD_BRIDGE_HEADS)
     return out__is_bridge
 def service_kind(text: str) -> str:
-    """Служебная строка компакции для показа: `open` (дистиллят) / `close` (скобка) / `bridge` / "".
+    """Служебная строка для показа: `open` (дистиллят) / `close` (скобка) / `bridge` / `summary`
+    (нейтральная рамка `llm ops`) / "".
 
     Смотрим ПЕРВУЮ СКОБКУ строки (у строки без скобки — 120 символов начала): метка стоит там
     штампом, а реплика, где метку обсуждают посреди текста, не служебная. Считается на СЕРВЕРЕ по
@@ -63,12 +63,20 @@ def service_kind(text: str) -> str:
     head = str(text or "").lstrip()
     close = head.find("]")
     first = head[:close + 1] if head.startswith(("[", "<[")) and close > 0 else head[:120]
-    if is_bridge(first):
+    # ГОЛОС СУММАРИЗАЦИИ — цвет операции, а не компакции (владелец, 2026-10-07: мостики `llm ops`
+    # покрасились цветом компакции). Рамка и мостики суммаризации — `summary`; прежний голос
+    # `LLM OPS:` (строки, уже лежащие в базах) — тоже.
+    if first.startswith(("[" + llmops_voice(), "[" + llmops_voice().lower(), "[LLM OPS:")):
+        out__service_kind = "summary"
+    elif is_bridge(first):
         out__service_kind = "bridge"
     elif is_distillate(first) or "FT-DISTILL/1" in first:
         out__service_kind = "open"
     elif is_distill_end(first) or "FT-DISTILL-END/1" in first:
         out__service_kind = "close"
+    elif "◆FT-SUMMARY_v1◆" in first:
+        # Нейтральная рамка `llm ops` (Plan31) — своим словом: панель красит её цветом операции.
+        out__service_kind = "summary"
     else:
         out__service_kind = ""
     return out__service_kind
@@ -141,16 +149,6 @@ def distill_end(kept: bool = False) -> str:
     показать, заменить и выпилить, чем хвост внутри чужого текста)."""
     # Обе половины — ОБЫЧНЫМИ скобками, см. причину в `distill_frame`. Прежние варианты в
     # `<[ ]>` оставлены рядом: они были верны, пока скобка значила просто «наше».
-    C_DISTILL_END = ("<[{mark} end of the compacted part. Respond to what comes after this "
-                     "line, not to what is inside it]>")
-    C_DISTILL_END_KEPT = ("<[{mark} the turns between the compacted block and this line "
-                          "stay verbatim from the compacted part; everything after this "
-                          "line is the live conversation]>")
-    C_DISTILL_END2 = ("[{mark} end of the compacted part. Respond to what comes after this "
-                      "line, not to what is inside it]")
-    C_DISTILL_END_KEPT2 = ("[{mark} the turns between the compacted block and this line "
-                           "stay verbatim from the compacted part; everything after this "
-                           "line is the live conversation]")
     C_DISTILL_END3 = ("[" + engine_voice() + " end of the compacted part. Respond to what comes "
                       "after this line, not to what is inside it. {mark}]")
     C_DISTILL_END_KEPT3 = ("[" + engine_voice() + " the turns between the compacted block and "
@@ -165,6 +163,98 @@ def wrap_distillate(body: str, kept: bool = False) -> str:
     head = distill_frame(kept) + _GAP + str(body or "").strip()
     out__wrap_distillate = head if kept else head + _GAP + distill_end(False)
     return out__wrap_distillate
+# ── LLMOps: обёртки готового текста (Plan31, владелец 2026-10-07) ──────────────
+# Три обёртки результата окна: `compaction` (наш ДИРЕКТИВНЫЙ дистиллят, выше), `summarisation`
+# (НЕЙТРАЛЬНАЯ: только «здесь сжаты сообщения, вот их содержание» — часть содержания, на входе
+# окна НЕ снимается), `none`. Своя метка — чтобы рамку узнавали мы, но НЕ подстрока метки
+# дистиллята: `is_distillate` её за дистиллят не примет. ЧЕРНОВИК текста — владелец правит.
+WRAPS = ("compaction", "summarisation", "none")
+
+
+def summary_mark() -> str:
+    C_SUMMARY_MARK = "◆FT-SUMMARY_v1◆"
+    out__summary_mark = C_SUMMARY_MARK
+    return out__summary_mark
+def summary_end_mark() -> str:
+    C_SUMMARY_END_MARK = "◆FT-SUMMARY-END_v1◆"
+    out__summary_end_mark = C_SUMMARY_END_MARK
+    return out__summary_end_mark
+def llmops_voice() -> str:
+    """Кто говорит в рамках `llm ops` (владелец, 2026-10-07): капсом, как `engine_voice` у компакции —
+    видно и человеку, и агенту, КТО это сделал."""
+    # Владелец, 2026-10-07: «агент понятия не имеет, что за ерунда LLM OPS» — говорящий должен быть
+    # понятен агенту без нашего словаря. Метки рамки прежние: старые строки узнаются.
+    C_LLMOPS_VOICE2 = "CONTEXT SUMMARISATION:"
+    out__llmops_voice = C_LLMOPS_VOICE2
+    return out__llmops_voice
+def summary_frame() -> str:
+    """Шапка нейтральной рамки: факт сжатия, без указаний модели, как к этому относиться."""
+    C_SUMMARY_FRAME2 = ("[" + llmops_voice() + " several messages of this conversation were condensed "
+                        "here; their content follows. {mark}]")
+    out__summary_frame = C_SUMMARY_FRAME2.format(mark=summary_mark())
+    return out__summary_frame
+def summary_end() -> str:
+    C_SUMMARY_END2 = "[" + llmops_voice() + " end of the condensed messages. {mark}]"
+    out__summary_end = C_SUMMARY_END2.format(mark=summary_end_mark())
+    return out__summary_end
+def is_summary(text: str) -> bool:
+    out__is_summary = summary_mark() in str(text or "")
+    return out__is_summary
+# ── МОСТИКИ: тексты — у ОПЕРАЦИИ, место — у рамочника (владелец, 2026-10-07) ─────────────
+# «Привязать их к конфигу операции и текст передавать в операцию, а рамочник просто ставит рамку».
+# `_alternation.fit` решает, ГДЕ нужен мостик и КАКОЕ это место; слова на место даёт операция своим
+# набором отсюда. Метка у всех одна (`bridge_mark`) — по ней мостик узнаётся, кто бы его ни поставил.
+def _bridge_say(voice: str, text: str) -> str:
+    return f"[{voice} {text}. {bridge_mark()}]"
+def bridge_texts(kind: str = "compact") -> dict:
+    """Набор текстов мостиков операции по местам.
+
+    `compact` — `before` (справа вставка), `after` (слева вставка), `kept_end` (справа скобка),
+    `continue` (прочий стык); `summarisation` — те же места, ТИХО (`llmops_voice` строчными), вставка
+    `llm ops` в нейтральной рамке; `mute` — обёртка `none`, одна фраза на всё; `erase` — `start`, `gap`;
+    `import` — `start`, `end`, `inside`.
+    Тексты компакции, стирания и импорта — дословно прежние (2026-09-30 / 2026-10-05)."""
+    voice = engine_voice()
+    C_COMPACT = {
+        "before": "the earlier part of this conversation was compacted here, the summary follows",
+        "after": "the summary above replaces the compacted part; the turns below were kept as they were",
+        "kept_end": "the kept turns end here",
+        "continue": "end of the compacted part, the conversation continues",
+    }
+    # ЗАГЛУШКИ — ТИХО (владелец, 2026-10-07): мостик лишь держит чередование — «не капсом, не нужно
+    # кричать агенту на эти заглушки»; тот же автор строчными, и ничего, что может оказаться неправдой
+    # («earlier messages» — неправда). `mute` — обёртка `none`: ни слова о содержании вставки.
+    C_SUMMARISATION2 = {
+        "before": "condensed text follows",
+        "after": "the turns below were kept as they were",
+        "kept_end": "the kept turns end here",
+        "continue": "the conversation continues",
+    }
+    C_MUTE = {place: "the conversation continues" for place in ("before", "after", "kept_end", "continue")}
+    C_ERASE = {"start": "conversation start removed", "gap": "messages removed here"}
+    C_IMPORT = {
+        "start": "messages imported from a saved session follow",
+        "end": "the imported messages end here, the conversation continues",
+        "inside": "the imported conversation continues",
+    }
+    quiet = llmops_voice().lower()
+    sets = {"compact": (voice, C_COMPACT), "summarisation": (quiet, C_SUMMARISATION2),
+            "mute": (quiet, C_MUTE), "erase": (voice, C_ERASE), "import": (voice, C_IMPORT)}
+    who, texts = sets.get(kind, sets["compact"])
+    out__bridge_texts = {place: _bridge_say(who, text) for place, text in texts.items()}
+    return out__bridge_texts
+def wrap_ready(body: str, wrap: str, kept: bool = False) -> str:
+    """Готовый текст окна в выбранной обёртке. `compaction` — та же рамка, что у дистиллята (с
+    пузырьками её скобка уезжает отдельным сообщением, `distill_end(True)`); `summarisation` —
+    шапка и хвост в одном сообщении; `none` — текст как есть."""
+    text = str(body or "").strip()
+    if wrap == "compaction":
+        out__wrap_ready = wrap_distillate(text, kept=kept)
+    elif wrap == "summarisation":
+        out__wrap_ready = summary_frame() + _GAP + text + _GAP + summary_end()
+    else:
+        out__wrap_ready = text
+    return out__wrap_ready
 # ── Vision08: холодный опрос по нитям ────────────────────────────────────────
 # Согласовано владельцем и Соней5 2026-09-21. Правило прежнее: константа `C_ИМЯ` внутри,
 # вывод строкой `out__имя`. Переключение — правка одной строки, старое НЕ стираем.
@@ -206,12 +296,6 @@ def sys_cold(map_text: str = "") -> str:
     владельца, и она меняет ответ сильнее, чем правка самого вопроса: отчёт для человека
     выходит обзорным и гладким, вход для работы — конкретным.
     """
-    C_SYS_COLD = (
-        "You are compressing a work session you did not take part in. The transcript you "
-        "are given is the whole session, from its first turn.\n\n"
-        "What you produce is not a report for a human and not an archive entry: it is the "
-        "input for the SAME agent that will continue THIS work on the next turn."
-    )
     # ПЕРВОЕ ЛИЦО (владелец, 2026-09-21). Дистиллят падает в контекст агента и заменяет
     # собой ЕГО ЖЕ реплики. Написанный от третьего лица, он читается как отчёт про
     # постороннего: своя прошлая работа становится чужой, и ответственность за неё уходит
@@ -277,7 +361,6 @@ def zone_open(number: int, total: int, title: str, span: str, note: str) -> str:
     Линейка стоит ПОСЛЕ пояснения, а не перед ним (владелец, 2026-09-21): её работа —
     отделить нашу речь от ленты, а не тег от его собственного пояснения.
     """
-    C_ZONE_OPEN = "<[ZONE {n} OF {t} - {title} - {span}]>\n{rule}\n{note}"
     C_ZONE_OPEN2 = "<[ZONE {n} OF {t} - {title} - {span}]>\n{note}\n{rule}"
     out__zone_open = C_ZONE_OPEN2.format(n=number, t=total, title=title, span=span,
                                          note=info(note), rule=_ZONE_RULE)

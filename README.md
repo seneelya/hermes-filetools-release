@@ -1,54 +1,145 @@
 # hermes-filetools
 
-A plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent): file tools with plain-text
-answers, a context engine (manual and automatic compaction of a session into a distillate), and a
-panel in the Hermes desktop app (prompt mirror, token strip, operations, config).
+**TL;DR**
 
-**Built first of all for Hermes Desktop.** The panel lives inside the desktop app; the file tools
-and the context engine work in any Hermes session, but seeing and steering the context is done
-from the desktop app.
+**The goal: the user owns the context and runs the session — not the agent.** You see every
+message the model receives, and you decide what stays, what gets edited, cut or compacted, and when.
 
-This repository holds RELEASES only — one commit and one tag (`vX.Y.Z`) per version. Development
-happens elsewhere.
+- A plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), built first of all
+  for **Hermes Desktop**.
+- **File tools** that answer in plain text, with an operation number on every answer.
+- **A panel** in the desktop app: every message the model receives, editable in place, with an
+  honest token counter.
+- **Compaction by interrogation**: the model is questioned about the old part of the session,
+  with a question set picked per topic, and the code builds the distillate from the answers.
+  By hand or automatically.
+- **LLM operations** on any selection of messages: summarise, remove repetitions or your own
+  prompt — then put the result in their place.
+- **The price, known and chosen:** changing the past costs the provider's prompt cache — the
+  prefix is computed again from the changed point. The plugin is aimed at **local LLMs** and at
+  getting the most out of them, where a recomputed prefix costs time, not money.
+- Verified on Hermes `c0ef5af520` (2026-10-11).
+
+## Install
+
+1. Install, and answer **yes** when Hermes asks to enable the plugin and to grant
+   `tools.override`:
+
+   ```
+   hermes plugins install https://github.com/seneelya/hermes-filetools-release
+   ```
+
+   **IMPORTANT — the `tools.override` capability.** Our file tools replace Hermes' built-in ones
+   under the same names, and Hermes allows that only with this capability. Your **yes** writes it
+   into `<HERMES_HOME>/config.yaml`:
+
+   ```yaml
+   plugins:
+     entries:
+       hermes-filetools:
+         granted_capabilities:
+           - tools.override
+   ```
+
+   Without it Hermes loads the plugin but **silently keeps its own** `read_file` / `write_file` /
+   `patch` / `search_files` / `terminal` — no error anywhere. Answered no, or not sure? Grant it
+   now:
+
+   ```
+   hermes plugins enable hermes-filetools --allow-tool-override
+   ```
+
+2. **IMPORTANT — switch on our context engine.** Hermes does not do this for you, and without it
+   there is no compaction at all (neither the button nor the automatic one) and no context
+   operations from the panel:
+
+   ```
+   hermes config set context.engine ctxctl
+   ```
+
+   or add it to `<HERMES_HOME>/config.yaml` by hand:
+
+   ```yaml
+   context:
+     engine: ctxctl
+   ```
+
+3. Close the desktop client, restart the gateway, open the client again:
+
+   ```
+   hermes gateway restart
+   ```
+
+Something does not work → [What Hermes' config must have](#what-hermes-config-must-have).
 
 ![The hermes-filetools panel in the Hermes desktop app](Screenshot_panel.jpg)
 
 ## What you get
 
-- **File tools with plain-text answers.** `read_file`, `write_file`, `patch`, `search_files`,
-  `terminal`, `execute_code`, `process`, `vision_analyze` replace Hermes' built-in ones under the
-  same names. The model reads text, not JSON; every call gets an **operation number**
-  (`Operation ID: 0015`) at the top of its answer. The panel and the commands refer to it — and so
-  can the agent, because it sees it. In a live conversation you can say *"the file you read in
-  operation 0015"* and the agent knows which one. (Message numbers — `m0042` in the panel — the
-  agent does NOT see during the conversation; use them in the panel, not in chat.)
-- **The panel (Mirror).** Every message the model actually receives, in order, grouped by turn:
-  your messages, the model's replies, every tool call with its result. Click any of them for the
-  full text, the full call, its size in tokens.
-- **Edit any message in place — without breaking the chain.** Fix a reply or a request of yours
-  right in the window (Edit → Save / Discard); the next turn sees the corrected text. Tool calls,
-  their results and the order of the conversation stay as they are. A handy trick: put a label
-  into one of your earlier messages and then say in chat *"in my message marked [X] I wrote …"* —
-  the agent sees the edited text and finds it.
-- **Save and load sessions as Markdown.** Save one message or a whole selection as plain `.md`
-  files, read and edit them in any editor, and import the folder back — into the same session or
-  into another one. Edit the text of messages freely; **leave tool calls and their results alone**
-  — a call and its result are a pair, and an import with a broken pair is refused (or, if it
-  slips through, confuses the model).
+### File tools with plain-text answers
 
-Yes, editing the past **breaks the provider's prompt cache** — the next request is computed from
-the edited point on. That is a deliberate trade: sometimes the right context matters more than
-the cache. This plugin is aimed first of all at **your own server with local LLMs**, where a
-recomputed prompt costs time, not money.
-- **Trim the context by hand.** Drop the body of a tool result you no longer need (a tombstone
-  stays, the model knows something was there) or erase whole messages.
-- **Our own token counter.** It counts what the model really receives — the system prompt, the
-  tool schemas and every message — asking the model server's own tokenizer when it can (llama.cpp)
-  and estimating otherwise, then corrects itself by the real numbers the server reports. Even on a
-  session you have just opened, before any turn, it is far closer to the truth than the counter
-  built into the desktop app. The token strip in the panel and the auto-compaction threshold use it.
-- **Compaction** — see below.
-- **Config** in the panel, plus a check that the plugin still fits the Hermes you run (below).
+`read_file`, `write_file`, `patch`, `search_files`, `terminal`, `execute_code`, `process`,
+`vision_analyze` replace Hermes' built-in ones under the same names. The model reads text, not JSON;
+every call gets an **operation number** (`Operation ID: 0015`) at the top of its answer. The panel
+and the commands refer to it — and so can the agent, because it sees it. In a live conversation you
+can say *"the file you read in operation 0015"* and the agent knows which one. (Message numbers —
+`m0042` in the panel — the agent does NOT see during the conversation; use them in the panel, not in
+chat.)
+
+### The panel (Mirror)
+
+Every message the model actually receives, in order, grouped by turn: your messages, the model's
+replies, every tool call with its result. Click any of them for the full text, the full call, its
+size in tokens. A `patch` call reads as a diff — lines that go on red, lines that come on green —
+and the same new lines are marked in the file excerpt of its answer.
+
+### Edit any message in place — without breaking the chain
+
+Fix a reply or a request of yours right in the window (Edit → Save / Discard); the next turn sees
+the corrected text. Tool calls, their results and the order of the conversation stay as they are. A
+handy trick: put a label into one of your earlier messages and then say in chat *"in my message
+marked [X] I wrote …"* — the agent sees the edited text and finds it.
+
+### Save and load sessions as Markdown
+
+Save one message or a whole selection as plain `.md` files, read and edit them in any editor, and
+import the folder back — into the same session or into another one. Edit the text of messages
+freely; **leave tool calls and their results alone** — a call and its result are a pair, and an
+import with a broken pair is refused (or, if it slips through, confuses the model).
+
+Yes, editing the past **breaks the provider's prompt cache** — the next request is computed from the
+edited point on. That is a deliberate trade: sometimes the right context matters more than the
+cache. This plugin is aimed first of all at **your own server with local LLMs**, where a recomputed
+prompt costs time, not money.
+
+### Trim the context by hand
+
+Drop the body of a tool result you no longer need (a tombstone stays, the model knows something was
+there) or erase whole messages.
+
+### Our own token counter
+
+It counts what the model really receives — the system prompt, the tool schemas and every message —
+asking the model server's own tokenizer when it can (llama.cpp) and estimating otherwise, then
+corrects itself by the real numbers the server reports. Even on a session you have just opened,
+before any turn, it is far closer to the truth than the counter built into the desktop app. The
+token strip in the panel and the auto-compaction threshold use it.
+
+### LLM operations on a selection
+
+Tick messages in the Mirror and open the LLMOps window: talk to a model about exactly those messages
+(summarise them, remove repetitions, or your own prompt), edit the answer, and put it into the
+conversation in their place. Replies render as Markdown (the book view), raw text is one click away;
+the window remembers its size and place.
+
+### Compaction
+
+See [How our compaction differs](#how-our-compaction-differs-work-in-progress).
+
+### Config
+
+In the panel, plus a check that the plugin still fits the Hermes you run
+([Checking compatibility](#checking-compatibility-after-a-hermes-update)).
 
 ## How our compaction differs (work in progress)
 
@@ -59,9 +150,15 @@ what the next question is depends on what the previous answers found. The point 
 not a short retelling but what the continuation actually needs: decisions, facts that were
 checked, what was tried and failed.
 
+The model first names the topics of the chosen part, then — having seen a menu of question sets —
+picks a set for each topic: work on a system, an investigation, a design, rules, a plain
+conversation, a short exchange, or a neutral set for everything else (a story, a made-up world, a
+plan). A literary session is not interrogated like code. The document is assembled by the code
+from the answers, never glued together by the model.
+
 **Not finished yet:**
 
-- Only **one branch** of the scheme is implemented so far.
+- More question sets (literature and others) are planned.
 - The plan is to also question the **"hot" agent** — the agent of the session itself, with its
   whole context still in front of it — **before** the compaction, so that the spirit of the
   session and the knowledge only it holds pass into the continuation instead of being lost. Not
@@ -69,21 +166,6 @@ checked, what was tried and failed.
 
 You can start a compaction from the panel (pick the messages or take the suggested ones), and the
 engine can do it automatically when the context fills up to a threshold you set in Config.
-
-## Install
-
-```
-hermes plugins install https://github.com/seneelya/hermes-filetools-release
-```
-
-The plugin lands in `<HERMES_HOME>/plugins/hermes-filetools`. Enable it when asked (or
-`hermes plugins enable hermes-filetools`), then restart the gateway **with the desktop client
-closed**:
-
-```
-hermes gateway restart
-```
-
 
 ## What Hermes' config must have
 
@@ -115,9 +197,10 @@ context:
   gateway.
 - Check: after a gateway restart `<HERMES_HOME>/logs/agent.log` has
   `capability_check plugin=hermes-filetools capability=tools.override decision=allow`.
-- Python packages the plugin needs (`openpyxl`, `firecrawl-anydoc`, and `pytest` for the full
-  compatibility check) are installed by Hermes itself on install (`pip_dependencies` in
-  `plugin.yaml`).
+- Python packages the plugin needs (`openpyxl`, `firecrawl-anydoc`, the `tree-sitter` grammars
+  for reading code by blocks, and `pytest` for the full compatibility check) are installed by
+  Hermes itself on install (`pip_dependencies` in `plugin.yaml`). The list also carries `ddgs` — not ours: Hermes' own `web_search` backend,
+  which their installer leaves out (search then falls back to the keyless tier).
 
 ## Update
 
@@ -126,6 +209,9 @@ hermes plugins update hermes-filetools
 ```
 
 Then restart the gateway with the desktop client closed.
+
+This repository holds RELEASES only — one commit and one tag (`vX.Y.Z`) per version.
+Development happens elsewhere.
 
 ## Your settings
 
@@ -179,7 +265,7 @@ access to the session, the gateway's memory, the tool registry, the way results 
 There is no other way to reach these things, and a Hermes update can move or change them. That is
 why every release names the Hermes commit it was verified on:
 
-**This version was verified on Hermes `b79c45bd3e` (2026-10-06).**
+**This version was verified on Hermes `c0ef5af520` (2026-10-11).**
 
 The same line is shown in the panel next to the check buttons. Running a newer Hermes? Run the
 check below before trusting the plugin.

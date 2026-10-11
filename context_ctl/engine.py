@@ -31,6 +31,7 @@ import time
 from agent.context_engine import ContextEngine
 
 from . import _bridge, _state, _tokcount
+from . import _insert
 
 # Как часто перезаписываем статус-файл на «скучных» событиях (учёт токенов). События,
 # которые действительно что-то меняют (старт сессии, первый увиденный системный промпт,
@@ -190,7 +191,7 @@ class ContextCtlEngine(ContextEngine):
         if d.get("fire") and d.get("enabled"):
             from . import _compact
             gate_ok, gate_why = _tokcount.auto_gate(self._tok.auto, rep.get("turn_key"),
-                                                    _compact._busy.locked(), time.time())
+                                                    _insert._busy.locked(), time.time())
         fire = bool(d.get("fire") and d.get("enabled") and gate_ok)
         if fire and commit:
             _tokcount.auto_started(self._tok.auto, rep.get("turn_key"))
@@ -312,7 +313,7 @@ class ContextCtlEngine(ContextEngine):
             rows, why = _apply.db_history(agent)
             if why:
                 return "не сделана — " + why
-            by_msg = _compact._index(self._session_id, rows)
+            by_msg = _insert._index(self._session_id, rows)
             addr_of = {id(r): a for a, r in by_msg.items()}
             addresses = [addr_of.get(id(r), "") for r in rows]
             # Спутник `ledger.jsonl` — записи операций (Plan27-Task01).
@@ -333,7 +334,7 @@ class ContextCtlEngine(ContextEngine):
             return
         try:
             from . import _compact
-            _compact.finalize_delivered(self._session_id, self, fin)
+            _insert.finalize_delivered(self._session_id, self, fin)
         except Exception:  # noqa: BLE001 - свидетельство неполно, но лента уже записана
             pass
 
@@ -440,33 +441,18 @@ class ContextCtlEngine(ContextEngine):
             del self._drops[:-_DROP_LOG_KEEP]
         self._write_status(force=True)
 
-    def apply_drop(self, ops, mode: str = "content") -> dict:
-        """Применить действие к названным операциям ЭТОЙ сессии. Отчёт — словарём.
-
-        `mode` — объект действия (`content` / `tool`), тем же словом, каким оно названо на
-        кнопке в панели. Default — `content`: он был единственным, когда дверь появилась, и
-        вызывающий без режима имеет в виду именно его.
-
-        ЕДИНСТВЕННАЯ дверь для панели (`POST /context-apply` → кнопка «применить»), и
-        сделана она методом на движке, а не импортом, по конкретной причине. Дашбордная
-        половина плагина загружается Хермесом ПО ПУТИ, вне пакета, — относительный импорт
-        `_command` там невозможен в принципе, а угадывать имя нашего пакета в `sys.modules`
-        значило бы завести ещё один приватный шов их плагин-лоадера. Живой движок маршрут
-        и так достаёт из реестра гейтвея (`_sessions[key]["agent"].context_compressor`,
-        тот же путь, которым ходит их собственный диспетчер), а объект движка — уже часть
-        нашего пакета, и внутри него все импорты обычные.
-
-        Сессию не выбираем и не угадываем: применяем к той, чей это движок.
-        """
-        from . import _command
-        return _command.run(self._session_id, self, list(ops or []), mode)
-
     def apply_addresses(self, operation: str, addrs) -> dict:
         """Операция над m-адресами этой сессии (Plan16-Task08): `content` или `erase`.
 
-        Одна дверь на все операции, чей предмет — сообщения, а не номера операций (владелец,
-        2026-09-29). Тот же приём метода на движке, что у `apply_drop`: дашбордная половина
-        грузится по пути и импортировать `_command` не может.
+        ЕДИНСТВЕННАЯ дверь панели для операций над контекстом (Plan23, 2026-10-06: путь номеров
+        операций `apply_drop` / `POST /context-apply` снят). Методом на движке, а не импортом,
+        по конкретной причине: дашбордная половина плагина загружается Хермесом ПО ПУТИ, вне
+        пакета, — относительный импорт `_command` там невозможен в принципе, а угадывать имя
+        нашего пакета в `sys.modules` значило бы завести ещё один приватный шов их
+        плагин-лоадера. Живой движок маршрут и так достаёт из реестра гейтвея
+        (`_sessions[key]["agent"].context_compressor`), а внутри движка импорты обычные.
+
+        Сессию не выбираем и не угадываем: применяем к той, чей это движок.
         """
         from . import _command
         return _command.run_addresses(self._session_id, self, list(addrs or []), operation)
@@ -489,11 +475,11 @@ class ContextCtlEngine(ContextEngine):
         """Запустить компакцию В ФОНЕ для НАЗВАННЫХ m-адресов этой сессии (Plan16-Task03).
 
         Рельса компакции отдаёт голые m-адреса (`m0001`, `m0007`, …) как есть — для неё, в
-        отличие от `apply_drop`, предметом работы являются сами сообщения, а не операции
+        отличие от прежнего `apply_drop`, предметом работы являются сами сообщения, а не операции
         (`ops`), и разрешать их во что-то ещё не нужно. `,`-список — та же форма, что уже
-        понимает `/ctx-compact m0001,m0007` (`_compact.parse_spec`), никакой новой не заводим.
+        понимает `/ctx-compact m0001,m0007` (`_insert.parse_spec`), никакой новой не заводим.
 
-        Та же причина метода-на-движке, что у `apply_drop`: дашбордная половина не может
+        Та же причина метода-на-движке, что у `apply_addresses`: дашбордная половина не может
         импортировать `_compact` напрямую (по пути, вне пакета), а живой движок уже достаётся
         из реестра гейтвея тем же маршрутом.
 
@@ -504,6 +490,54 @@ class ContextCtlEngine(ContextEngine):
         from . import _compact
         spec = ",".join(str(a).strip() for a in (addrs or []) if str(a or "").strip())
         return _compact.start_background(self._session_id, self, spec)
+
+    def start_ready(self, addrs, text: str, wrap: str, preset: str = "") -> dict:
+        """LLMOps (Plan31): поставить ГОТОВЫЙ текст на место m-адресов ВСТАВКОЙ В ЛЕНТУ (`_insert`) —
+        операция `llm ops`, не компакция. В фоне, общим замком записи; итог — файл состояния
+        (`GET /context-compact-status`, `who: "llmops"`). `wrap` — `compaction` / `summarisation` / `none`;
+        `preset` — ключ пресета окна, только для журнала."""
+        from . import _llmops
+        return _llmops.start_replace(self._session_id, self, list(addrs or []),
+                                     str(text or ""), str(wrap or ""), str(preset or ""))
+
+    # ── LLMOps (Plan31 Таск 2): окно зовёт движок тем же приёмом, что `start_compact` —
+    # дашбордная половина наш пакет не импортирует. Маршрут к модели — маршрут опроса компакции.
+    def llmops_data(self, addrs) -> dict:
+        """Данные окна по m-адресам (`_llmops.window_data`)."""
+        from . import _apply, _llmops
+        agent = self.live_agent()
+        if agent is None:
+            return {"ok": False, "error": "живого агента нет — сессия не открыта"}
+        rows, why = _apply.db_history(agent)
+        if why:
+            return {"ok": False, "error": why}
+        from . import _compact
+        by_msg = _insert._index(self._session_id, rows)
+        if not by_msg:
+            return {"ok": False, "error": "адресов сообщений нет — индексатор не разметил сессию"}
+        return _llmops.window_data(self._session_id, rows, by_msg, list(addrs or []))
+
+    def llmops_chat(self, messages, model: str = "", think: bool = False) -> dict:
+        """Разговор окна одним запросом (`_llmops.chat`)."""
+        from . import _llm, _llmops
+        with _llm.use_route(self.live_agent()):
+            return _llmops.chat(messages, model, think)
+
+    def llmops_models(self) -> dict:
+        """Модели сервера маршрута (`_llmops.models`)."""
+        from . import _llm, _llmops
+        with _llm.use_route(self.live_agent()):
+            return _llmops.models()
+
+    def llmops_presets(self) -> list:
+        """Пресеты окна (`_prompts/_llmops.py`)."""
+        from . import _llmops
+        return _llmops.presets()
+
+    def llmops_frames(self) -> dict:
+        """Тексты обёрток результата для показа в окне (`_llmops.frame_texts`)."""
+        from . import _llmops
+        return _llmops.frame_texts()
 
     def note_rewrite(self) -> None:
         """Наша запись переписала ленту (`_apply.commit_replacement`): якорь и точный замер —
@@ -530,7 +564,7 @@ class ContextCtlEngine(ContextEngine):
         rows, why = _apply.db_history(agent)
         if why:
             return {"ok": False, "picked": [], "lines": [why]}
-        by_msg = _compact._index(self._session_id, rows)
+        by_msg = _insert._index(self._session_id, rows)
         report = _cut.select(rows, _settings.compaction(), share)
         lines = _cut.explain(report)
         if report["index"] < 0:
@@ -616,7 +650,6 @@ class ContextCtlEngine(ContextEngine):
         return {
             "engine": self.name,
             "plugin_version": self.plugin_version,
-            "task": "Plan13: механизм 1 (заглушки) работает, автокомпакции нет",
             "session_id": self._session_id,
             "session_kwargs": self._session_kwargs,
             "bridge": {

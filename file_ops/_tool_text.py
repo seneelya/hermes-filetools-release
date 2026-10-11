@@ -419,8 +419,12 @@ def as_removed(text: str, *, symbols: dict = None, op: str = "", tool: str = "")
 def render_json_result(raw: str, *, labels: dict = None, body_keys=("output",),
                        head_keys=(), value_formatters: dict = None,
                        symbols: dict = None, body_max_chars: int = None,
-                       spill_dir: str = None, op: str = "") -> str:
+                       spill_dir: str = None, op: str = "",
+                       count_body: bool = False) -> str:
     """JSON string (their contract) → plain text (ours).
+
+    `count_body` — a LIST body whose items are things (processes), not lines of
+    output: its count goes in the header, `Processes: 0` included.
 
     `body_keys` — candidate keys holding the big field that goes BELOW the
     separator; the first one PRESENT wins (present, not truthy: an empty body
@@ -459,10 +463,11 @@ def render_json_result(raw: str, *, labels: dict = None, body_keys=("output",),
         return raw
 
     body_value = None
+    body_key = ""
     for key in body_keys:
         found = data.pop(key, None)
-        if body_value is None:
-            body_value = found
+        if body_value is None and found is not None:
+            body_value, body_key = found, key
 
     lines = []
     first = op_line(op)
@@ -486,6 +491,13 @@ def render_json_result(raw: str, *, labels: dict = None, body_keys=("output",),
         if _skip(value):
             continue
         lines.append(field(key, value))
+
+    # A collection body is COUNTED in the header, empty or not, the way search says
+    # `Found: 0`: `process list` with nothing running used to come back as the bare op
+    # line, while their JSON said `"processes": []` (live 2026-10-06, `deferred/20`).
+    # Opt-in: a list of OUTPUT lines counted would be noise. Empty text stays silent.
+    if count_body and isinstance(body_value, list):
+        lines.append(field(body_key, len(body_value)))
 
     header = "\n".join(lines)
     body = _render_body(body_value, labels)

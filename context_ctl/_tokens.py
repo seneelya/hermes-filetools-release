@@ -180,12 +180,24 @@ def row_units(row: dict, markup: dict) -> tuple[int, int]:
     role = row.get("role")
     units = count_ours(wire_text(row))
     for call in row_calls(row):
-        args = call_args(call)
-        units += count_ours((call.get("function") or {}).get("name") or "")
-        for key, val in args.items():
-            units += count_ours(key)
-            units += count_ours(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False))
+        units += call_units(call)
     return units, row_markup(role, row, markup)
+
+
+def call_units(call: dict) -> int:
+    """Наши единицы ОДНОГО вызова: имя, ключи и значения аргументов раскодированными."""
+    units = count_ours((call.get("function") or {}).get("name") or "")
+    for key, val in call_args(call).items():
+        units += count_ours(key)
+        units += count_ours(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False))
+    return units
+
+
+def call_markup(call: dict, markup: dict) -> int:
+    """Разметка шаблона ОДНОГО вызова (вызов плюс параметры сверх первого), в токенах модели."""
+    if not markup:
+        return 0
+    return markup.get("call", 0) + max(len(call_args(call)) - 1, 0) * markup.get("param", 0)
 
 
 def row_markup(role, row, markup) -> int:
@@ -196,7 +208,7 @@ def row_markup(role, row, markup) -> int:
     if role == "assistant":
         extra = 0
         for call in row_calls(row):
-            extra += markup.get("call", 0) + max(len(call_args(call)) - 1, 0) * markup.get("param", 0)
+            extra += call_markup(call, markup)
         return markup.get("assistant", 0) + extra
     return 0  # tool: обёртка результата посчитана в `call` у вызова
 
@@ -205,6 +217,13 @@ def row_tokens(row: dict, mult: float, markup: dict) -> int:
     """Строка в токенах модели: наш счёт × множитель токенизатора + разметка шаблона."""
     units, mk = row_units(row, markup or {})
     return round(units * (mult or 1.0)) + mk
+
+
+def call_tokens(call: dict, mult: float, markup: dict) -> int:
+    """ОДИН вызов в токенах модели — доля строки ассистента, которая его несёт. Чип тула в зеркале
+    показывает вызов + ответ (у записи ответ пустяковый, а вызов несёт весь файл), чип реплики —
+    только прозу (владелец, 2026-10-06). Итоги по-прежнему считаются по строкам (`row_tokens`)."""
+    return round(call_units(call) * (mult or 1.0)) + call_markup(call, markup or {})
 
 
 # --------------------------------------------------------------------------- файл моделей

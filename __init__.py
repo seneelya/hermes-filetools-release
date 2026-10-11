@@ -75,7 +75,7 @@ try:  # plugin mode
                            modify_file_new_core, terminal_core, execute_code_core,
                            process_core, vision_analyze_core)
     from .file_ops.mocks import tool_error
-    from .file_ops._schema_loader import load_schema
+    from .file_ops._schema_loader import load_schema, fill as fill_placeholders
     from .file_ops import _vocab
     from .file_ops._new_format import DEFAULT_SYMBOLS
     from .file_ops.flags import has_flag
@@ -91,7 +91,7 @@ except ImportError:  # console/dev mode: put file_ops/ on sys.path
     import modify_file_new_core, terminal_core, execute_code_core  # type: ignore
     import process_core, vision_analyze_core  # type: ignore
     import mocks  # type: ignore
-    from _schema_loader import load_schema  # type: ignore
+    from _schema_loader import load_schema, fill as fill_placeholders  # type: ignore
     import _vocab  # type: ignore
     from _new_format import DEFAULT_SYMBOLS  # type: ignore
     from flags import has_flag  # type: ignore
@@ -111,18 +111,25 @@ except ImportError:  # console/dev mode: put file_ops/ on sys.path
 _READ_FILE_FLAGS_HELP = """read_file `flags` (space-separated, values after a
 space and never with "=", e.g. flags="--line 400 --count 200"):
   --line N           Start reading at line N (1-indexed, default 1).
-  --count N          Read at most N lines from --line (default 2000, max
-                     2000). --count 0 is its own mode: the header only (path,
-                     size, encoding, FileTag) and no file content at all -
-                     use it to check a file's size or encoding before reading.
+                     "--line 120,450" reads from each of those lines.
+  --count N          Read about N lines from --line (default 2000); for code
+                     the output may be slightly extended. One answer carries
+                     a limited number of tokens: a bigger read stops and says
+                     where to continue. --count 0 is its own mode: the header
+                     only (path, size, encoding, FileTag) and no file content
+                     at all - use it to check a file's size or encoding
+                     before reading.
   --numbered         Prefix every returned line with its absolute number
                      "N|". Off by default: the content then comes back
                      verbatim, and occasional "⚓ Line: N" signposts give you
                      numbers to work from without a number on every line.
-  --force            Bypass binary/unknown-encoding refusal; read best-effort.
+  --force            Enforce the operation: override a refusal that comes
+                     with a reason (a file that looks binary, an encoding
+                     that can't be confirmed, the answer limit).
   --encoding NAME    Decode using exactly this codec (e.g. cp866, koi8-r) -
                      skips auto-detection and the binary/encoding refusal.
                      Use this when the auto-guess looks wrong.
+  --get-codeblock    Work with code and markdown by blocks - see below.
   --help             Show this text instead of reading anything.
 An unrecognised flag is refused by name - it is never silently ignored."""
 # `--no-anchors` is deliberately NOT listed above, though it works (see
@@ -315,11 +322,45 @@ def _handle_sift_files(args, **kw) -> str:
 # on anything in the tool call itself.
 # ---------------------------------------------------------------------------
 
+def _read_blocks_settings(params: dict) -> dict:
+    """read_file's Plan30 settings (`plugin.yaml` `read_file.params`) with their defaults - the
+    handler runs with them and the schema states the same `max_tokens`."""
+    params = params or {}
+    try:
+        max_tokens = int(params.get("max_tokens", view_file_new_core.DEFAULT_MAX_TOKENS))
+    except (TypeError, ValueError):
+        max_tokens = view_file_new_core.DEFAULT_MAX_TOKENS
+    return {
+        "align_blocks": bool(params.get("align_blocks", True)),
+        "cut_note": bool(params.get("cut_note", True)),
+        "gcb_hint": bool(params.get("gcb_hint", True)),
+        "gcb_escalate": bool(params.get("gcb_escalate", True)),
+        "max_tokens": max(1, max_tokens),
+    }
+
+
+def _read_file_help(symbols: dict = None) -> str:
+    """`flags="--help"`: the flag list plus the block-mode guide, a file of its own
+    (`file_ops/read_file__get_codeblock_help.txt`, written for read_file from get_codeblock's
+    TLDR; its `{block_open}`-style placeholders get this run's symbols). A missing guide must
+    not cost the flag list."""
+    from pathlib import Path
+    try:
+        guide = (Path(__file__).resolve().parent / "file_ops"
+                 / "read_file__get_codeblock_help.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        return _READ_FILE_FLAGS_HELP
+    guide = fill_placeholders(guide, _vocab.placeholders({**DEFAULT_SYMBOLS, **(symbols or {})}))
+    return _READ_FILE_FLAGS_HELP + "\n\n" + guide
+
+
 def _make_handle_view_file_new(mtime_enabled: bool, symbols: dict, anchors_enabled: bool = True,
-                                anchor_gap=None):
+                                anchor_gap=None, blocks: dict = None):
+    blocks = blocks or _read_blocks_settings({})
+
     def _handler(args, **kw) -> str:
         if has_flag(args.get("flags"), "help"):
-            return _READ_FILE_FLAGS_HELP
+            return _read_file_help(symbols)
         path = args.get("path")
         if not path or not isinstance(path, str):
             return "ERROR: read_file: missing required field 'path'."
@@ -343,6 +384,7 @@ def _make_handle_view_file_new(mtime_enabled: bool, symbols: dict, anchors_enabl
             flags=args.get("flags"),
             anchors_enabled=anchors_enabled,
             anchor_gap=anchor_gap,
+            **blocks,
         )
     return _handler
 
@@ -1225,7 +1267,7 @@ def register(ctx) -> None:
         if path == "new" and slot == "read_file":
             handler = _make_handle_view_file_new(
                 mtime_enabled, symbols, bool(params.get("anchors", True)),
-                params.get("anchor_gap"))
+                params.get("anchor_gap"), blocks=_read_blocks_settings(params))
         elif path == "new" and slot == "write_file":
             handler = _make_handle_create_file_new(mtime_enabled,
                                                     params.get("ui_json", "off"), symbols)
@@ -1251,7 +1293,11 @@ def register(ctx) -> None:
             handler = _SLOT_HANDLERS_OLD[slot]
 
         # Placeholders in the description (`{block_open}`, Plan28) get the symbols this run uses.
-        schema = load_schema(schema_name, _vocab.placeholders(symbols))
+        # Setting values too (`{read_file.max_tokens}`, Plan30): the limit the model is told is
+        # the one this run enforces.
+        schema = load_schema(schema_name, _vocab.placeholders(
+            symbols, {"read_file.max_tokens": _read_blocks_settings(params)["max_tokens"]}
+            if slot == "read_file" else None))
         # Only path:new slots get the dict facade, and the condition is the
         # same one that puts a slot in new_path_schemas below - a slot whose
         # stub we did NOT patch can never receive the marker, so wrapping it

@@ -308,7 +308,7 @@ def render_block(rows, positions, addresses=None, kept=None) -> str:
         # пустое сообщение; поэтому строка не рендерится совсем.
         # МОСТИК ЧЕРЕДОВАНИЯ — ТОЖЕ (владелец, 2026-09-30: сброс служебных строк обязателен): это
         # реплика «[CONTEXT COMPACTION ENGINE: …]», вставленная ради правила ролей, а не разговор.
-        # Узнаём одной функцией `_prompts.is_bridge` (метка `◆FT-DISTILL-BRIDGE_v1◆` и старая шапка).
+        # Узнаём одной функцией `_prompts.is_bridge` (метка `◆bridge-message◆` и старая шапка).
         text = str((rows[i] or {}).get("content") or "")
         if _prompts.is_distill_end(text) or _prompts.is_bridge(text):
             continue

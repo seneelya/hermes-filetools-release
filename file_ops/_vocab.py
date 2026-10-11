@@ -98,6 +98,8 @@ LABELS = {
         "timeout_note": "Note",
         "note": "Note",
         "process_running": "Process running",
+        # `list`: the count in the header (`Processes: 0`), the rows below the separator.
+        "processes": "Processes",
         "bytes_written": "Bytes written",
         "message": "Message",
         "detached": "Detached",
@@ -125,6 +127,11 @@ HEADER = {
         "encoding": "Encoding",
         "control_chars": "Control chars",
         "file_tag": "FileTag",
+        # Plan30: the ranges actually shown (after block alignment / several --line), the
+        # answer-size limit, and the first line of a --get-codeblock map (not file text).
+        "shown": "Shown",
+        "limit": "Limit",
+        "map": "Map",
     },
     # A write answers in one line of prose under its address; no header words of its own.
     "write_file": {
@@ -187,6 +194,15 @@ MARKS = {
     "block_word": "BLOCK",
     "end_word": "END",
     "anchor_word": "Line",
+    # Tail of a closer whose range ends INSIDE a block (Plan30): `■END x1b : 81   | cut inside
+    # block 69-270 |`. On the mark line itself, so it travels with it (markers grammar: `:.*`).
+    "cut_word": "cut inside block",
+}
+
+# Schema placeholders that come from SETTINGS, not from the dictionary: `{read_file.max_tokens}`.
+# The defaults here are what a description says when registration passes no settings (panel).
+SETTING_DEFAULTS = {
+    "read_file.max_tokens": 10000,
 }
 
 
@@ -203,14 +219,17 @@ def format_elements(symbols: dict) -> dict:
     }
 
 
-def placeholders(symbols: dict) -> dict:
+def placeholders(symbols: dict, settings: dict | None = None) -> dict:
     """Values for `{name}` placeholders in schema descriptions (`_schema_loader.fill`):
-    formatting elements (`{block_open}`), mark words (`{anchor_word}`) and header words as
-    `{tool.role}` (`{read_file.file_tag}`)."""
+    formatting elements (`{block_open}`), mark words (`{anchor_word}`), header words as
+    `{tool.role}` (`{read_file.file_tag}`) and setting values (`{read_file.max_tokens}`,
+    `settings` over `SETTING_DEFAULTS`)."""
     out = {**format_elements(symbols), **MARKS}
     for tool in HEADER:
         for role, word in header(tool).items():
             out[f"{tool}.{role}"] = word
+    for name, default in SETTING_DEFAULTS.items():
+        out[name] = str((settings or {}).get(name, default))
     return out
 
 

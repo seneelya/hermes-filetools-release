@@ -36,9 +36,10 @@ try:
 except ImportError:  # pragma: no cover - плоская загрузка
     from file_ops import _tool_text  # type: ignore
 
-# Имена режимов живут в `_select` — там же, где формат файла выбора. Здесь только пользуемся,
-# чтобы отчёт назывался тем же словом, что кнопка в панели и элемент в файле.
-from . import _select
+# Имя механизма в отчёте — то же слово, что операция двери (`_command.OP_CONTENT`). Стирание
+# по номерам (`erase_tools` / `erase_turn`) снято в Plan23: стирает одно правило владения
+# (`_pairs.settle`, `_command._erase_places`).
+MODE_CONTENT = "content"
 
 # Метка, по которой движок узнаёт «это ручное применение выбора, а не запрос на
 # суммаризацию». Ездит в `focus_topic` — том самом поле, куда их `/compress` кладёт свой
@@ -285,7 +286,7 @@ def apply_stubs(messages, items, ledger_index=None) -> tuple[list, dict]:
 
     found = {row["tool_call_id"] for row in stubbed} | {row["tool_call_id"] for row in skipped}
     report = {
-        "mechanism": _select.MODE_CONTENT,
+        "mechanism": MODE_CONTENT,
         # `applied` — канонический список тронутого, одинаковый у всех механизмов: по нему
         # отчитывается команда и маршрут, и им не надо знать, какой ключ у какого механизма.
         # `stubbed` остаётся своим именем этого механизма.
@@ -296,234 +297,6 @@ def apply_stubs(messages, items, ledger_index=None) -> tuple[list, dict]:
         "problems": lint_pairs(out),
         "chars_saved": sum(row["saved"] for row in stubbed),
     }
-    return out, report
-
-
-def _without_tool_calls(msg: dict) -> dict:
-    """Копия сообщения БЕЗ ключа `tool_calls`, а не с пустым списком.
-
-    Разница не косметическая, и половины расходятся именно здесь. На половине БАЗЫ пустой
-    список безопасен сам собой: их `_message_row_params` биндит
-    `json.dumps(tool_calls) if tool_calls else None`, то есть `[]` уезжает в колонку как NULL.
-    А на половине ПАМЯТИ ГЕЙТВЕЯ между нами и следующим запросом нет ни одного writer'а —
-    словарь уйдёт к провайдеру как есть, и `tool_calls: []` это форма, которую ни их
-    конвертер, ни провайдеры принимать не обязаны. Поэтому ключ убираем сами и одинаково для
-    обеих половин: меньше поводов помнить, какая из них сейчас в руках.
-    """
-    return {k: v for k, v in msg.items() if k != "tool_calls"}
-
-
-def erase_tools(messages, items, ledger_index=None, *,
-                drop_prose: bool = False) -> tuple[list, dict]:
-    """Применить механизм 2 (`erase tool`). Возвращает `(новый список, отчёт)`.
-
-    `drop_prose` — уносить ли текст опустевшей строки ассистента. По умолчанию
-    НЕТ: человек выбрал операцию, а не слова модели. Механизм 3 (`erase turn`)
-    ставит его, потому что там человек выбрал ход, а проза шага — его часть.
-    Флаг, а не второй механизм: инвариант провайдера («у каждого вызова есть
-    результат и наоборот») чинится одним кодом, и второй его копии, которая
-    однажды починит его иначе, не появляется.
-
-    ЕДИНИЦА — ПАРА, А НЕ БАТЧ. Это исправление владельца 2026-09-09, и оно того стоило: я
-    утверждал, что удалять можно только весь мини-ход целиком, потому что «провайдер требует
-    результат на каждый `tool_call`». Из этого требования следует совсем другое — что удалять
-    надо ОБЕ половины пары. Владелец: «не вижу, почему нужно удалять весь батч, ход не
-    рвётся». Так и есть: инвариант («у каждого вызова есть результат и наоборот») сохраняется,
-    если вместе с tool-строкой переписать массив `tool_calls` у строки ассистента. Массив
-    общий на все тулы хода — вот единственное, что за «батчем» на самом деле стояло.
-
-    ЧТО БЫВАЕТ С ОПУСТЕВШЕЙ СТРОКОЙ АССИСТЕНТА — вопрос владельца («или может получится
-    пустой тул-ход?»), и ответ у Hermes уже есть, в их же `agent/message_sanitization.py`:
-    сообщение, несущее `tool_calls`, или tool-результат они НЕ удаляют никогда («deleting
-    orphans the paired ``tool_call_id`` → HTTP 400»), а опустевшее в остальном сообщение —
-    удаляют. Отсюда наши три случая:
-
-        остались другие вызовы          → строка живёт, массив переписан
-        вызовов не осталось, текст есть → строка живёт как обычный ответ ассистента,
-                                          ключ `tool_calls` убран целиком (не `[]`)
-        вызовов не осталось, текста нет → строка уходит: это ровно их «otherwise-empty»,
-                                          и держать её значило бы послать пустой ход
-
-    СЛЕДА НЕ ОСТАЁТСЯ ВОВСЕ, и это замысел, а не упущение (владелец: «удалили = пусто, нету,
-    чисто»). Единственный след — дырка в нумерации операций: номера последовательные, и
-    пропуск честно означает «здесь что-то было».
-    """
-    wanted = {}
-    for item in items or []:
-        call_id = str((item or {}).get("tool_call_id") or "")
-        if call_id:
-            wanted[call_id] = item
-    index = ledger_index or {}
-
-    # Первый проход — только подсчёт: сколько освободит каждая половина пары. Считаем ПОЛНЫЙ
-    # размер, а не разницу с заглушкой: здесь не остаётся ни заголовка, ни штампа.
-    plan = {}
-    for msg in messages or []:
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        if role == "tool":
-            call_id = str(msg.get("tool_call_id") or "")
-            if call_id not in wanted:
-                continue
-            plan.setdefault(call_id, {"op": _op_of(wanted[call_id], index, call_id),
-                                      "result": 0, "args": 0})
-            plan[call_id]["result"] = len(str(msg.get("content") or ""))
-        elif role == "assistant" and msg.get("tool_calls"):
-            for call in list(msg.get("tool_calls") or []):
-                call_id = _call_id(call)
-                if call_id not in wanted:
-                    continue
-                plan.setdefault(call_id, {"op": _op_of(wanted[call_id], index, call_id),
-                                          "result": 0, "args": 0})
-                plan[call_id]["args"] = len(str(_fn_args(call) or ""))
-
-    touch = set(plan)
-    out, erased = [], []
-    shells_removed, shells_emptied = [], []
-    # Проза унесённых оболочек. Список из одного числа, чтобы считать её там же,
-    # где решается судьба строки, а не вторым проходом по уже изменённому списку.
-    prose_saved = [0]
-    # САМИ удалённые сообщения, а не только их адреса. Нужны предохранителю коммита: он
-    # сверяет наш список с активными строками базы и отказывает, если чего-то не хватает
-    # (потеря данных 2026-09-08). Удаление по замыслу тоже создаёт нехватку, и отличить его
-    # от потери можно ровно одним способом — назвать удалённое явно.
-    removed_msgs = []
-
-    for msg in messages or []:
-        if not isinstance(msg, dict):
-            out.append(msg)
-            continue
-
-        role = msg.get("role")
-        if role == "assistant" and msg.get("tool_calls"):
-            calls = list(msg.get("tool_calls") or [])
-            kept = [call for call in calls if _call_id(call) not in touch]
-            if len(kept) == len(calls):
-                out.append(msg)
-                continue
-            gone = [_call_id(call) for call in calls if _call_id(call) in touch]
-            if kept:
-                out.append({**msg, "tool_calls": kept})
-                continue
-            if str(msg.get("content") or "").strip() and not drop_prose:
-                # Текст ассистента — его собственные слова, а не содержимое операции. Человек
-                # выбрал операцию, а не реплику, поэтому реплика остаётся.
-                out.append(_without_tool_calls(msg))
-                shells_emptied.append({"calls": gone})
-            else:
-                # Ни вызовов, ни текста — держать нечего и незачем. При
-                # `drop_prose` сюда же попадает и оболочка с текстом: её слова
-                # входят в ход, который человек выбрал целиком.
-                prose = len(str(msg.get("content") or ""))
-                shells_removed.append({"calls": gone, "prose_chars": prose}
-                                      if prose else {"calls": gone})
-                removed_msgs.append(msg)
-                prose_saved[0] += prose
-            continue
-
-        if role == "tool":
-            call_id = str(msg.get("tool_call_id") or "")
-            if call_id in touch:
-                p = plan[call_id]
-                removed_msgs.append(msg)
-                erased.append({"tool_call_id": call_id, "op": p["op"],
-                               "chars_before": p["result"] + p["args"],
-                               "chars_after": 0,
-                               "saved": p["result"] + p["args"],
-                               "saved_result": p["result"], "saved_args": p["args"]})
-                continue
-
-        out.append(msg)
-
-    # Адрес, у которого не нашлось НИ tool-строки, НИ записи в массиве вызовов. Пара, у
-    # которой нашлась только одна половина, к отчёту об удалении относится: вторая половина
-    # уже отсутствовала до нас, и её удаление только починило бы пару.
-    found = {row["tool_call_id"] for row in erased}
-    found |= {cid for shell in shells_removed + shells_emptied for cid in shell["calls"]}
-    # Адрес нашёлся, а активной строки под ним НЕТ. Это ДОКАЗАННОЕ отсутствие, и оно отличается
-    # от «номер не удалось адресовать вовсе»: там мы просто не знаем, есть строка или нет.
-    # Панель по этому списку снимает карточку с экрана (решение владельца 2026-09-09: «если на
-    # карточке нажат erase, даже если нечего удалять из контекста, удалить саму карточку, чтобы
-    # она не портила вид»), поэтому список именно номеров операций, а не адресов.
-    absent = [str((wanted[call_id] or {}).get("op") or "")
-              for call_id in wanted if call_id not in found]
-    report = {
-        "mechanism": _select.MODE_TOOL,
-        "applied": erased,
-        "erased": erased,
-        "absent": [op for op in absent if op],
-        # Оболочки хода, которых больше нет, и оболочки, потерявшие вызовы, но сохранившие
-        # текст. Отдельными списками, потому что первое — ЕДИНСТВЕННОЕ, чего человек не
-        # выбирал, а получил: он назвал операцию, а ушла ещё и строка ассистента. Молчать об
-        # этом нельзя, отговариваться «так надо» — тоже.
-        "shells_removed": shells_removed,
-        "shells_emptied": shells_emptied,
-        # Для предохранителя коммита — см. `removed_msgs` выше.
-        "removed": removed_msgs,
-        "skipped": [],
-        "not_found": [call_id for call_id in wanted if call_id not in found],
-        "problems": lint_pairs(out),
-        "chars_saved": sum(row["saved"] for row in erased) + prose_saved[0],
-        # Символы прозы, унесённой вместе с ходом. Ноль у `erase tool` всегда:
-        # там проза остаётся.
-        "prose_chars": prose_saved[0],
-    }
-    return out, report
-
-
-def step_calls(messages, items) -> tuple[list, list]:
-    """Расширить выбор до ЦЕЛЫХ шагов. `(items, добавленные tool_call_id)`.
-
-    Шаг — реплика ассистента и ответы на ЕЁ вызовы; связь по `tool_call_id`, а не
-    по соседству (замер живой базы 2026-09-09: 6956 шагов из 6957 сплошные, но
-    единственный вызов без ответа по позиции утащил бы чужую строку).
-
-    Добавленные адреса возвращаются ОТДЕЛЬНО: человек отметил одну операцию, а
-    уйдёт несколько, и об этом надо сказать до применения, а не после.
-    """
-    wanted = {str((i or {}).get("tool_call_id") or ""): i for i in (items or [])}
-    wanted.pop("", None)
-    extra = []
-    out = list(items or [])
-    for msg in messages or []:
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            continue
-        calls = [_call_id(c) for c in (msg.get("tool_calls") or [])]
-        calls = [c for c in calls if c]
-        if not any(c in wanted for c in calls):
-            continue
-        for call_id in calls:
-            if call_id in wanted:
-                continue
-            wanted[call_id] = {"tool_call_id": call_id}
-            out.append(wanted[call_id])
-            extra.append(call_id)
-    return out, extra
-
-
-def erase_turn(messages, items, ledger_index=None) -> tuple[list, dict]:
-    """Применить механизм 3 (`erase turn`). Возвращает `(новый список, отчёт)`.
-
-    ШАГ, А НЕ ПОЛНЫЙ TURN. Полный turn в их смысле кончается возвратом управления
-    человеку; здесь уходит реплика ассистента со ВСЕМИ её вызовами и ответами —
-    именно это владелец имеет в виду, говоря «удалить ход» (поправка 1 к
-    контракту записей).
-
-    Механизм тот же, что у `erase tool`, — разница только в ШИРИНЕ выбора, и это
-    не экономия строк, а свойство: инвариант провайдера («у каждого вызова есть
-    результат и наоборот») чинится одним и тем же кодом, и второй его копии,
-    которая однажды починит его иначе, не появляется.
-
-    ОТЛИЧИЕ ОДНО: реплика ассистента уходит ВМЕСТЕ С ТЕКСТОМ. У `erase tool`
-    текст остаётся — человек выбрал операцию, а не слова модели. Здесь он выбрал
-    ход, а проза шага — его часть; владелец 2026-09-09: «кроме карточек есть ещё
-    реплики модели, которые стоят вместе с вызовами тула, их нужно тоже удалять».
-    """
-    expanded, extra = step_calls(messages, items)
-    out, report = erase_tools(messages, expanded, ledger_index, drop_prose=True)
-    report["mechanism"] = _select.MODE_TURN
-    report["widened"] = extra
     return out, report
 
 
@@ -678,7 +451,7 @@ def ops_to_call_ids(session: str | None, ops, messages=None) -> tuple[list, list
         if call_id:
             items.append({"tool_call_id": call_id,
                           "op": str((entry or {}).get("op") or raw).strip(),
-                          "mode": _select.MODE_CONTENT,
+                          "mode": MODE_CONTENT,
                           # ОТКУДА взят адрес. Диагностика, а не украшение: «нашли в
                           # истории» и «нашли только в леджере» ведут к разным исходам, и
                           # если применение потом не сработало, первым делом надо знать

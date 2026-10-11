@@ -17,7 +17,7 @@ Hermes перед каждым запросом, а в автокомпакци�
   человека не будет); не вышло — вставляем мостик противоположной роли, тоже голосом системы и
   ОБЫЧНЫМИ СЛОВАМИ, понятными агенту (владелец: «агент понятия не имеет, что за зверь
   `◆FT-BRIDGE◆`»). С 2026-09-30 — ОДИН АВТОР (владелец: «чтобы был виден один автор»): шапка из
-  семьи дистиллята и скобки, `[◆FT-DISTILL-BRIDGE_v1◆ CONTEXT COMPACTION: …]`, и слова дистиллята.
+  семьи дистиллята и скобки, `[CONTEXT COMPACTION ENGINE: … ◆bridge-message◆]` (метка с 2026-10-07), и слова дистиллята.
   Метки дистиллята `◆FT-DISTILL_v1◆` в ней нет (замыкающий ромб): `is_distillate` мостик не
   примет за дистиллят — иначе проверка «новый дистиллят на месте» прошла бы на мостике.
   Старые мостики `[system — context compaction:` узнаются по-прежнему.
@@ -41,41 +41,23 @@ from __future__ import annotations
 import copy
 import time
 
-from ._prompts import bridge_mark, engine_voice, is_distill_end, is_distillate
+from ._prompts import bridge_mark, bridge_texts, is_distill_end, is_distillate
 from ._prompts import is_bridge as _is_bridge_text
 
 BRIDGE_MARK = bridge_mark()
 _TALK = ("user", "assistant")
 
 
-def _say(text: str) -> str:
-    """Служебная строка компакции: говорящий впереди, метка в конце штампом (владелец, 2026-09-30)."""
-    return f"[{engine_voice()} {text}. {BRIDGE_MARK}]"
-
-
 # Текст мостика — ПО МЕСТУ, не по роли (владелец 2026-09-30: иначе мостик врёт агенту — «сводка
-# ниже», когда она уже выше). Место определяют соседи: дистиллят справа/слева, скобка справа.
-BRIDGE_TEXT = {
-    "before": _say("the earlier part of this conversation was compacted here, the summary follows"),
-    "after": _say("the summary above replaces the compacted part; the turns below were kept as "
-                  "they were"),
-    "kept_end": _say("the kept turns end here"),
-    "continue": _say("end of the compacted part, the conversation continues"),
-}
-
+# ниже», когда она уже выше). Место определяют соседи: вставка справа/слева, скобка справа.
+# СЛОВА — У ОПЕРАЦИИ (владелец, 2026-10-07): наборы по местам живут в `_prompts.bridge_texts(kind)`,
+# операция может передать свой (`fit(..., texts=)`); здесь — только наборы по умолчанию.
+BRIDGE_TEXT = bridge_texts("compact")
 # Мостики стирания (`erase`, 2026-09-30) — короткие (владелец: «толку от удаления мало»).
-ERASE_TEXT = {
-    "start": _say("conversation start removed"),
-    "gap": _say("messages removed here"),
-}
-
+ERASE_TEXT = bridge_texts("erase")
 # Мостики импорта (`Plan27`, 2026-10-05): по месту — вход в импортированное, выход из него, стык
 # внутри него. Какая сторона импортирована, `fit` знает по `old` (импортированных строк там нет).
-IMPORT_TEXT = {
-    "start": _say("messages imported from a saved session follow"),
-    "end": _say("the imported messages end here, the conversation continues"),
-    "inside": _say("the imported conversation continues"),
-}
+IMPORT_TEXT = bridge_texts("import")
 
 
 def _text(row) -> str:
@@ -86,11 +68,12 @@ def _is_distillate(row) -> bool:
     return is_distillate(_text(row))
 
 
-def bridge_text(prev, row, kind: str = "compact", is_new=None) -> str:
+def bridge_text(prev, row, kind: str = "compact", is_new=None, texts=None, is_insert=None) -> str:
     """Текст мостика между `prev` и `row` — по тому, что стоит рядом; `kind` — чья правка.
 
     `is_new(row) -> bool` — строки не было в ленте до правки. Нужен импорту: отличить вход в
-    импортированное от выхода из него.
+    импортированное от выхода из него. `texts` — набор операции по местам (`_prompts.bridge_texts`);
+    `is_insert(row)` — это вставка операции (по умолчанию — наш дистиллят по метке).
     """
     if kind == "erase":
         return ERASE_TEXT["start"] if prev is None else ERASE_TEXT["gap"]
@@ -101,13 +84,15 @@ def bridge_text(prev, row, kind: str = "compact", is_new=None) -> str:
         if new(prev) and not new(row):
             return IMPORT_TEXT["end"]
         return IMPORT_TEXT["inside"]
-    if _is_distillate(row):
-        return BRIDGE_TEXT["before"]
-    if _is_distillate(prev):
-        return BRIDGE_TEXT["after"]
+    words = texts or BRIDGE_TEXT
+    inserted = is_insert or _is_distillate
+    if inserted(row):
+        return words["before"]
+    if prev is not None and inserted(prev):
+        return words["after"]
     if _is_closing(row):
-        return BRIDGE_TEXT["kept_end"]
-    return BRIDGE_TEXT["continue"]
+        return words["kept_end"]
+    return words["continue"]
 
 
 def is_bridge(row) -> bool:
@@ -129,7 +114,7 @@ def _other(role: str) -> str:
     return "user" if role == "assistant" else "assistant"
 
 
-def fit(new: list, old: list, kind: str = "compact") -> tuple[list, int]:
+def fit(new: list, old: list, kind: str = "compact", texts=None, inserts=None) -> tuple[list, int]:
     """Лента `new` без стыков одной роли. `(лента, сколько мостиков вставлено)`.
 
     `old` — лента до сборки. По ней находится ПЕРВАЯ ИЗМЕНЁННАЯ СТРОКА (первая позиция, где в
@@ -139,6 +124,10 @@ def fit(new: list, old: list, kind: str = "compact") -> tuple[list, int]:
     пересобирается только список (у закрывающей скобки может смениться `role`).
     Скобку переворачиваем, лишь когда она стоит СЛЕВА на стыке и переворот не сталкивает её с
     левым соседом; во всех остальных случаях — мостик.
+
+    `texts` — слова операции по местам (`_prompts.bridge_texts`); `inserts` — `id` строк-вставок
+    операции: они, а не угадывание по метке, решают места `before`/`after` (прежний дистиллят в ленте
+    тоже считается вставкой — как было).
     """
     out, bridges = [], 0
     stamp = time.time() + 0.0005
@@ -149,6 +138,11 @@ def fit(new: list, old: list, kind: str = "compact") -> tuple[list, int]:
     def is_new(row) -> bool:
         return id(row) not in old_ids
 
+    ins = set(inserts or ())
+
+    def is_insert(row) -> bool:
+        return id(row) in ins or _is_distillate(row)
+
     for index, row in enumerate(new):
         # ПЕРВАЯ реплика после системного промпта — от пользователя (многие провайдеры иначе
         # отказывают; их собственная компакция в начале ленты тоже пишет от пользователя). Если
@@ -157,7 +151,7 @@ def fit(new: list, old: list, kind: str = "compact") -> tuple[list, int]:
         # новое начало — «лента раньше начиналась не с неё».
         new_start = is_new(row) or (kind == "erase" and (not old or old[0] is not row))
         if not out and _role(row) == "assistant" and new_start:
-            out.append({"role": "user", "content": bridge_text(None, row, kind, is_new),
+            out.append({"role": "user", "content": bridge_text(None, row, kind, is_new, texts, is_insert),
                         "timestamp": stamp})
             bridges += 1
         prev = out[-1] if out else None
@@ -168,7 +162,7 @@ def fit(new: list, old: list, kind: str = "compact") -> tuple[list, int]:
                 prev["role"] = _other(_role(prev))
             else:
                 role = _other(_role(row))
-                out.append({"role": role, "content": bridge_text(prev, row, kind, is_new),
+                out.append({"role": role, "content": bridge_text(prev, row, kind, is_new, texts, is_insert),
                             "timestamp": stamp + bridges * 1e-3})
                 bridges += 1
         out.append(row)

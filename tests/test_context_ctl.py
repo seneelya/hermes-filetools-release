@@ -322,19 +322,18 @@ def test_get_status_shape_survives_the_abc_default():
 def test_session_sanitizer_matches_the_ledgers():
     """Две копии одного правила обязаны совпадать — иначе два файла на одну сессию.
 
-    `context_ctl/_select.py` и `_signal.py` дублируют `_ledger._safe_session` осознанно: их
+    `context_ctl/_signal.py` дублирует `_ledger._safe_session` осознанно: его
     грузят по пути из `dashboard/plugin_api.py`, где относительный импорт невозможен. Этот
     тест — единственное, что держит копии вместе, поэтому имена здесь неудобные нарочно.
 
     Расхождение уже случалось: в первой копии не было `+` в квантификаторе, и `сессия`
     давала `______` вместо `_` — то есть два файла на одну сессию.
     """
-    from hermes_filetools.context_ctl import _select, _signal
+    from hermes_filetools.context_ctl import _signal
     from hermes_filetools.file_ops._ledger import _safe_session as ledger_safe
 
     for name in ("", "   ", None, "..", "...hidden", "a/b\\c", "20260908_180224_d5f698",
                  "сессия", "a:b*c?d", "..\\..\\etc\\passwd", "x" * 300, ".dot"):
-        assert _select._safe_session(name) == ledger_safe(name), name
         assert _signal._safe_session(name) == ledger_safe(name), name
 
 

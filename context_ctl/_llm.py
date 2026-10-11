@@ -206,16 +206,19 @@ def _post(route: dict, body: dict, timeout: float) -> dict:
         raise RuntimeError(f"сервер {route['base_url']} недоступен: {exc.reason}") from None
 
 
-def _complete(route: dict, messages: list, timeout: float | None, response_format=None) -> dict:
+def _complete(route: dict, messages: list, timeout: float | None, response_format=None,
+              think: bool = False) -> dict:
     """Запрос и разбор ответа: `{text, model, tokens, sent}`.
 
     СТУПЕНИ ОТКАТА. Поля «не думай» (`_server_kind`) и `response_format` — наши добавки, и
     сервер вправе отвергнуть незнакомое поле (400/422). Тогда повторяем: без полей «не думай»,
     затем и без схемы (ответ всё равно проверяем сами — `_parse_json`). Ступень, на которой
     сервер ответил, запоминается на (адрес, модель): следующие вопросы опроса не бьются в ту
-    же стену и не рвут префикс кеша разным телом. `sent` — какая ступень ушла, для отчёта."""
+    же стену и не рвут префикс кеша разным телом. `sent` — какая ступень ушла, для отчёта.
+
+    `think=True` — окно LLMOps (`Plan31`): полей «не думай» не шлём вовсе."""
     key = (route["base_url"], route["model"])
-    extras = _server_kind.no_think(route.get("server", "llamacpp"))
+    extras = {} if think else _server_kind.no_think(route.get("server", "llamacpp"))
     steps = [("full", extras, response_format), ("no-think-off", {}, response_format),
              ("bare", {}, None)]
     start = _step_of.get(key, 0)
@@ -310,7 +313,8 @@ def available() -> tuple[bool, str]:
 
 def ask_structured(data: str, question: str, schema: dict, *,
                    schema_name: str = "filetools_answer", system: str = "",
-                   task: str | None = TASK_KEY, timeout: float | None = None) -> dict:
+                   task: str | None = TASK_KEY, timeout: float | None = None,
+                   think: bool = False) -> dict:
     """Вопрос К ТЕМ ЖЕ ДАННЫМ, с ответом, ограниченным схемой. Ответ словарём.
 
     `system` — системный промт, ОДИН на весь прогон (Vision08). Холодный клиент истории не
@@ -355,7 +359,7 @@ def ask_structured(data: str, question: str, schema: dict, *,
     response_format = {"type": "json_schema", "json_schema": {
         "name": "plugin_structured_output", "schema": schema, "strict": False}}
     try:
-        result = _complete(route, messages, timeout, response_format)
+        result = _complete(route, messages, timeout, response_format, think=think)
     except Exception as exc:  # noqa: BLE001 — отчёт, не падение
         return {"ok": False, "parsed": None, "text": "", "error": str(exc), "task": task}
 
@@ -373,7 +377,8 @@ def ask_structured(data: str, question: str, schema: dict, *,
 
 
 def ask(prompt: str, *, system: str = "",
-        task: str | None = TASK_KEY, timeout: float | None = None) -> dict:
+        task: str | None = TASK_KEY, timeout: float | None = None,
+        think: bool = False) -> dict:
     """ОДИН вопрос модели одним сообщением. Ответ — словарём, исключений наружу нет.
 
     `task=TASK_KEY` (default) — наш слот суммаризации. `task=None` — АКТИВНАЯ ГЛАВНАЯ модель
@@ -385,6 +390,9 @@ def ask(prompt: str, *, system: str = "",
     же устроен и их собственный вызов сводки. `max_tokens` не ставим НИКОГДА: жёсткий cap
     усекает сводку на середине (их комментарий в `_call_summary_llm`, и он оплачен их
     инцидентом — thinking-модели выжигают лимит на рассуждении).
+
+    `think` — думание на ЭТОМ вопросе (`_complete(think=)`); по умолчанию выключено, в опросе
+    компакции его задаёт описание вопроса (`Plan32.1`).
     """
     ok, why = available()
     if not ok:
@@ -397,7 +405,7 @@ def ask(prompt: str, *, system: str = "",
     messages = ([{"role": "system", "content": system}] if system else []) \
         + [{"role": "user", "content": prompt}]
     try:
-        result = _complete(route, messages, timeout)
+        result = _complete(route, messages, timeout, think=think)
     except Exception as exc:  # noqa: BLE001 — отчёт, не падение
         return {"ok": False, "text": "", "error": str(exc), "task": task}
 
