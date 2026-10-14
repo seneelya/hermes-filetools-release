@@ -1,5 +1,5 @@
 name: hermes-filetools
-version: "0.45.1"
+version: "0.45.3"
 # THIS FILE IS THE DEFAULTS (since 2026-09-30). A plugin update / our deploy overwrites it.
 # YOUR changes live in <HERMES_HOME>/filetools/settings.yaml - the Config panel writes only the
 # differences from the values below there; delete a key in that file to get the default back.
@@ -471,6 +471,7 @@ disabled_tools:
   - desktop_preview
   - gui_tour
   - desktop_project
+  - show_tip
   - open_preview
   - close_preview
   - read_preview
@@ -491,6 +492,12 @@ disabled_tools:
   # (commit e16ad33a9): open_preview / close_preview / read_preview ->
   # desktop_preview, tour -> gui_tour, project_create / project_list /
   # project_switch -> desktop_project.
+  #
+  # 2026-10-11 (c0ef5af520): `show_tip` is new in `desktop_ui`; `setup_mcp` is gone (its line is a
+  # no-op now). Upstream made `project` honour `agent.disabled_toolsets` (#54433) but keeps
+  # `desktop_ui` folded in "regardless" (tui_gateway/server.py::_with_session_toolsets) - so this
+  # list is still the only way. `tests/test_plugin_integration.py::test_e2g_every_desktop_ui_tool_is_hidden`
+  # fails when they add a desktop_ui tool this list does not name.
 
 # UI-facing text for Plan17's Config panel (Disabled Hermes tools zone) - not read by
 # _load_manifest_disabled_tools or _suppress_disabled_tools, which only ever look at the
@@ -514,6 +521,7 @@ disabled_tools_help:
   desktop_preview: "Open / close / read the embedded preview (merges the old open_preview, close_preview, read_preview)."
   gui_tour: "Guided tour of the app (was \"tour\")."
   desktop_project: "Create / list / switch a workspace (merges the old project_create, project_list, project_switch)."
+  show_tip: "Point at a part of the app with a tip bubble (new in c0ef5af520)."
 
 config_schema:
   # Hermes' `config_schema` is NOT JSON Schema. hermes_cli/plugins.py

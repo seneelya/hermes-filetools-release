@@ -1074,6 +1074,7 @@ function waitLLMOpsRun(sid) {
     setTimeout(tick, LLMOPS_POLL_MS);
   });
 }
+var LLMOPS_CHAT_TIMEOUT_MS = 30 * 60 * 1e3;
 function llmopsTransport(sid, addrs) {
   const s = encodeURIComponent(String(sid || ""));
   const get = (path, what) => adapter.rest(path).then((res) => {
@@ -1085,7 +1086,9 @@ function llmopsTransport(sid, addrs) {
     data: () => get(`/llmops-data?session=${s}&addrs=${encodeURIComponent((addrs || []).join(","))}`, "no data"),
     models: () => get(`/llmops-models?session=${s}`, "no model list"),
     presets: () => get(`/llmops-presets?session=${s}`, "no presets"),
-    chat: ({ messages, model, think }) => adapter.rest("/llmops-chat", { method: "POST", body: { session: sid, messages, model, think: !!think } }).then(asRecord),
+    // A big session's prompt takes minutes — their default 30 s cut it (owner, 2026-10-14).
+    chat: ({ messages, model, think }) => adapter.rest("/llmops-chat", { method: "POST", body: { session: sid, messages, model, think: !!think }, timeoutMs: LLMOPS_CHAT_TIMEOUT_MS }).then(asRecord),
+    stop: () => adapter.rest("/llmops-stop", { method: "POST", body: { session: sid } }).then(asRecord),
     replace: ({ addrs: eat, text, wrap, preset }) => {
       setLLMOpsRail({ note: "llm ops: replacing\u2026", ok: null });
       return adapter.rest("/llmops-replace", { method: "POST", body: { session: sid, addrs: eat, text, wrap, preset: preset || "" } }).then(asRecord).then((r) => {
@@ -4634,6 +4637,8 @@ function ChipTrigger({ id, popup, setPopup, tone, label, tip, border, flushLeft,
   }, []);
   return jsxs20("span", {
     ref: triggerRef,
+    // Якорь для перехода к чипу снаружи (список операций файла, 2026-10-14): `prompt-mirror.js::goToOp`.
+    "data-chip-id": id,
     className: "inline-flex",
     style: { minWidth: 0 },
     children: [
@@ -6379,7 +6384,8 @@ function rangeText(from, to) {
   if (from == null || to == null) return "\u2014";
   return from === to ? String(from) : `${from}-${to}`;
 }
-function OpIdsPopup({ file, pos, onClose }) {
+function OpIdsPopup({ file, pos, onClose, onPick }) {
+  const [hot, setHot] = useState9(null);
   if (!pos) return null;
   const rows = file.rows || [];
   return jsx30("div", {
@@ -6397,31 +6403,40 @@ function OpIdsPopup({ file, pos, onClose }) {
         rowGap: "1px",
         fontSize: "0.58rem"
       },
-      children: rows.flatMap((r, i) => [
-        jsxs27("div", { key: `t${i}`, style: { color: "var(--ui-text-secondary)" }, children: [
-          toolLabel(r.tool),
-          // Метка вложенности. Говорит РОВНО одно: операция выполнена внутри `execute_code` —
-          // именно это и означает флаг `nested` в леджере. «Из терминала» показать нельзя: правка
-          // файла шелл-командой нашими тулами не проходит вовсе и в леджер не попадает, так что
-          // такого факта у нас просто нет, и выдумывать его метка не станет.
-          r.nested ? jsx30("span", {
-            // Тот же плотный оттенок, что у вложенного чтения на баре, и БЕЗ `opacity`: правило
-            // «только оттенки, не прозрачности» держим по всей панели, а не только на слоях.
-            style: { color: segFill("read_nested", 0, false) },
-            children: " exec"
-          }) : null
-        ] }),
-        jsx30("div", { key: `o${i}`, style: { color: "var(--ui-text-primary)", textAlign: "right" }, children: `${r.op}:` }),
-        jsx30("div", {
-          key: `r${i}`,
-          style: { color: r.from == null ? "var(--ui-text-quaternary)" : "var(--ui-text-primary)" },
-          children: rangeText(r.from, r.to)
-        })
-      ])
+      children: rows.flatMap((r, i) => {
+        const pick = onPick && r.op ? (e) => {
+          e.stopPropagation();
+          onPick(r.op);
+          onClose();
+        } : null;
+        const cell = pick ? { onClick: pick, onMouseEnter: () => setHot(i), onMouseLeave: () => setHot(null) } : {};
+        const hotBg = hot === i ? { backgroundColor: "var(--ui-bg-tertiary)", cursor: "pointer" } : {};
+        return [
+          jsxs27("div", Object.assign({ key: `t${i}`, style: Object.assign({ color: "var(--ui-text-secondary)" }, hotBg), children: [
+            toolLabel(r.tool),
+            // Метка вложенности. Говорит РОВНО одно: операция выполнена внутри `execute_code` —
+            // именно это и означает флаг `nested` в леджере. «Из терминала» показать нельзя: правка
+            // файла шелл-командой нашими тулами не проходит вовсе и в леджер не попадает, так что
+            // такого факта у нас просто нет, и выдумывать его метка не станет.
+            r.nested ? jsx30("span", {
+              // Тот же плотный оттенок, что у вложенного чтения на баре, и БЕЗ `opacity`: правило
+              // «только оттенки, не прозрачности» держим по всей панели, а не только на слоях.
+              style: { color: segFill("read_nested", 0, false) },
+              children: " exec"
+            }) : null
+          ] }, cell)),
+          jsx30("div", Object.assign({ key: `o${i}`, style: Object.assign({ color: "var(--ui-text-primary)", textAlign: "right" }, hotBg), children: `${r.op}:` }, cell)),
+          jsx30("div", Object.assign({
+            key: `r${i}`,
+            style: Object.assign({ color: r.from == null ? "var(--ui-text-quaternary)" : "var(--ui-text-primary)" }, hotBg),
+            children: rangeText(r.from, r.to)
+          }, cell))
+        ];
+      })
     })
   });
 }
-function Tile({ file, popupPos, onTogglePopup, onClosePopup }) {
+function Tile({ file, popupPos, onTogglePopup, onClosePopup, onPickOp }) {
   const segs = file.segments;
   return jsxs27("div", {
     className: "rounded-sm border",
@@ -6510,11 +6525,11 @@ function Tile({ file, popupPos, onTogglePopup, onClosePopup }) {
           })
         ]
       }),
-      jsx30(OpIdsPopup, { file, pos: popupPos, onClose: onClosePopup })
+      jsx30(OpIdsPopup, { file, pos: popupPos, onClose: onClosePopup, onPick: onPickOp })
     ]
   });
 }
-function FileContextPanel({ view, selectedOp, open, onToggle }) {
+function FileContextPanel({ view, selectedOp, open, onToggle, onPickOp }) {
   const [height, setHeight] = useState9(DEFAULT_H);
   const [manual, setManual] = useState9(false);
   const [autoH, setAutoH] = useState9(DEFAULT_H);
@@ -6642,6 +6657,7 @@ function FileContextPanel({ view, selectedOp, open, onToggle }) {
               file: Object.assign({}, f, { desync: desyncPaths.has(f.path) }),
               popupPos: openOps && openOps.path === f.path ? openOps.pos : null,
               onTogglePopup: togglePopup,
+              onPickOp,
               onClosePopup: () => setOpenOps(null)
             }))
           })
@@ -6946,6 +6962,8 @@ function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, 
 
 // desktop/src/prompt-mirror.js
 var TAIL_SPACE = "40%";
+var FOLLOW_PAUSE_MS = 6e4;
+var FOLLOW_BOTTOM_PX = 40;
 var EXPORT_PAINT = {
   border: ACTION_COLOR.export,
   fill: railFill(ACTION_COLOR.export),
@@ -7027,6 +7045,21 @@ function pairToolCalls(items) {
     if (pairs) pairs.forEach((p) => out.push(p));
   });
   return out;
+}
+function chipKeyOfOp(op, groups, ops) {
+  if (!op) return [null, false];
+  const find = (test) => {
+    for (const g of groups || []) {
+      const hit = pairToolCalls(g.items).find((r) => r.kind === "toolpair" && r.answer && test(r.answer));
+      if (hit) return hit.key;
+    }
+    return null;
+  };
+  const own = find((a) => a.fact && a.fact.op === op);
+  if (own) return [own, false];
+  const fact = (ops || []).find((o) => o && o.op === op && o.host_msg);
+  const host3 = fact ? find((a) => a.address === fact.host_msg) : null;
+  return host3 ? [host3, true] : [null, false];
 }
 function selectedOpOf(popup, groups) {
   const id = popup && popup.id;
@@ -7347,6 +7380,7 @@ function PromptMirror() {
     loadZones();
   }, []);
   const [lastReport, setLastReport] = useState11("");
+  const [jump, setJump] = useState11(null);
   useEffect5(() => {
     if (addrOp.note) setLastReport("addr");
   }, [addrOp.note]);
@@ -7385,6 +7419,30 @@ function PromptMirror() {
     if (headRef.current) ro.observe(headRef.current);
     return () => ro.disconnect();
   }, [exp.mode, compact.mode, addrOp.mode, llmops.mode, rows.length]);
+  const scrollRef = useRef6(null);
+  const follow = useRef6({ sid: null, n: 0, top: 0, pausedAt: 0 });
+  useEffect5(() => {
+    const f = follow.current;
+    const n2 = rows.length;
+    if (f.sid !== view.sessionId || f.n === 0) {
+      f.sid = view.sessionId;
+      f.n = n2;
+      return;
+    }
+    const grew = n2 > f.n;
+    f.n = n2;
+    const el = scrollRef.current;
+    if (!grew || !el || Date.now() - f.pausedAt < FOLLOW_PAUSE_MS) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }, [rows.length, view.sessionId]);
+  function onTapeScroll(e) {
+    const f = follow.current;
+    const el = e.currentTarget;
+    const top = el.scrollTop;
+    if (top < f.top - 2) f.pausedAt = Date.now();
+    else if (el.scrollHeight - top - el.clientHeight < FOLLOW_BOTTOM_PX) f.pausedAt = 0;
+    f.top = top;
+  }
   const armedOp = exp.mode ? "export" : compact.mode ? "compact" : addrOp.mode ? addrOp.kind : llmops.mode ? "llmops" : null;
   const armedPicked = armedOp === "export" ? exp.picked : armedOp === "compact" ? compact.picked : addrOp.mode ? addrOp.picked : armedOp === "llmops" ? llmops.picked : {};
   const armedBusy = armedOp === "export" ? !!exp.busy : armedOp === "compact" ? !!compact.busy : addrOp.mode ? !!addrOp.busy : false;
@@ -7393,7 +7451,7 @@ function PromptMirror() {
   const canApply = !!armedOp && !armedBusy && armedCount > 0 && !blockedByWindow;
   const applyColor = armedOp ? ACTION_COLOR[armedOp] : null;
   const armedLabel = { export: "export", compact: "compact", content: "drop content", erase: "erase", llmops: "llm ops" }[armedOp] || "";
-  const report = lastReport === "addr" ? addrOp : lastReport === "compact" ? compact : lastReport === "export" ? exp : lastReport === "import" ? imp : lastReport === "llmops" ? llmops : null;
+  const report = lastReport === "addr" ? addrOp : lastReport === "compact" ? compact : lastReport === "export" ? exp : lastReport === "import" ? imp : lastReport === "llmops" ? llmops : lastReport === "jump" ? jump : null;
   function applyArmed(button) {
     const box = button && button.getBoundingClientRect ? button.getBoundingClientRect() : null;
     setApplyAt(box ? { x: box.left + box.width / 2, y: box.bottom } : null);
@@ -7402,6 +7460,26 @@ function PromptMirror() {
     else if (armedOp === "content" || armedOp === "erase") setDropConfirm(true);
     else if (armedOp === "llmops") applyLLMOps();
   }
+  const applyBtn = jsx33("button", {
+    type: "button",
+    disabled: !canApply,
+    title: canApply ? armedOp === "export" ? `export ${armedCount} ticked message(s) to files` : armedOp === "content" ? `drop the content of ${armedCount} ticked tool result(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "erase" ? `erase ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "llmops" ? `open the LLMOps window with ${armedCount} ticked message(s)` : `compact ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : blockedByWindow ? "the LLMOps window is open \u2014 close it first" : armedOp ? "nothing ticked" : "arm an operation first",
+    onClick: (e) => {
+      e.stopPropagation();
+      if (canApply) applyArmed(e.currentTarget);
+    },
+    className: canApply ? "mirror-action-btn rounded-full font-medium cursor-pointer select-none active:scale-95" : "rounded-full font-medium select-none",
+    style: Object.assign({
+      marginLeft: "auto",
+      flexShrink: 0,
+      border: `1px solid ${canApply ? applyColor : "var(--ui-stroke-secondary)"}`,
+      color: canApply ? applyColor : void 0,
+      userSelect: "none",
+      cursor: canApply ? "pointer" : "default",
+      opacity: canApply ? 1 : 0.45
+    }, ACTION_BTN),
+    children: armedBusy ? "applying\u2026" : "Apply operation"
+  });
   const head = jsxs30("div", {
     className: "items-center gap-2 px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0",
     style: Object.assign({
@@ -7411,25 +7489,7 @@ function PromptMirror() {
       alignItems: "center"
     }, SELECTABLE),
     children: [
-      jsx33("button", {
-        type: "button",
-        disabled: !canApply,
-        title: canApply ? armedOp === "export" ? `export ${armedCount} ticked message(s) to files` : armedOp === "content" ? `drop the content of ${armedCount} ticked tool result(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "erase" ? `erase ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "llmops" ? `open the LLMOps window with ${armedCount} ticked message(s)` : `compact ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : blockedByWindow ? "the LLMOps window is open \u2014 close it first" : armedOp ? "nothing ticked" : "arm an operation first",
-        onClick: (e) => {
-          e.stopPropagation();
-          if (canApply) applyArmed(e.currentTarget);
-        },
-        className: canApply ? "mirror-action-btn rounded-full font-medium cursor-pointer select-none active:scale-95" : "rounded-full font-medium select-none",
-        style: Object.assign({
-          justifySelf: "start",
-          border: `1px solid ${canApply ? applyColor : "var(--ui-stroke-secondary)"}`,
-          color: canApply ? applyColor : void 0,
-          userSelect: "none",
-          cursor: canApply ? "pointer" : "default",
-          opacity: canApply ? 1 : 0.45
-        }, ACTION_BTN),
-        children: armedBusy ? "applying\u2026" : "Apply operation"
-      }),
+      jsx33("span", {}, "apply-gap"),
       jsx33("span", {
         className: orphans ? "text-(--ui-text-primary)" : "text-(--ui-text-quaternary)",
         style: Object.assign({ justifySelf: "center", minWidth: 0, textAlign: "center" }, SELECTABLE),
@@ -7497,7 +7557,8 @@ function PromptMirror() {
         style: Object.assign({ fontSize: "0.7rem", color: ACTION_COLOR.compact }, SELECTABLE),
         title: "rough token estimate of the ticked messages \u2014 same per-message numbers as in the tape, summed",
         children: `~${tokensLabel(pickedTokens)} tk ticked`
-      }) : null
+      }) : null,
+      applyBtn
     ]
   });
   const groups = buildCarriageGroups(rows);
@@ -7570,6 +7631,19 @@ function PromptMirror() {
       }, `${g.header.key}-rail-${spec.key}`));
     });
   });
+  function goToOp(op) {
+    const [key, viaHost] = chipKeyOfOp(op, groups, fileContext.ops);
+    const tape = tapeRef.current;
+    const el = key && tape && tape.querySelector(`[data-chip-id="${String(key).replace(/"/g, '\\"')}"]`);
+    setLastReport("jump");
+    if (!key) {
+      setJump({ note: `op ${op}: no chip in the tape`, ok: false });
+      return;
+    }
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "auto" });
+    setJump({ note: `op ${op} \u2192 ${key}` + (viaHost ? " (the execute_code it ran inside)" : "") + (el ? "" : " (chip not on screen)"), ok: !!el });
+    setPopup({ id: key, tier: "summary" });
+  }
   function pickAll(slot, clear) {
     const next = {};
     if (!clear) idsBySpec[slot].forEach((id) => {
@@ -7685,7 +7759,7 @@ function PromptMirror() {
       // появилась бы линия.
       // ЗОНЫ (Plan23-Task01, владелец 2026-09-29: «сейчас очень хаотично»): Operations — кнопки
       // группами, Status — одна строка отчёта, Files — FileOps. Каждая сворачивается, свёрнутая
-      // показывает сводку. `Apply` остался в шапке: виден и при свёрнутой Operations.
+      // показывает сводку. `Apply` — в шапке ленты у крестиков рельс (2026-10-14): виден и при свёрнутой Operations.
       // `Operations` БЕЗ заголовка (владелец, 2026-09-29: «мы теряем высоту на заголовке»):
       // развёрнутая — группы кнопок, треугольник в начале первой; свёрнутая — одна строка
       // тонких кнопок без опций. `Status` — просто одна строка: разворачивать там пока нечего.
@@ -7720,6 +7794,7 @@ function PromptMirror() {
       ctxView.files && ctxView.files.length ? jsx33(FileContextPanel, {
         view: ctxView,
         selectedOp: selectedOpOf(popup, groups),
+        onPickOp: goToOp,
         open: zones.files,
         onToggle: () => toggleZone("files")
       }, "zone-files") : null,
@@ -7800,6 +7875,8 @@ function PromptMirror() {
             ]
           }),
           jsx33("div", {
+            ref: scrollRef,
+            onScroll: onTapeScroll,
             className: "w-full fops-scroll",
             style: {
               flex: "1 1 auto",
@@ -8918,15 +8995,24 @@ function messageBlock(m) {
   return `[${m.addr} ${who}]
 ${String(m.text || "")}`;
 }
+function pickedPart(list, side, pick) {
+  const all = list || [];
+  if (pick === true) return all;
+  const k2 = Math.max(0, Math.min(all.length, Math.floor(Number(pick) || 0)));
+  if (!k2) return [];
+  return side === "prefix" ? all.slice(all.length - k2) : all.slice(0, k2);
+}
 function dataText(data, picks) {
   const p = picks || {};
   const parts = [];
-  if (p.prefix && data.prefix && data.prefix.length) {
-    parts.push("<context-before>\n" + data.prefix.map(messageBlock).join("\n\n") + "\n</context-before>");
+  const before = pickedPart(data.prefix, "prefix", p.prefix);
+  if (before.length) {
+    parts.push("<context-before>\n" + before.map(messageBlock).join("\n\n") + "\n</context-before>");
   }
   parts.push("<messages>\n" + (data.target || []).map(messageBlock).join("\n\n") + "\n</messages>");
-  if (p.suffix && data.suffix && data.suffix.length) {
-    parts.push("<context-after>\n" + data.suffix.map(messageBlock).join("\n\n") + "\n</context-after>");
+  const after = pickedPart(data.suffix, "suffix", p.suffix);
+  if (after.length) {
+    parts.push("<context-after>\n" + after.map(messageBlock).join("\n\n") + "\n</context-after>");
   }
   return parts.join("\n\n");
 }
@@ -9131,9 +9217,10 @@ function ModeSwitch({ raw, onRaw, md, editLabel }) {
     ]
   });
 }
-function Md({ text, md, style }) {
+function Md({ text, md, style, className }) {
   return jsx40("div", {
     "data-selectable-text": "true",
+    className,
     style: {
       fontSize: "0.75rem",
       lineHeight: 1.5,
@@ -9222,15 +9309,17 @@ function ChipPopup({ m, rect, onClose, onCopy, md }) {
     ]
   });
 }
-function Wagon({ name, list, on, onToggle }) {
+function Wagon({ name, list, count, onCount }) {
   const n2 = (list || []).length;
-  return jsxs36("label", {
-    title: n2 ? `${name}: ${list[0].addr}\u2026${list[n2 - 1].addr}` : `${name}: empty`,
+  const part = pickedPart(list, name, count);
+  const on = part.length > 0;
+  const span = (l) => l.length ? `${l[0].addr}\u2026${l[l.length - 1].addr}` : "nothing";
+  return jsxs36("div", {
+    title: n2 ? `${name}: ${span(list)} \xB7 sent: ${span(part)}` : `${name}: empty`,
     style: {
       display: "flex",
-      alignItems: "center",
-      gap: "0.35rem",
-      cursor: n2 ? "pointer" : "default",
+      flexDirection: "column",
+      gap: "0.25rem",
       padding: "0.4rem 0.45rem",
       borderRadius: "0.5rem",
       fontSize: "0.6rem",
@@ -9241,9 +9330,29 @@ function Wagon({ name, list, on, onToggle }) {
       userSelect: "none"
     },
     children: [
-      jsx40("input", { type: "checkbox", checked: !!on, disabled: !n2, onChange: () => onToggle(), style: { margin: 0 } }),
-      jsx40("span", { style: { fontWeight: 600 }, children: name }),
-      jsx40("span", { style: { color: TEXT_DIM, marginLeft: "auto" }, children: `${n2} \xB7 ${kLabel(sumTokens(list))}` })
+      jsxs36("label", {
+        style: { display: "flex", alignItems: "center", gap: "0.35rem", cursor: n2 ? "pointer" : "default" },
+        children: [
+          jsx40("input", { type: "checkbox", checked: on, disabled: !n2, onChange: () => onCount(on ? 0 : n2), style: { margin: 0 } }),
+          jsx40("span", { style: { fontWeight: 600 }, children: name }),
+          jsx40("span", {
+            style: { color: TEXT_DIM, marginLeft: "auto" },
+            children: `${part.length} of ${n2} \xB7 ${kLabel(sumTokens(part))}`
+          })
+        ]
+      }),
+      // The prefix counts from its end — its slider grows toward the target from the right; the
+      // suffix counts from its start.
+      n2 > 1 ? jsx40("input", {
+        type: "range",
+        min: 0,
+        max: n2,
+        step: 1,
+        value: part.length,
+        title: name === "prefix" ? "messages right before the selection" : "messages right after the selection",
+        onChange: (e) => onCount(Number(e.target.value)),
+        style: { width: "100%", margin: 0, accentColor: ACCENT, direction: name === "prefix" ? "rtl" : "ltr" }
+      }) : null
     ]
   });
 }
@@ -9289,6 +9398,14 @@ function copyText(text) {
 function Turn({ turn, index, editable, folded, onFold, onEdit, onCopy, onMove, md, raw, onRaw }) {
   const tone = toneOf2(turn.role);
   const reply = turn.role === "assistant";
+  const headRef = useRef11(null);
+  const fold = () => {
+    onFold();
+    requestAnimationFrame(() => {
+      const el = headRef.current;
+      if (el) el.scrollIntoView({ block: "nearest" });
+    });
+  };
   return jsxs36("div", {
     style: {
       display: "flex",
@@ -9299,7 +9416,10 @@ function Turn({ turn, index, editable, folded, onFold, onEdit, onCopy, onMove, m
       borderTop: index ? `2px solid color-mix(in oklch, ${tone}, transparent 35%)` : "none"
     },
     children: [
+      // The head sticks to the top of the column while its turn scrolls by (owner, 2026-10-14: the
+      // role chip ran off screen, a huge turn could not be folded) - opaque, so text slides under it.
       jsxs36("div", {
+        ref: headRef,
         style: {
           display: "flex",
           alignItems: "center",
@@ -9308,11 +9428,14 @@ function Turn({ turn, index, editable, folded, onFold, onEdit, onCopy, onMove, m
           userSelect: "none",
           padding: "0.2rem 0.4rem",
           borderRadius: "0.35rem",
-          background: `color-mix(in oklch, ${tone}, transparent 85%)`
+          position: "sticky",
+          top: 0,
+          zIndex: 1,
+          background: `color-mix(in oklch, ${tone} 15%, ${SURFACE})`
         },
         children: [
           jsx40("span", {
-            onClick: onFold,
+            onClick: fold,
             style: { cursor: "pointer", color: tone, fontWeight: 700, fontSize: "0.8rem", letterSpacing: "0.02em" },
             children: `${folded ? "\u25B8" : "\u25BE"} ${turn.role}${index < 2 && editable ? " (editable)" : ""}`
           }),
@@ -9366,7 +9489,7 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
   const [model, setModel] = useState17("");
   const [think, setThink] = useState17(false);
   const [presetKey, setPresetKey] = useState17((presets[0] || {}).key);
-  const [picks, setPicks] = useState17({ prefix: false, suffix: false });
+  const [picks, setPicks] = useState17({ prefix: 0, suffix: 0 });
   const [values, setValues] = useState17({});
   const [turns, setTurns] = useState17([]);
   const [sent, setSent] = useState17(false);
@@ -9380,6 +9503,7 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
   const [resultRaw, setResultRaw] = useState17(false);
   const [wrap, setWrap] = useState17((presets[0] || {}).wrap || "as-it-was");
   const tapeRef = useRef11(null);
+  const chatRun = useRef11(0);
   const [chipPop, setChipPop] = useState17(null);
   const [headOpen, setHeadOpen] = useState17(false);
   const saved = useMemo3(() => placeOf(loadPlace(), window.innerWidth, window.innerHeight), []);
@@ -9480,7 +9604,11 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
     setSent(true);
     setBusy(true);
     setStatus({ kind: "busy", note: `sending ${kLabel(conversationTokens(conv))} to ${model}\u2026` });
-    transport.chat({ messages: conv.map((t) => ({ role: t.role, content: t.content })), model, think }).then((r) => {
+    const run = ++chatRun.current;
+    const mine = (f) => (x) => {
+      if (run === chatRun.current) f(x);
+    };
+    transport.chat({ messages: conv.map((t) => ({ role: t.role, content: t.content })), model, think }).then(mine((r) => {
       if (!r || !r.ok) {
         setStatus({ kind: "error", note: r && r.error || "no answer" });
         return;
@@ -9489,7 +9617,19 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
       setResult((res) => dropReply(res, r.text));
       const tk = r.tokens || {};
       setStatus({ kind: "idle", note: `${r.model || model} \xB7 ${kLabel(tk.prompt)} \u2192 ${kLabel(tk.completion)}` });
-    }, (err) => setStatus({ kind: "error", note: String(err && err.message || err) })).then(() => setBusy(false));
+    }), mine((err) => setStatus({ kind: "error", note: String(err && err.message || err) }))).then(mine(() => setBusy(false)));
+  };
+  const stop = () => {
+    if (!busy) return;
+    chatRun.current++;
+    setBusy(false);
+    setStatus({ kind: "idle", note: "stopped" });
+    if (transport.stop) {
+      transport.stop().then((r) => {
+        if (r && r.ok === false) setStatus({ kind: "error", note: `stopped here; server: ${r.error || "no stop"}` });
+      }, () => {
+      });
+    }
   };
   const frames = data && data.frames || [];
   const frame = !data ? null : wrap === "as-it-was" ? frames[0] ? { head: frames[0].head, tail: frames[0].tail || "", tailApart: false } : null : frameFor(wrap, frameTexts, (data.bubbles || []).length > 0);
@@ -9555,12 +9695,12 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
     style: { display: "flex", flexDirection: "column", gap: "0.3rem", padding: "0 0.45rem 0.45rem", borderRight: STROKE, minHeight: 0, overflow: "hidden" },
     children: [
       jsx40(Label, { children: "data" }),
-      data ? jsx40(Wagon, { name: "prefix", list: data.prefix, on: picks.prefix, onToggle: () => setPicks({ ...picks, prefix: !picks.prefix }) }) : null,
+      data ? jsx40(Wagon, { name: "prefix", list: data.prefix, count: picks.prefix, onCount: (k2) => setPicks({ ...picks, prefix: k2 }) }) : null,
       jsx40("div", {
         style: { display: "flex", flexDirection: "column", gap: "0.2rem", overflowY: "auto", minHeight: 0, flex: "0 1 auto", padding: "0.1rem 0" },
         children: rows.map((m) => jsx40(Chip2, { m, open: !!chipPop && chipPop.addr === m.addr, onOpen: setChipPop }, m.addr))
       }),
-      data ? jsx40(Wagon, { name: "suffix", list: data.suffix, on: picks.suffix, onToggle: () => setPicks({ ...picks, suffix: !picks.suffix }) }) : null,
+      data ? jsx40(Wagon, { name: "suffix", list: data.suffix, count: picks.suffix, onCount: (k2) => setPicks({ ...picks, suffix: k2 }) }) : null,
       jsx40("div", { style: { flex: 1 } }),
       frames.length ? jsx40("div", {
         style: { fontSize: "0.55rem", color: TEXT_DIM },
@@ -9589,6 +9729,7 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
       jsx40("div", { style: { padding: "0 0.6rem" }, children: jsx40(Label, { children: "conversation" }) }),
       jsx40("div", {
         ref: tapeRef,
+        className: "llmops-scroll",
         style: { flex: 1, minHeight: 0, overflowY: "auto", padding: "0 0.6rem" },
         children: turns.map((t, i) => jsx40(Turn, {
           turn: t,
@@ -9622,6 +9763,7 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
               }
             }
           }) }),
+          busy ? jsx40(Btn, { onClick: stop, strong: true, tone: "var(--ui-red)", title: "stop waiting and cut the model request", children: "\u25A0 Stop" }) : null,
           jsx40(Btn, { onClick: send, disabled: busy || !data, strong: true, tone: ACCENT, children: busy ? "\u2026" : "Send" })
         ]
       })
@@ -9665,7 +9807,7 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
       ] }),
       frame ? jsx40(FramePiece, { text: frame.head, open: headOpen, onToggle: () => setHeadOpen(!headOpen) }, "frame-head") : null,
       // 📖 shows the body rendered; an empty body is always the field (there is nothing to read).
-      md && !resultRaw && result.body.trim() ? jsx40(Md, { text: result.body, md, style: {
+      md && !resultRaw && result.body.trim() ? jsx40(Md, { text: result.body, md, className: "llmops-scroll", style: {
         flex: 1,
         minHeight: 0,
         overflowY: "auto",
@@ -9765,6 +9907,17 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
       color: "var(--ui-text-primary)"
     },
     children: [
+      // A visible scrollbar on the long columns (owner, 2026-10-14: only the wheel scrolled them).
+      jsx40("style", { children: `
+        .llmops-scroll::-webkit-scrollbar { width: 13px; }
+        .llmops-scroll::-webkit-scrollbar-track { background: transparent; }
+        .llmops-scroll::-webkit-scrollbar-thumb {
+          background-color: var(--ui-stroke-secondary);
+          border-radius: 0; border-style: solid; border-color: transparent;
+          border-width: 0 4px 0 1px; background-clip: padding-box;
+        }
+        .llmops-scroll::-webkit-scrollbar-thumb:hover { background-color: var(--ui-stroke-primary); }
+      ` }),
       head,
       popRow ? jsx40(ChipPopup, {
         m: popRow,

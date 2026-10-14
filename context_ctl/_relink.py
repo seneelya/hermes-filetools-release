@@ -38,10 +38,13 @@ _DROPPED = ("cmd_sidecar", "turn")
 def _same_text(rec, text: str) -> bool:
     """Текст тот же, что записан в журнале? Переводы строк ПО КРАЯМ не в счёт: файл выгрузки
     режется на половины без них (`_export.split_halves`), и честный ответ с `\\n` в конце
-    иначе всегда выглядел бы правленым."""
+    иначе всегда выглядел бы правленым. До двух с каждого края (живьём 2026-10-14: `execute_code`
+    с `\\n\\n` в конце)."""
     want = str(rec.get("sha8") or "")
     core = text.strip("\n")
-    return any(_ledger.sha8(v) == want for v in (text, core, core + "\n", "\n" + core + "\n"))
+    edges = ("", "\n", "\n\n")
+    return _ledger.sha8(text) == want or any(
+        _ledger.sha8(lead + core + trail) == want for lead in edges for trail in edges)
 
 
 def relink(rows, records, session: str, allocate=None) -> tuple[list, list]:

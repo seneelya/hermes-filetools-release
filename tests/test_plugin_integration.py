@@ -1388,3 +1388,36 @@ def test_e4_console_sift_files_only_and_count():
     cnt = _run_console("sift_files_core.py", "def ", "--output-mode", "count",
                        "--path", str(FIXTURES), "--file-glob", "*.py")
     assert cnt.get("total_count", 0) > 0, f"count empty: {cnt}"
+
+
+def test_e2g_every_desktop_ui_tool_is_hidden():
+    """`desktop_ui` is folded into desktop sessions REGARDLESS of config (their
+    `_with_session_toolsets`, still so at c0ef5af520), so `disabled_tools` in plugin.yaml is the
+    only way to keep these tools from the model - and it hides them BY NAME. A tool they add to
+    that toolset slips through silently; at c0ef5af520 that was `show_tip`. This finds every
+    `registry.register(..., toolset="desktop_ui")` in their tree and demands each name listed."""
+    import re
+
+    tools_pkg = pytest.importorskip("tools")
+    root = Path(tools_pkg.__file__).resolve().parent
+    found = set()
+    for path in root.glob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # Each call = the text from one `registry.register(` to the next (or the file end): how a
+        # call closes varies (`\n)` or `...")` at the line end - `show_tip` closes the latter way).
+        for body in text.split("registry.register(")[1:]:
+            if re.search(r"toolset\s*=\s*[\"']desktop_ui[\"']", body):
+                name = re.search(r"\bname\s*=\s*[\"']([a-z_]+)[\"']", body)
+                if name:
+                    found.add(name.group(1))
+    assert found, "no desktop_ui tool found at all - the scan is broken or the toolset was renamed"
+    # The shipped list itself (not a profile's override) - read as text: no yaml in this env.
+    block = (PROJECT_ROOT / "plugin.yaml").read_text(encoding="utf-8").split("\ndisabled_tools:\n", 1)[1]
+    hidden = set()
+    for line in block.splitlines():
+        if not line.startswith("  - "):
+            if line.strip() and not line.lstrip().startswith("#"):
+                break
+            continue
+        hidden.add(line[4:].strip())
+    assert sorted(found - hidden) == [], "desktop_ui tools the model would see - add them to plugin.yaml disabled_tools"

@@ -35,6 +35,47 @@ AS_IT_WAS = "as-it-was"
 # 2026-10-07: падение llama.cpp (CUDA `allreduce.cu`) оказалось багом сервера на этом промпте —
 # воспроизведено в его собственном чате без плагина; пауза не влияет. Владелец: «оставь 3 секунды».
 WARM_SETTLE_S = 3.0
+# Сколько ждём ответа на разговор окна: большие сессии считаются минутами (владелец, 2026-10-14 —
+# 30 с UI и 180 с маршрута обрывали). Окно ждёт столько же (`adapter.js::LLMOPS_CHAT_TIMEOUT_MS`).
+CHAT_TIMEOUT_S = 30 * 60
+
+# Идущий разговор окна (одно окно — один разговор): его соединения и флаг «остановлен» (`stop`).
+_run_lock = threading.Lock()
+_run: dict | None = None
+
+
+def _sink(run: dict):
+    """Приёмник соединений `_llm.conn_sink` для разговора `run`; после стопа новых не открываем."""
+    def take(conn):
+        with _run_lock:
+            if run["stopped"]:
+                raise RuntimeError("остановлено")
+            # Сам сокет, не соединение: после `getresponse` http.client отвязывает его (`conn.sock = None`),
+            # а ответ читает дальше через тот же сокет.
+            run["socks"].append(conn.sock)
+    return take
+
+
+def stop() -> dict:
+    """■ Stop окна: гасим сокеты идущего разговора — `urlopen` в его потоке падает, сервер модели
+    видит обрыв. `{ok, cut}` — сколько соединений оборвали (0 — нечего было или ещё не открыто)."""
+    with _run_lock:
+        run = _run
+        if run is None:
+            return {"ok": True, "cut": 0}
+        run["stopped"] = True
+        socks = list(run["socks"])
+    cut = 0
+    for sock in socks:
+        if sock is None:
+            continue
+        try:
+            import socket
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        cut += 1
+    return {"ok": True, "cut": cut}
 
 
 def _strip_target_frames(text: str) -> tuple:
@@ -129,7 +170,27 @@ def window_data(session_id: str, rows: list, by_msg: dict, addrs: list) -> dict:
 def chat(messages: list, model: str = "", think: bool = False, timeout: float | None = None) -> dict:
     """Весь разговор окна одним запросом на маршрут опроса. `{ok, text, model, tokens}` / `{ok: False, error}`.
 
-    Маршрут ставит вызывающий (`_llm.use_route`). `model` — из выбора окна, пусто — модель маршрута."""
+    Маршрут ставит вызывающий (`_llm.use_route`). `model` — из выбора окна, пусто — модель маршрута.
+    Ждёт до `CHAT_TIMEOUT_S`; `stop()` обрывает его (ответ `{ok: False, stopped: True}`)."""
+    global _run
+    run = {"socks": [], "stopped": False}
+    with _run_lock:
+        _run = run
+    token = _llm.conn_sink.set(_sink(run))
+    try:
+        out = _chat(messages, model, think, timeout or CHAT_TIMEOUT_S)
+    finally:
+        _llm.conn_sink.reset(token)
+        with _run_lock:
+            if _run is run:
+                _run = None
+    if run["stopped"]:
+        return {"ok": False, "stopped": True, "error": "остановлено"}
+    return out
+
+
+def _chat(messages: list, model: str, think: bool, timeout: float) -> dict:
+    """Тело `chat`: прогрев, запрос, разбор."""
     ok, why = _llm.available()
     if not ok:
         return {"ok": False, "error": why}
@@ -145,7 +206,7 @@ def chat(messages: list, model: str = "", think: bool = False, timeout: float | 
         # Прогрев — голое «ok» без данных. Не ответил — разговор никуда не шлём.
         return {"ok": False, "error": f"модель не ответила на прогрев: {warm['error']}"}
     try:
-        result = _llm._complete(route, msgs, timeout, think=bool(think))
+        result = _llm._complete(route, msgs, timeout, think=bool(think), stream=True)
     except Exception as exc:  # noqa: BLE001 — отчёт, не падение
         return {"ok": False, "error": str(exc)}
     text = result["text"].strip()

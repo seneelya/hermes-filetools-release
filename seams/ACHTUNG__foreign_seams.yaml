@@ -867,6 +867,26 @@ seams:
       rethinking, not patching.
     asserted_by: null
 
+  - id: override.desktop_ui_folded_in_regardless
+    level: 1
+    file: tui_gateway/server.py
+    kind: symbol
+    symbol: 'fold_in -= disabled - {"desktop_ui"}'
+    baseline_count: 1
+    we_do: >-
+      Hide every `desktop_ui` tool BY NAME (plugin.yaml `disabled_tools`):
+      their `_with_session_toolsets` folds that toolset into desktop sessions
+      whatever the config says (`project` honours agent.disabled_toolsets
+      since #54433, `desktop_ui` is kept on purpose). Added 2026-10-11 when
+      c0ef5af520 brought a new one, `show_tip`, that the list did not name.
+    breaks: >-
+      They add a desktop_ui tool -> the model silently gets it (a name we do
+      not list is not hidden). The test scans their tree for every
+      `toolset="desktop_ui"` registration and fails on an unlisted name.
+      Count 0 = the fold-in changed - maybe config now works and the list
+      can shrink; read the function.
+    asserted_by: tests/test_plugin_integration.py::test_e2g_every_desktop_ui_tool_is_hidden
+
   # ---- level 2: how the model learns what our tools are ----
 
   - id: schema.build_execute_code_schema

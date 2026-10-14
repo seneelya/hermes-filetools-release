@@ -808,19 +808,28 @@ def _ledger_split(entries):
     return ops, ledger.erased_ops(entries)
 
 
-def _parent_state(entry, entries, index):
-    """`(state, reason)` for an operation performed INSIDE execute_code.
+def _parent_of(entry, entries):
+    """`(parent execute_code entry or None, matched_by_position)` for a nested operation.
 
     Its own sha8 can never match: the row it correlates to holds the sandbox's
     output, not this read's text, because every nested call inherits the OUTER
-    tool_call_id (`_ledger.py::_observability_context`). Asking the per-row
-    question of a nested operation is what produces the `unknown` that made
-    these reads look lost when they are not.
+    tool_call_id (`_ledger.py::_observability_context`). So the questions about
+    it are asked of the PARENT — the `execute_code` entry it ran inside.
 
-    So the question is asked of the PARENT instead — the `execute_code` entry
-    sharing this tool_call_id, whose digest does describe its row. The nested
-    operation's visibility is exactly its parent's: parent evicted, it is gone
-    with it; parent alive, its text is inside the parent's.
+    With a correlation id: the `execute_code` entry sharing it.
+
+    Without one — and measurement says that is the NORMAL case, not the exception:
+    across the whole live ledger store, all 50 nested entries lack `tool_call_id`,
+    every one of them (checked 2026-09-08). The sandbox runs the inner tool in a
+    context where `tools.approval`'s contextvars are unset, so there is nothing for
+    `_ledger` to record. The parent can still be identified, by ledger POSITION
+    rather than by id: a child is recorded WHILE execute_code runs, the parent right
+    AFTER it returns, so the parent is the first `execute_code` entry below this one.
+    Same 50 entries, same check: all 50 have such an entry, none is missing.
+
+    Deliberately NOT the nearest execute_code in either direction: "before"
+    would attach a child to the PREVIOUS sandbox call whenever the current one
+    is the session's first, which is exactly the case with no evidence at all.
     """
     call_id = entry.get("tool_call_id")
     if call_id:
@@ -829,39 +838,38 @@ def _parent_state(entry, entries, index):
                 continue
             if (other.get("tool") == "execute_code"
                     and other.get("tool_call_id") == call_id):
-                state, reason = _state_for(other, index.get(str(call_id)))
-                suffix = "inherited from the execute_code operation it ran inside"
-                return state, f"{reason}; {suffix}" if reason else suffix
-        return "unknown", ("nested operation whose execute_code parent is not "
-                           "in the ledger")
-
-    # No correlation id at all — and measurement says that is the NORMAL case,
-    # not the exception: across the whole live ledger store, all 50 nested
-    # entries lack `tool_call_id`, every one of them (checked 2026-09-08). The
-    # sandbox runs the inner tool in a context where `tools.approval`'s
-    # contextvars are unset, so there is nothing for `_ledger` to record. That
-    # left EVERY nested operation permanently `unknown` — the very symptom the
-    # nested handling was written to remove.
-    #
-    # The parent can still be identified, by ledger POSITION rather than by id:
-    # a child is recorded WHILE execute_code runs, the parent right AFTER it
-    # returns, so the parent is the first `execute_code` entry below this one.
-    # Same 50 entries, same check: all 50 have such an entry, none is missing.
-    #
-    # Deliberately NOT the nearest execute_code in either direction: "before"
-    # would attach a child to the PREVIOUS sandbox call whenever the current one
-    # is the session's first, which is exactly the case with no evidence at all.
+                return other, False
+        return None, False
     for other in entries[entries.index(entry) + 1:]:
         if other.get("tool") == "execute_code":
-            other_id = other.get("tool_call_id")
-            state, reason = _state_for(other, index.get(str(other_id)) if other_id else None)
-            suffix = ("inherited from the execute_code operation it ran inside "
-                      "(matched by ledger position — the sandbox records no "
-                      "correlation id for nested calls)")
-            return state, f"{reason}; {suffix}" if reason else suffix
-    return "unknown", ("nested operation with no correlation id and no "
-                       "execute_code entry after it — its parent cannot be "
-                       "identified")
+            return other, True
+    return None, True
+
+
+def _parent_state(entry, entries, index):
+    """`(state, reason)` for an operation performed INSIDE execute_code.
+
+    The nested operation's visibility is exactly its parent's (`_parent_of`):
+    parent evicted, it is gone with it; parent alive, its text is inside the
+    parent's.
+    """
+    parent, by_position = _parent_of(entry, entries)
+    if parent is None:
+        if not by_position:
+            return "unknown", ("nested operation whose execute_code parent is not "
+                               "in the ledger")
+        return "unknown", ("nested operation with no correlation id and no "
+                           "execute_code entry after it — its parent cannot be "
+                           "identified")
+    parent_id = parent.get("tool_call_id")
+    state, reason = _state_for(parent, index.get(str(parent_id)) if parent_id else None)
+    if by_position:
+        suffix = ("inherited from the execute_code operation it ran inside "
+                  "(matched by ledger position — the sandbox records no "
+                  "correlation id for nested calls)")
+    else:
+        suffix = "inherited from the execute_code operation it ran inside"
+    return state, f"{reason}; {suffix}" if reason else suffix
 
 
 def build_context_state(entries, rows) -> dict:
@@ -926,6 +934,14 @@ def build_context_state(entries, rows) -> dict:
         msg = msg_of.get(str(call_id or "")) if not entry.get("nested") else None
         if msg:
             fact["msg"] = msg
+        # Адрес строки `execute_code`, ВНУТРИ которого шла вложенная операция (2026-10-14) —
+        # только для перехода из списка операций файла к чипу скрипта. Нарочно НЕ `msg`: по
+        # `msg` чип берёт диф и состояние операции, и скрипт присвоил бы себе чужие.
+        if entry.get("nested"):
+            parent, _ = _parent_of(entry, entries)
+            host = msg_of.get(str(parent.get("tool_call_id") or "")) if parent else None
+            if host:
+                fact["host_msg"] = host
         # THE LEDGER REMEMBERS THE OPERATION AND THE DATABASE HAS NO ROW FOR IT. A flag, not
         # a phrase to be re-parsed on the client: the panel acts on this (it removes the
         # card), and hanging an action off matching the wording of `reason` would break the
@@ -2223,6 +2239,23 @@ async def llmops_chat(request: Request):
         # The model answers in minutes — off the event loop.
         return await asyncio.to_thread(engine.llmops_chat, messages,
                                        str(body.get("model") or ""), bool(body.get("think")))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@router.post("/llmops-stop")
+async def llmops_stop(request: Request):
+    """`POST /llmops-stop {session}` — ■ Stop окна: оборвать идущий `/llmops-chat` (его сокет к
+    модели гасится, тот запрос отвечает `{ok: False, stopped: True}`). `{ok, cut}`."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    engine, err = _llmops_engine((body or {}).get("session") if isinstance(body, dict) else "", "llmops_stop")
+    if err:
+        return err
+    try:
+        return engine.llmops_stop()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 

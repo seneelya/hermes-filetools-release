@@ -138,6 +138,18 @@ def list_files(folder) -> tuple[list, list]:
     return files, problems
 
 
+def read_verbatim(path) -> str:
+    """Файл выгрузки как он есть. `read_text` переводил `\\r\\n` в `\\n` — и результат, прочитавший
+    файл с CRLF, приходил в ленту другим текстом: хэш не сходился с журналом, импорт метил его
+    «правлен руками» (владелец, 2026-10-14: 139 из 223 в живом импорте). Выгрузка пишет `\\n`
+    (`_export`, `newline=""`), `\\r\\n` внутри — содержимое. Файл ЦЕЛИКОМ в `\\r\\n` (сохранён
+    редактором Windows) — переводы строк редактора, их сводим к `\\n`."""
+    text = Path(path).read_bytes().decode("utf-8")
+    if "\r\n" in text and "\n" not in text.replace("\r\n", ""):
+        text = text.replace("\r\n", "\n")
+    return text
+
+
 def new_tag() -> str:
     """Метка одного импорта: id вызовов `imp_<метка>_<место>_<k>` не повторяются, если ту же папку
     влить дважды или в сессию, где импорт уже был (`Plan27-Task03`)."""
@@ -149,7 +161,7 @@ def build_rows(files, read=None, tag: str = "") -> tuple[list, list]:
 
     `read(path) -> str` — подмена чтения для тестов. `tag` — метка импорта в id вызовов.
     """
-    read = read or (lambda p: Path(p).read_text(encoding="utf-8"))
+    read = read or read_verbatim
     rows, problems = [], []
     last_stamp = 0.0
     # Вызовы последней реплики, ещё без результата: `[(канон, имя, id)]`.

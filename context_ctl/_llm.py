@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import http.client
 import json
 import os
 import re
@@ -102,6 +103,10 @@ _route: contextvars.ContextVar = contextvars.ContextVar("filetools_llm_route", d
 # Ступень отката, на которой сервер ответил: (адрес, модель) → номер (`_complete`). Живёт до
 # перезапуска процесса: сервер, отвергший поле, отвергнет его и завтра.
 _step_of: dict = {}
+# Кто поставил сюда функцию, получает КАЖДОЕ соединение `_post` до отправки (окно LLMOps, кнопка
+# ■ Stop: `_llmops.stop` гасит сокет из другого потока — `urlopen` падает, сервер модели видит обрыв
+# и бросает генерацию). Не поставлено — обычный `urlopen`.
+conn_sink: contextvars.ContextVar = contextvars.ContextVar("filetools_llm_conn_sink", default=None)
 
 
 class _HttpError(RuntimeError):
@@ -182,6 +187,48 @@ def _key_value(key) -> str:
     return str(key or "").strip()
 
 
+def _watched(conn, sink):
+    """Соединение уходит в `sink` сразу ПОСЛЕ `connect` — когда сокет уже есть и его можно погасить.
+    Приёмник вправе бросить (стоп раньше соединения) — тогда запрос не уходит."""
+    connect = conn.connect
+
+    def watched_connect():
+        connect()
+        try:
+            sink(conn)
+        except BaseException:
+            conn.close()
+            raise
+    conn.connect = watched_connect
+    return conn
+
+
+class _SinkHttp(urllib.request.HTTPHandler):
+    """`HTTPHandler`, отдающий соединение в `sink` (см. `conn_sink`)."""
+
+    def __init__(self, sink):
+        super().__init__()
+        self._sink = sink
+
+    def http_open(self, req):
+        def make(host, **kw):
+            return _watched(http.client.HTTPConnection(host, **kw), self._sink)
+        return self.do_open(make, req)
+
+
+class _SinkHttps(urllib.request.HTTPSHandler):
+    """То же для https."""
+
+    def __init__(self, sink):
+        super().__init__()
+        self._sink = sink
+
+    def https_open(self, req):
+        def make(host, **kw):
+            return _watched(http.client.HTTPSConnection(host, **kw), self._sink)
+        return self.do_open(make, req, context=self._context)
+
+
 def _post(route: dict, body: dict, timeout: float) -> dict:
     """Один запрос `chat/completions`. Исключения — словами, без ключа в тексте."""
     headers = {"Content-Type": "application/json"}
@@ -194,8 +241,12 @@ def _post(route: dict, body: dict, timeout: float) -> dict:
     req = urllib.request.Request(route["base_url"] + "/chat/completions",
                                  data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                                  headers=headers, method="POST")
+    sink = conn_sink.get()
+    opener = urllib.request.build_opener(_SinkHttp(sink), _SinkHttps(sink)) if sink else None
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with (opener.open(req, timeout=timeout) if opener else urllib.request.urlopen(req, timeout=timeout)) as resp:
+            if body.get("stream"):
+                return _from_sse(resp)
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -206,8 +257,31 @@ def _post(route: dict, body: dict, timeout: float) -> dict:
         raise RuntimeError(f"сервер {route['base_url']} недоступен: {exc.reason}") from None
 
 
+def _from_sse(lines) -> dict:
+    """Потоковый ответ (`stream: true`, строки `data: {…}`) — собранный в форму обычного: текст из
+    `delta.content`, модель, `usage` последнего куска. Рассуждение (`reasoning_content`) не берём —
+    как и в обычном ответе."""
+    parts, model, usage = [], "", {}
+    for raw in lines:
+        line = raw.decode("utf-8", "replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+        except ValueError:
+            continue
+        model = chunk.get("model") or model
+        usage = chunk.get("usage") or usage
+        for choice in chunk.get("choices") or []:
+            parts.append(str((choice.get("delta") or {}).get("content") or ""))
+    return {"choices": [{"message": {"content": "".join(parts)}}], "model": model, "usage": usage}
+
+
 def _complete(route: dict, messages: list, timeout: float | None, response_format=None,
-              think: bool = False) -> dict:
+              think: bool = False, stream: bool = False) -> dict:
     """Запрос и разбор ответа: `{text, model, tokens, sent}`.
 
     СТУПЕНИ ОТКАТА. Поля «не думай» (`_server_kind`) и `response_format` — наши добавки, и
@@ -216,7 +290,9 @@ def _complete(route: dict, messages: list, timeout: float | None, response_forma
     сервер ответил, запоминается на (адрес, модель): следующие вопросы опроса не бьются в ту
     же стену и не рвут префикс кеша разным телом. `sent` — какая ступень ушла, для отчёта.
 
-    `think=True` — окно LLMOps (`Plan31`): полей «не думай» не шлём вовсе."""
+    `think=True` — окно LLMOps (`Plan31`): полей «не думай» не шлём вовсе. `stream=True` — тоже окно:
+    ответ потоком (`_from_sse`), чтобы обрыв соединения (■ Stop) останавливал генерацию на сервере —
+    не-потоковый запрос llama.cpp досчитывает до конца (проверено живьём 2026-10-14, роутер :5001)."""
     key = (route["base_url"], route["model"])
     extras = {} if think else _server_kind.no_think(route.get("server", "llamacpp"))
     steps = [("full", extras, response_format), ("no-think-off", {}, response_format),
@@ -226,7 +302,9 @@ def _complete(route: dict, messages: list, timeout: float | None, response_forma
     for i, (sent, add, fmt) in enumerate(steps[start:], start):
         if i > start and add == steps[i - 1][1] and fmt == steps[i - 1][2]:
             continue  # ступень ничем не отличается от предыдущей — повторять нечего
-        body = {"model": route["model"], "messages": messages, "stream": False, **add}
+        body = {"model": route["model"], "messages": messages, "stream": bool(stream), **add}
+        if stream:
+            body["stream_options"] = {"include_usage": True}
         if fmt:
             body["response_format"] = fmt
         try:

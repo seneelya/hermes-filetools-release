@@ -523,6 +523,11 @@ class ContextCtlEngine(ContextEngine):
         with _llm.use_route(self.live_agent()):
             return _llmops.chat(messages, model, think)
 
+    def llmops_stop(self) -> dict:
+        """■ Stop окна: оборвать идущий разговор (`_llmops.stop`)."""
+        from . import _llmops
+        return _llmops.stop()
+
     def llmops_models(self) -> dict:
         """Модели сервера маршрута (`_llmops.models`)."""
         from . import _llm, _llmops

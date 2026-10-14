@@ -242,7 +242,7 @@ Every answer starts with its operation number (above).
 
 Hermes gives the model a set of tools to **drive the desktop app itself** — open a preview, focus
 a pane, take a guided tour, switch a workspace, and so on (`desktop_preview`, `focus_pane`,
-`apply_layout`, `gui_tour`, `desktop_project`, `read_terminal`, …). We did not ask for them, they
+`apply_layout`, `gui_tour`, `desktop_project`, `read_terminal`, `show_tip`, …). We did not ask for them, they
 cost context on every request, and Hermes has no setting that removes them. So the plugin hides
 them by default: the model does not see them at all. The panels themselves keep working — only the
 model loses the ability to drive them.
