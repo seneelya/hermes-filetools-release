@@ -87,6 +87,8 @@ def read_state(session: str | None) -> dict:
         return empty(session)
     out = empty(session)
     out.update({k: v for k, v in data.items() if k in out})
+    if isinstance(data.get("draft"), dict):
+        out["draft"] = data["draft"]  # превью (`Plan35`) — только когда есть
     out["running"] = bool(out["running"])
     out["ok"] = bool(out["ok"])
     out["lines"] = [str(x) for x in (out.get("lines") or [])]
@@ -98,6 +100,8 @@ def write_state(session: str | None, payload: dict) -> dict:
     о ходе прогона хуже, чем упавший фоновый прогон компакции."""
     data = empty(session)
     data.update({k: v for k, v in (payload or {}).items() if k in data})
+    if isinstance((payload or {}).get("draft"), dict):
+        data["draft"] = payload["draft"]  # превью (`Plan35`): нет — ключа нет, файл прежний
     data["version"] = VERSION
     data["session"] = session or ""
     try:

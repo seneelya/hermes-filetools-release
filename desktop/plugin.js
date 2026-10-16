@@ -636,7 +636,12 @@ var COMPACT_INITIAL = {
   confirming: false,
   busy: false,
   note: "",
-  ok: null
+  ok: null,
+  wish: "",
+  sets: null,
+  menu: {},
+  menuTouched: false,
+  preview: false
 };
 var $compact = makeAtom(COMPACT_INITIAL);
 function useCompact() {
@@ -1016,10 +1021,13 @@ function setLLMOpsPicks(picked) {
   if (!cur.mode) return;
   setLLMOpsRail({ picked: Object.assign({}, picked || {}) });
 }
-function openLLMOpsWindow(sid, addrs) {
+function openLLMOpsWindow(sid, addrs, draft) {
   if ($llmopsWin.get()) return false;
   llmopsSeq += 1;
-  $llmopsWin.set({ sid: String(sid || ""), addrs: (addrs || []).slice(), seq: llmopsSeq });
+  $llmopsWin.set(Object.assign(
+    { sid: String(sid || ""), addrs: (addrs || []).slice(), seq: llmopsSeq },
+    draft ? { draft } : {}
+  ));
   return true;
 }
 function closeLLMOpsWindow() {
@@ -1089,9 +1097,14 @@ function llmopsTransport(sid, addrs) {
     // A big session's prompt takes minutes — their default 30 s cut it (owner, 2026-10-14).
     chat: ({ messages, model, think }) => adapter.rest("/llmops-chat", { method: "POST", body: { session: sid, messages, model, think: !!think }, timeoutMs: LLMOPS_CHAT_TIMEOUT_MS }).then(asRecord),
     stop: () => adapter.rest("/llmops-stop", { method: "POST", body: { session: sid } }).then(asRecord),
-    replace: ({ addrs: eat, text, wrap, preset }) => {
+    // Что модель уже напечатала, пока `chat` ждёт: новое после `textAt`/`reasoningAt` символов.
+    progress: (textAt, reasoningAt) => adapter.rest(`/llmops-progress?session=${s}&text=${Number(textAt) || 0}&reasoning=${Number(reasoningAt) || 0}`).then(asRecord),
+    replace: ({ addrs: eat, text, wrap, preset, origin }) => {
       setLLMOpsRail({ note: "llm ops: replacing\u2026", ok: null });
-      return adapter.rest("/llmops-replace", { method: "POST", body: { session: sid, addrs: eat, text, wrap, preset: preset || "" } }).then(asRecord).then((r) => {
+      return adapter.rest("/llmops-replace", { method: "POST", body: Object.assign(
+        { session: sid, addrs: eat, text, wrap, preset: preset || "" },
+        origin ? { origin } : {}
+      ) }).then(asRecord).then((r) => {
         if (r.ok !== true) {
           const why = String(r.error || "not started");
           setLLMOpsRail({ note: `llm ops: ${why}`, ok: false });
@@ -1562,6 +1575,56 @@ function openCompactConfirm() {
     return;
   }
   setCompact({ confirming: true });
+  loadCompactSets().then((r) => {
+    if (!r || r.ok !== true || !Array.isArray(r.sets)) return;
+    const off = new Set(Array.isArray(r.off) ? r.off : []);
+    const menu = Object.fromEntries(r.sets.map((s) => [s.name, s.fallback || !off.has(s.name)]));
+    setCompact({ sets: r.sets, menu, menuTouched: false });
+  });
+}
+function loadCompactSets(sid) {
+  const key = sid || viewKey();
+  if (!adapter.hasRest || !isPersistableKey(key)) {
+    return Promise.resolve({ ok: false, error: "open a saved chat \u2014 the sets come from its live engine" });
+  }
+  return adapter.rest(`/compact-sets?session=${encodeURIComponent(key)}`).then((r) => r && typeof r === "object" ? r : { ok: false, error: "not an answer" }).catch((err) => ({ ok: false, error: err && err.message || String(err) }));
+}
+function compactSetLabel(s) {
+  return String(s && (s.word || s.name) || "");
+}
+function compactSetTitle(s) {
+  const asks = Array.isArray(s && s.asks) ? s.asks : [];
+  return [String(s && s.pick || "")].concat(asks.length ? ["", "asks:"].concat(asks.map((a) => `  \u2022 ${a}`)) : []).concat(s && s.fallback ? ["", "fallback \u2014 always shown"] : []).join("\n");
+}
+function toggleCompactMenu(name) {
+  const cur = $compact.get() || COMPACT_INITIAL;
+  const set = (cur.sets || []).find((s) => s.name === name);
+  if (!set || set.fallback) return;
+  setCompact({ menu: Object.assign({}, cur.menu, { [name]: !(cur.menu || {})[name] }), menuTouched: true });
+}
+function setCompactWish(text) {
+  setCompact({ wish: String(text || "") });
+}
+function toggleCompactPreview() {
+  const cur = $compact.get() || COMPACT_INITIAL;
+  setCompact({ preview: !cur.preview });
+}
+function draftOfStatus(r) {
+  const d = r && typeof r.draft === "object" && r.draft ? r.draft : null;
+  if (!d || !String(d.text || "").trim() || !Array.isArray(d.addrs) || !d.addrs.length) return null;
+  return {
+    addrs: d.addrs.map(String),
+    win: {
+      text: String(d.text),
+      wrap: String(d.wrap || "compaction"),
+      // `sets` — классификация опроса `[{topic, set}]` как есть: строками журнал их выбросит.
+      origin: {
+        by: "compact",
+        wish: String(d.wish || ""),
+        sets: Array.isArray(d.sets) ? d.sets.filter((x) => x && typeof x === "object").map((x) => ({ topic: String(x.topic || ""), set: String(x.set || "") })) : []
+      }
+    }
+  };
 }
 function cancelCompactConfirm() {
   setCompact({ confirming: false });
@@ -1580,6 +1643,16 @@ function pollCompactStatus(sid) {
     const r = res && typeof res === "object" ? res : {};
     if (r.running) return;
     stopCompactPoll();
+    const draft = draftOfStatus(r);
+    if (draft) {
+      const opened = openLLMOpsWindow(sid, draft.addrs, draft.win);
+      setCompact({
+        busy: false,
+        ok: null,
+        note: opened ? "preview: the distillate is in the LLMOps window \u2014 Replace puts it into the tape" : "preview ready, but the LLMOps window is already open \u2014 close it and run the preview again"
+      });
+      return;
+    }
     const lines = Array.isArray(r.lines) ? r.lines : [];
     setCompact({
       busy: false,
@@ -1612,7 +1685,14 @@ function confirmCompact() {
     return Promise.resolve();
   }
   setCompact({ confirming: false, busy: true, note: "", ok: null });
-  return adapter.rest("/context-compact-start", { method: "POST", body: { session: sid, addrs } }).then((res) => {
+  return adapter.rest("/context-compact-start", { method: "POST", body: Object.assign(
+    { session: sid, addrs },
+    String(cur.wish || "").trim() ? { wish: String(cur.wish).trim() } : {},
+    // Наборы — только если человек их трогал: нетронутые = настройка, и фильтры работают.
+    cur.menuTouched ? { menu: Object.keys(cur.menu || {}).filter((n2) => cur.menu[n2]) } : {},
+    // Превью — только `true` и только с галочкой: без неё тело прежнее (`Plan35`).
+    cur.preview ? { preview: true } : {}
+  ) }).then((res) => {
     const r = res && typeof res === "object" ? res : {};
     if (r.ok !== true) {
       setCompact({ busy: false, ok: false, note: r.error || "not started" });
@@ -3923,8 +4003,8 @@ function PalettePane() {
 
 // desktop/src/prompt-mirror.js
 import * as sdk8 from "@hermes/plugin-sdk";
-import { jsx as jsx33, jsxs as jsxs30 } from "react/jsx-runtime";
-import { useEffect as useEffect5, useLayoutEffect as useLayoutEffect4, useState as useState11, useMemo as useMemo2, useRef as useRef6 } from "react";
+import { jsx as jsx34, jsxs as jsxs31 } from "react/jsx-runtime";
+import { useEffect as useEffect5, useLayoutEffect as useLayoutEffect5, useState as useState12, useMemo as useMemo2, useRef as useRef7 } from "react";
 
 // desktop/src/mirror-rail.js
 import { jsx as jsx19 } from "react/jsx-runtime";
@@ -6824,14 +6904,15 @@ var KEYFRAMES = `
 var ANCHOR_GAP_PX = 14;
 var ANCHOR_WIDTH_REM = 20;
 var EDGE_PX = 8;
-function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, anchor, canConfirm = true, actions }) {
+function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, anchor, canConfirm = true, actions, extra, widthRem }) {
   if (!open) return null;
   const anchored = anchor && Number.isFinite(anchor.x) && Number.isFinite(anchor.y);
+  const w = Number(widthRem) > 0 ? Number(widthRem) : ANCHOR_WIDTH_REM;
   const place = anchored ? {
     position: "absolute",
-    width: `${ANCHOR_WIDTH_REM}rem`,
+    width: `${w}rem`,
     minWidth: 0,
-    left: `clamp(${EDGE_PX}px, calc(${anchor.x}px - ${ANCHOR_WIDTH_REM / 2}rem), calc(100vw - ${ANCHOR_WIDTH_REM}rem - ${EDGE_PX}px))`,
+    left: `clamp(${EDGE_PX}px, calc(${anchor.x}px - ${w / 2}rem), calc(100vw - ${w}rem - ${EDGE_PX}px))`,
     top: `min(${anchor.y + ANCHOR_GAP_PX}px, calc(100vh - 12rem))`
   } : {};
   return jsxs29("div", {
@@ -6883,6 +6964,7 @@ function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, 
         children: [
           jsx32("div", { className: "text-sm font-semibold", style: SELECTABLE, children: title }),
           jsx32("div", { className: "text-xs text-(--ui-text-secondary)", style: SELECTABLE, children: body }),
+          extra || null,
           busy ? jsxs29("div", { className: "flex flex-col gap-1 mt-1", children: [
             jsx32("div", {
               className: "h-2 w-full rounded-full overflow-hidden relative",
@@ -6960,7 +7042,181 @@ function ConfirmModal({ open, title, body, busy, progress, onConfirm, onCancel, 
   });
 }
 
+// desktop/src/config-tools-table.js
+import { jsx as jsx33, jsxs as jsxs30 } from "react/jsx-runtime";
+import { useState as useState11, useLayoutEffect as useLayoutEffect4, useRef as useRef6 } from "react";
+function InfoLabel({ id, text, info, openInfo, setOpenInfo, className }) {
+  const open = openInfo === id;
+  const popRef = useRef6(null);
+  const [flipLeft, setFlipLeft] = useState11(false);
+  useLayoutEffect4(() => {
+    if (!open) {
+      setFlipLeft(false);
+      return;
+    }
+    const el = popRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.right > window.innerWidth) setFlipLeft(true);
+  }, [open]);
+  return jsxs30("span", { className: "relative inline-flex min-w-0 flex-1", children: [
+    jsx33("span", {
+      key: "label",
+      onClick: (e) => {
+        e.stopPropagation();
+        setOpenInfo(open ? null : id);
+      },
+      className: (className || "") + " cursor-pointer",
+      style: SELECTABLE,
+      children: text
+    }),
+    open ? jsx33("div", {
+      key: "pop",
+      ref: popRef,
+      onClick: (e) => e.stopPropagation(),
+      className: "absolute z-20 rounded-md p-2 text-[0.65rem] leading-snug whitespace-pre-wrap",
+      style: Object.assign(
+        { top: "100%", marginTop: "3px", width: "220px", maxWidth: "80vw", backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", boxShadow: "0 4px 12px rgba(0,0,0,0.35)" },
+        flipLeft ? { right: 0 } : { left: 0 },
+        SELECTABLE
+      ),
+      children: info || "\u2014"
+    }) : null
+  ] });
+}
+function sectionHead(text, infoId, info, openInfo, setOpenInfo) {
+  return jsx33("div", { className: "px-1 pt-1 pb-0.5", children: jsx33(InfoLabel, {
+    id: infoId,
+    info,
+    openInfo,
+    setOpenInfo,
+    className: "text-[0.65rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary)",
+    text
+  }) });
+}
+var SELECT_STYLE = { backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)", height: "18px", margin: 0 };
+var CHECKBOX_STYLE = { accentColor: "var(--dt-primary)", width: "14px", height: "14px" };
+function disableRow(name, info, checked, onChange, openInfo, setOpenInfo) {
+  return jsxs30("div", {
+    className: "flex items-center justify-between gap-2 pl-1 pr-1 py-0 text-[10px] transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background)",
+    style: { borderRight: "1px solid var(--ui-stroke-quaternary)" },
+    children: [
+      // Hard clip, no ellipsis — the owner explicitly wants letters cut off, not "...": that
+      // reads as "still complete, just tight" instead of announcing a truncation.
+      jsx33(InfoLabel, { id: "dis-" + name, text: name, info, openInfo, setOpenInfo, className: "block w-full overflow-hidden whitespace-nowrap" }),
+      jsxs30("label", { className: "flex items-center gap-1 shrink-0 text-(--ui-text-quaternary) cursor-pointer", style: SELECTABLE, children: [
+        jsx33("span", { style: SELECTABLE, children: "disable" }),
+        jsx33("input", { type: "checkbox", checked, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE })
+      ] })
+    ]
+  }, name);
+}
+function paramControl(toolKey, param, onChange, openInfo, setOpenInfo) {
+  const id = "param-" + toolKey + "-" + param.key;
+  let control;
+  if (param.type === "bool") {
+    control = jsx33("input", { type: "checkbox", checked: param.value, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE });
+  } else if (param.type === "number") {
+    control = jsx33("input", {
+      type: "text",
+      inputMode: "numeric",
+      maxLength: 3,
+      value: String(param.value),
+      onChange: (e) => {
+        const digits = e.currentTarget.value.replace(/\D/g, "").slice(0, 3);
+        onChange(digits === "" ? 0 : Number(digits));
+      },
+      className: "w-8 px-1 rounded text-[10px] text-center outline-none",
+      style: SELECT_STYLE
+    });
+  } else if (param.type === "enum") {
+    control = jsx33("select", {
+      value: param.value,
+      onChange: (e) => onChange(e.currentTarget.value),
+      className: "rounded text-[10px] outline-none",
+      style: SELECT_STYLE,
+      children: (param.options || []).map((o) => jsx33("option", { value: o, children: o }, o))
+    });
+  } else {
+    control = jsx33("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: String(param.value) });
+  }
+  return jsxs30("div", { className: "flex items-center justify-between gap-2 w-full", children: [
+    jsx33(InfoLabel, { id, text: param.key, info: param.help, openInfo, setOpenInfo, className: "text-[10px]" }),
+    control
+  ] }, param.key);
+}
+function paramsEditor(toolKey, params, onChange, openInfo, setOpenInfo) {
+  if (!params.length) return jsx33("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: "\u2014" });
+  return jsx33("div", {
+    className: "flex flex-col gap-0.5 w-full",
+    children: params.map((p) => paramControl(toolKey, p, (value) => onChange(p.key, value), openInfo, setOpenInfo))
+  });
+}
+function pathSelect(key, value, onChange) {
+  return jsx33("select", {
+    value,
+    onChange: (e) => onChange(e.currentTarget.value),
+    className: "rounded text-[10px] outline-none",
+    style: SELECT_STYLE,
+    children: ["old", "new"].map((o) => jsx33("option", { value: o, children: o }, o))
+  });
+}
+var COL_PX = { tool: 100, params: 120, enabled: 60, path: 70 };
+function toolTableRow(key, state, onChange, showParams, showPath, hoverKey, setHoverKey) {
+  const onEnter = () => setHoverKey(key);
+  const onLeave = () => setHoverKey(null);
+  const cellStyle = (extra) => Object.assign(
+    { display: "flex", alignItems: "flex-start", borderBottom: "1px solid var(--ui-stroke-quaternary)", backgroundColor: hoverKey === key ? "var(--ui-row-hover-background)" : "transparent" },
+    extra
+  );
+  const cells2 = [
+    jsx33("div", {
+      className: "px-1 py-0.5 min-w-0 text-[10px]",
+      style: cellStyle(),
+      onMouseEnter: onEnter,
+      onMouseLeave: onLeave,
+      // text-[0.8rem]: text-sm (0.875rem) was competing with the section header's own text-xs
+      // for visual weight; dialed back a touch while keeping the added font-semibold.
+      children: jsx33(InfoLabel, { id: "slot-" + key, text: key, info: state.help, openInfo: state.openInfo, setOpenInfo: state.setOpenInfo, className: "text-[10px] font-semibold truncate" })
+    }, key + "-name")
+  ];
+  if (showParams) {
+    cells2.push(jsx33("div", {
+      className: "px-1 py-0.5",
+      onMouseEnter: onEnter,
+      onMouseLeave: onLeave,
+      style: cellStyle({ borderRight: "1px solid var(--ui-stroke-quaternary)" }),
+      children: paramsEditor(
+        key,
+        state.params,
+        (paramKey, value) => onChange({ params: state.params.map((p) => p.key === paramKey ? Object.assign({}, p, { value }) : p) }),
+        state.openInfo,
+        state.setOpenInfo
+      )
+    }, key + "-params"));
+  }
+  cells2.push(jsx33("div", {
+    className: "px-1 py-0.5",
+    style: cellStyle({ justifyContent: "center" }),
+    onMouseEnter: onEnter,
+    onMouseLeave: onLeave,
+    children: jsx33("span", { className: "inline-flex items-center", children: jsx33("input", { type: "checkbox", checked: state.enabled, onChange: (e) => onChange({ enabled: e.currentTarget.checked }), style: CHECKBOX_STYLE }) })
+  }, key + "-enabled"));
+  if (showPath) {
+    cells2.push(jsx33("div", {
+      className: "px-1 py-0.5 text-[10px]",
+      style: cellStyle(),
+      onMouseEnter: onEnter,
+      onMouseLeave: onLeave,
+      children: pathSelect(key, state.path, (v) => onChange({ path: v }))
+    }, key + "-path"));
+  }
+  return cells2;
+}
+
 // desktop/src/prompt-mirror.js
+var CONFIRM_CHECKBOX = Object.assign({}, CHECKBOX_STYLE, { width: "12px", height: "12px", cursor: "pointer" });
+var CONFIRM_HINT = "text-[0.65rem] leading-snug text-(--ui-text-quaternary)";
 var TAIL_SPACE = "40%";
 var FOLLOW_PAUSE_MS = 6e4;
 var FOLLOW_BOTTOM_PX = 40;
@@ -7104,12 +7360,12 @@ function buildCarriage(group, popup, setPopup, stale, compact, row, ledgerByMsg,
     prevKind = row2.kind;
     let node;
     if (row2.kind === "step") {
-      node = jsx33(StepBar, { row: row2 });
+      node = jsx34(StepBar, { row: row2 });
       railEntries.push({ kind: "step", pickable: false });
     } else if (row2.kind === "toolpair") {
       const callId = String(row2.answer && row2.answer.fact && row2.answer.fact.tool_call_id || "");
       const answerAddr = row2.answer && row2.answer.address || "";
-      node = jsx33(ToolPairBrick, {
+      node = jsx34(ToolPairBrick, {
         row: row2,
         popup,
         setPopup,
@@ -7136,7 +7392,7 @@ function buildCarriage(group, popup, setPopup, stale, compact, row, ledgerByMsg,
       node = null;
       railEntries.push({ kind: "empty", pickable: false, gapBefore, msgAddr: row2.address || "" });
     } else {
-      node = jsx33(MessageNode, { row: row2, popup, setPopup });
+      node = jsx34(MessageNode, { row: row2, popup, setPopup });
       railEntries.push({
         kind: "brick",
         pickable: false,
@@ -7145,10 +7401,10 @@ function buildCarriage(group, popup, setPopup, stale, compact, row, ledgerByMsg,
         msgAddr: row2.address || ""
       });
     }
-    return jsx33("div", { style: gapBefore ? { marginTop: "0.125rem" } : void 0, children: node }, row2.key);
+    return jsx34("div", { style: gapBefore ? { marginTop: "0.125rem" } : void 0, children: node }, row2.key);
   });
   const railRows = buildRailRows(railEntries);
-  const vagon = jsxs30("div", {
+  const vagon = jsxs31("div", {
     // Ширина — ПО СОДЕРЖИМОМУ (`fit-content`), не фиксированный процент (владелец,
     // 2026-09-15, второй заход: «вот как раз после этого номера [адреса] и должна сразу
     // заканчиваться ширина этого прямоугольника... но он продолжается направо дальше пока не
@@ -7178,11 +7434,11 @@ function buildCarriage(group, popup, setPopup, stale, compact, row, ledgerByMsg,
       // Шапка вагона — сетка строк (`BrickHead`): `Turn …` слева, `op ID` над номерами операций,
       // `message ID` над адресами (владелец, 2026-09-23 и 2026-09-29). Адрес — наша система
       // координат, но по одному виду `m001f` этого не угадать.
-      jsx33("div", {
+      jsx34("div", {
         className: "px-2 pt-1",
         style: { height: ROW_HEIGHT2.header, boxSizing: "border-box" },
         // «carriage» → «Turn» (владелец, 2026-09-15).
-        children: jsx33(BrickHead, {
+        children: jsx34(BrickHead, {
           left: `Turn ${header.index} \xB7 ${header.count} msg`,
           opLabel: "op ID",
           addrLabel: "message ID",
@@ -7190,16 +7446,16 @@ function buildCarriage(group, popup, setPopup, stale, compact, row, ledgerByMsg,
           height: "100%"
         })
       }),
-      opener ? jsx33("div", {
+      opener ? jsx34("div", {
         className: "flex justify-end items-center px-2 pt-1",
         style: { height: ROW_HEIGHT2.opener, boxSizing: "border-box" },
-        children: jsx33(MessageNode, { row: opener, popup, setPopup })
+        children: jsx34(MessageNode, { row: opener, popup, setPopup })
       }) : null,
       // `pb-1`, БЕЗ `pt-1` (Таск 10a) — верхний паддинг этой обёртки не был бы учтён в
       // `railEntries` (там нет строки под «просто отступ»), и первая строка внутри
       // съехала бы вниз относительно своей ячейки на рельсе на эту величину. Нижний
       // паддинг безопасен — он ПОСЛЕ последней строки, ничьей ячейки не сдвигает.
-      jsx33("div", { className: "flex flex-col px-2 pb-1 gap-0", children: restNodes })
+      jsx34("div", { className: "flex flex-col px-2 pb-1 gap-0", children: restNodes })
     ]
   }, `${group.header.key}-vagon`);
   return { vagon, railRows };
@@ -7209,14 +7465,14 @@ function ImportBody({ imp }) {
   const fresh = check && check.folder === imp.folder;
   const roles = fresh && check.roles ? Object.keys(check.roles).map((k2) => `${k2} ${check.roles[k2]}`).join(" \xB7 ") : "";
   const problems = fresh && Array.isArray(check.problems) ? check.problems : [];
-  return jsxs30("div", {
+  return jsxs31("div", {
     className: "flex flex-col gap-2",
     children: [
-      jsx33("div", { children: "Adds the folder's messages before (head) or after (tail) this chat's context, or replaces the WHOLE context with them. Order is the file number. Irreversible." }),
-      jsxs30("div", {
+      jsx34("div", { children: "Adds the folder's messages before (head) or after (tail) this chat's context, or replaces the WHOLE context with them. Order is the file number. Irreversible." }),
+      jsxs31("div", {
         className: "flex items-center gap-1",
         children: [
-          jsx33("input", {
+          jsx34("input", {
             type: "text",
             value: imp.folder || "",
             placeholder: "export snapshot folder \u2014 or press Ctrl+V",
@@ -7235,7 +7491,7 @@ function ImportBody({ imp }) {
               color: "var(--ui-text-primary)"
             }
           }, "folder"),
-          jsx33("button", {
+          jsx34("button", {
             type: "button",
             disabled: !!imp.checking || !String(imp.folder || "").trim(),
             onClick: (e) => {
@@ -7254,7 +7510,7 @@ function ImportBody({ imp }) {
           }, "check")
         ]
       }, "row"),
-      fresh ? jsx33("div", {
+      fresh ? jsx34("div", {
         style: { color: check.ok ? "var(--ui-green)" : "var(--ui-red)", whiteSpace: "pre-wrap" },
         children: check.error ? String(check.error) : `${check.files || 0} files \u2192 ${check.messages || 0} messages` + (roles ? ` (${roles})` : "") + (problems.length ? `
 ${problems.length} problem(s):
@@ -7262,7 +7518,7 @@ ${problems.length} problem(s):
 \u2026 and ${problems.length - 8} more` : "") : `
 You gonna import: ${check.messages || 0} messages`)
       }, "result") : null,
-      imp.note && imp.ok === false ? jsx33("div", { style: { color: "var(--ui-red)" }, children: imp.note }, "note") : null
+      imp.note && imp.ok === false ? jsx34("div", { style: { color: "var(--ui-red)" }, children: imp.note }, "note") : null
     ]
   });
 }
@@ -7273,19 +7529,19 @@ function PromptMirror() {
   useEffect5(() => {
     loadMessages();
   }, [view.sessionId]);
-  const [popup, setPopup] = useState11(null);
+  const [popup, setPopup] = useState12(null);
   const exp = useExportRail();
   const addrOp = useAddrOp();
   const llmops = useLLMOpsRail();
   const llmopsWin = useLLMOpsWin();
-  const [applyAt, setApplyAt] = useState11(null);
-  const [dropConfirm, setDropConfirm] = useState11(false);
+  const [applyAt, setApplyAt] = useState12(null);
+  const [dropConfirm, setDropConfirm] = useState12(false);
   const imp = useImportOp();
-  const [importAt, setImportAt] = useState11(null);
-  const dragRef = useRef6(null);
-  const tapeRef = useRef6(null);
-  const headRef = useRef6(null);
-  const [railBoxes, setRailBoxes] = useState11({});
+  const [importAt, setImportAt] = useState12(null);
+  const dragRef = useRef7(null);
+  const tapeRef = useRef7(null);
+  const headRef = useRef7(null);
+  const [railBoxes, setRailBoxes] = useState12({});
   function railDrag(key, read, write) {
     function mark(id, add) {
       const marks = read();
@@ -7379,8 +7635,8 @@ function PromptMirror() {
   useEffect5(() => {
     loadZones();
   }, []);
-  const [lastReport, setLastReport] = useState11("");
-  const [jump, setJump] = useState11(null);
+  const [lastReport, setLastReport] = useState12("");
+  const [jump, setJump] = useState12(null);
   useEffect5(() => {
     if (addrOp.note) setLastReport("addr");
   }, [addrOp.note]);
@@ -7399,7 +7655,7 @@ function PromptMirror() {
   const { rows, placed, orphans } = layoutMessages(st.carriages, st.messages);
   const total = Array.isArray(st.messages) ? st.messages.length : 0;
   const foreign = rows.filter((r) => r.foreign).length;
-  useLayoutEffect4(() => {
+  useLayoutEffect5(() => {
     const tape = tapeRef.current;
     if (!tape) return;
     const measure = () => {
@@ -7419,8 +7675,8 @@ function PromptMirror() {
     if (headRef.current) ro.observe(headRef.current);
     return () => ro.disconnect();
   }, [exp.mode, compact.mode, addrOp.mode, llmops.mode, rows.length]);
-  const scrollRef = useRef6(null);
-  const follow = useRef6({ sid: null, n: 0, top: 0, pausedAt: 0 });
+  const scrollRef = useRef7(null);
+  const follow = useRef7({ sid: null, n: 0, top: 0, pausedAt: 0 });
   useEffect5(() => {
     const f = follow.current;
     const n2 = rows.length;
@@ -7460,7 +7716,7 @@ function PromptMirror() {
     else if (armedOp === "content" || armedOp === "erase") setDropConfirm(true);
     else if (armedOp === "llmops") applyLLMOps();
   }
-  const applyBtn = jsx33("button", {
+  const applyBtn = jsx34("button", {
     type: "button",
     disabled: !canApply,
     title: canApply ? armedOp === "export" ? `export ${armedCount} ticked message(s) to files` : armedOp === "content" ? `drop the content of ${armedCount} ticked tool result(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "erase" ? `erase ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : armedOp === "llmops" ? `open the LLMOps window with ${armedCount} ticked message(s)` : `compact ${armedCount} ticked message(s) \u2014 asks to confirm, IRREVERSIBLE` : blockedByWindow ? "the LLMOps window is open \u2014 close it first" : armedOp ? "nothing ticked" : "arm an operation first",
@@ -7480,7 +7736,7 @@ function PromptMirror() {
     }, ACTION_BTN),
     children: armedBusy ? "applying\u2026" : "Apply operation"
   });
-  const head = jsxs30("div", {
+  const head = jsxs31("div", {
     className: "items-center gap-2 px-2 py-1 border-b border-(--ui-stroke-quaternary) shrink-0",
     style: Object.assign({
       fontSize: "0.55rem",
@@ -7489,15 +7745,15 @@ function PromptMirror() {
       alignItems: "center"
     }, SELECTABLE),
     children: [
-      jsx33("span", {}, "apply-gap"),
-      jsx33("span", {
+      jsx34("span", {}, "apply-gap"),
+      jsx34("span", {
         className: orphans ? "text-(--ui-text-primary)" : "text-(--ui-text-quaternary)",
         style: Object.assign({ justifySelf: "center", minWidth: 0, textAlign: "center" }, SELECTABLE),
         // Число, которое и есть вердикт прогона: сколько сообщений легло в структуру
         // и сколько осталось за бортом.
         children: st.loading ? "loading\u2026" : `${placed}/${total} placed` + (orphans ? ` \xB7 ${orphans} not placed` : "") + (foreign ? ` \xB7 ${foreign} foreign` : "")
       }),
-      jsx33("button", {
+      jsx34("button", {
         onClick: () => loadMessages(),
         className: "rounded-full font-medium cursor-pointer select-none transition-colors duration-150 ease-out hover:bg-(--ui-bg-tertiary) active:scale-95",
         style: Object.assign({
@@ -7510,14 +7766,14 @@ function PromptMirror() {
     ]
   });
   if (st.note) {
-    return jsxs30("div", {
+    return jsxs31("div", {
       className: "flex flex-col h-full w-full overflow-hidden",
       style: CAPPED,
       children: [head, sdkC(sdk8.EmptyState, "div", { title: "No messages", description: st.note })]
     });
   }
   if (!rows.length) {
-    return jsxs30("div", {
+    return jsxs31("div", {
       className: "flex flex-col h-full w-full overflow-hidden",
       style: CAPPED,
       children: [head, sdkC(sdk8.EmptyState, "div", {
@@ -7532,11 +7788,11 @@ function PromptMirror() {
   const totalTokens = msgTokens2 + fixedTokens;
   const pickedTokens = rows.reduce((sum, r) => r.kind === "msg" && r.address && (compact.picked || {})[r.address] ? sum + factTokens(r.fact) : sum, 0);
   const RAIL_HEAD = "1.35rem";
-  const statsBar = jsxs30("div", {
+  const statsBar = jsxs31("div", {
     className: "flex items-center gap-2 min-w-0",
     style: Object.assign({ fontSize: "0.55rem", width: "100%" }, SELECTABLE),
     children: [
-      jsx33("span", {
+      jsx34("span", {
         className: "text-(--ui-text-quaternary)",
         style: SELECTABLE,
         title: tokRep ? `messages ${msgTokens2} + system ${tokRep.system || 0} + tools ${tokRep.tools || 0} \u2014 our estimator` : "messages only \u2014 the token counter has not answered yet",
@@ -7552,7 +7808,7 @@ function PromptMirror() {
       // Источник — `rows`, а не `st.messages`: отметка стоит на АДРЕСЕ, и только в `rows`
       // адрес лежит рядом с длиной. `~` не для красоты: это оценка по символам, а не счёт
       // токенизатором (см. `factTokens`).
-      compact.mode ? jsx33("span", {
+      compact.mode ? jsx34("span", {
         className: "font-semibold",
         style: Object.assign({ fontSize: "0.7rem", color: ACTION_COLOR.compact }, SELECTABLE),
         title: "rough token estimate of the ticked messages \u2014 same per-message numbers as in the tape, summed",
@@ -7622,7 +7878,7 @@ function PromptMirror() {
       activeAddresses(built2.railRows, spec.paint.active).forEach((id) => {
         if (idsBySpec[slot].indexOf(id) < 0) idsBySpec[slot].push(id);
       });
-      items.push(jsx33(Rail, {
+      items.push(jsx34(Rail, {
         railRows: built2.railRows,
         cells: baseCells(built2.railRows, spec.picked, spec.drag, spec.paint),
         guide: true,
@@ -7660,7 +7916,7 @@ function PromptMirror() {
     railSpecs[slot].setPicks(next);
   }
   function railPickBtn(title, glyph, onClick, disabled) {
-    return jsx33("button", {
+    return jsx34("button", {
       type: "button",
       className: "mirror-action-btn rounded-md border border-(--ui-stroke-secondary)",
       title,
@@ -7704,7 +7960,7 @@ function PromptMirror() {
   }) : [];
   const railLefts = Object.keys(railBoxes).map((k2) => railBoxes[k2].left);
   const firstRail = railLefts.length ? Math.min.apply(null, railLefts) : null;
-  const tapeHead = jsx33("div", {
+  const tapeHead = jsx34("div", {
     style: {
       position: "relative",
       zIndex: 4,
@@ -7721,20 +7977,20 @@ function PromptMirror() {
   }, "tape-head");
   const orphanRows = rows.filter((r) => r.kind === "orphan");
   if (orphanRows.length) {
-    items.push(jsxs30("div", {
+    items.push(jsxs31("div", {
       className: "flex items-center gap-2 mt-3 mb-1",
       style: Object.assign({ fontSize: "0.55rem", width: "60%", gridColumn: "1 / -1" }, SELECTABLE),
       children: [
-        jsx33("span", {
+        jsx34("span", {
           className: "px-1.5 py-0.5 rounded-full border border-(--ui-stroke-secondary) text-(--ui-text-primary) shrink-0",
           children: `not placed \xB7 ${orphans}`
         }),
-        jsx33("div", { className: "grow", style: { borderTop: "1px solid var(--ui-stroke-primary)" } })
+        jsx34("div", { className: "grow", style: { borderTop: "1px solid var(--ui-stroke-primary)" } })
       ]
     }, "orphan-bar"));
-    orphanRows.forEach((row) => items.push(jsx33("div", {
+    orphanRows.forEach((row) => items.push(jsx34("div", {
       style: { gridColumn: "1 / -1" },
-      children: jsx33(MessageNode, { row, popup, setPopup })
+      children: jsx34(MessageNode, { row, popup, setPopup })
     }, row.key)));
   }
   const msgAddresses = rows.filter((r) => r.kind === "msg").map((r) => r.address).filter(Boolean);
@@ -7742,7 +7998,7 @@ function PromptMirror() {
   openRails.forEach(() => railTerms.push(RAIL_BODY_WIDTH));
   const railCols = railTerms.length ? ` ${railTerms.join(" ")}` : "";
   const railColumnGap = "0.375rem";
-  return jsxs30("div", {
+  return jsxs31("div", {
     className: "flex flex-col h-full w-full overflow-hidden",
     style: CAPPED,
     children: [
@@ -7763,42 +8019,42 @@ function PromptMirror() {
       // `Operations` БЕЗ заголовка (владелец, 2026-09-29: «мы теряем высоту на заголовке»):
       // развёрнутая — группы кнопок, треугольник в начале первой; свёрнутая — одна строка
       // тонких кнопок без опций. `Status` — просто одна строка: разворачивать там пока нечего.
-      zones.operations ? jsxs30("div", { className: "shrink-0 flex flex-col border-b border-(--ui-stroke-quaternary)", children: [
-        jsx33(OpGroup, {
+      zones.operations ? jsxs31("div", { className: "shrink-0 flex flex-col border-b border-(--ui-stroke-quaternary)", children: [
+        jsx34(OpGroup, {
           label: "context",
-          lead: jsx33(ZoneToggle, { title: "Operations", open: true, onToggle: () => toggleZone("operations") }),
+          lead: jsx34(ZoneToggle, { title: "Operations", open: true, onToggle: () => toggleZone("operations") }),
           children: [
-            jsx33(ActionZone, { op: addrOp }, "addr"),
-            jsx33(CompactZone, { compact, addresses: msgAddresses }, "compact"),
-            jsx33(LLMOpsZone, {}, "llmops")
+            jsx34(ActionZone, { op: addrOp }, "addr"),
+            jsx34(CompactZone, { compact, addresses: msgAddresses }, "compact"),
+            jsx34(LLMOpsZone, {}, "llmops")
           ]
         }),
-        jsx33(OpGroup, { label: "save", children: [
-          jsx33(ExportZone, { exp, addresses: msgAddresses }, "export"),
-          jsx33(ImportZone, { imp, onOpen: setImportAt }, "import")
+        jsx34(OpGroup, { label: "save", children: [
+          jsx34(ExportZone, { exp, addresses: msgAddresses }, "export"),
+          jsx34(ImportZone, { imp, onOpen: setImportAt }, "import")
         ] })
-      ] }, "zone-operations") : jsxs30("div", {
+      ] }, "zone-operations") : jsxs31("div", {
         className: "shrink-0 flex items-center flex-wrap border-b border-(--ui-stroke-quaternary)",
         style: { paddingLeft: "0.375rem", minHeight: "1.25rem" },
         children: [
-          jsx33(ZoneToggle, { title: "Operations", open: false, onToggle: () => toggleZone("operations") }, "toggle"),
-          jsx33(ActionZone, { op: addrOp, thin: true }, "addr"),
-          jsx33(CompactZone, { compact, addresses: msgAddresses, thin: true }, "compact"),
-          jsx33(LLMOpsZone, { thin: true }, "llmops"),
-          jsx33(ExportZone, { exp, addresses: msgAddresses, thin: true }, "export"),
-          jsx33(ImportZone, { imp, thin: true, onOpen: setImportAt }, "import")
+          jsx34(ZoneToggle, { title: "Operations", open: false, onToggle: () => toggleZone("operations") }, "toggle"),
+          jsx34(ActionZone, { op: addrOp, thin: true }, "addr"),
+          jsx34(CompactZone, { compact, addresses: msgAddresses, thin: true }, "compact"),
+          jsx34(LLMOpsZone, { thin: true }, "llmops"),
+          jsx34(ExportZone, { exp, addresses: msgAddresses, thin: true }, "export"),
+          jsx34(ImportZone, { imp, thin: true, onOpen: setImportAt }, "import")
         ]
       }, "zone-operations"),
-      jsx33(StatusLine, { report, run: compactRun }, "zone-status"),
+      jsx34(StatusLine, { report, run: compactRun }, "zone-status"),
       // `Files` пропадает целиком, пока файлов в контексте нет (владелец: «сжимать в ноль»).
-      ctxView.files && ctxView.files.length ? jsx33(FileContextPanel, {
+      ctxView.files && ctxView.files.length ? jsx34(FileContextPanel, {
         view: ctxView,
         selectedOp: selectedOpOf(popup, groups),
         onPickOp: goToOp,
         open: zones.files,
         onToggle: () => toggleZone("files")
       }, "zone-files") : null,
-      jsx33("style", { children: `
+      jsx34("style", { children: `
         .fops-scroll::-webkit-scrollbar { width: 16px; }
         .fops-scroll::-webkit-scrollbar-track { background: transparent; }
         .fops-scroll::-webkit-scrollbar-thumb {
@@ -7833,7 +8089,7 @@ function PromptMirror() {
         .mirror-action-btn:hover { box-shadow: inset 0 0 0 999px color-mix(in srgb, currentColor 12%, transparent); }
         .mirror-action-btn:disabled:hover { box-shadow: none; }
       ` }),
-      jsxs30("div", {
+      jsxs31("div", {
         className: "min-h-0 w-full",
         style: {
           flex: "1 1 auto",
@@ -7846,7 +8102,7 @@ function PromptMirror() {
         children: [
           // Вагоны и рельса слева, по содержимому. Бегунок — на правом крае окна,
           // потому что скроллер на всю ширину, а лента внутри него не растянута.
-          jsxs30("div", {
+          jsxs31("div", {
             ref: headRef,
             style: {
               flex: "0 0 auto",
@@ -7860,7 +8116,7 @@ function PromptMirror() {
               ...railSpecs.map((spec, slot) => {
                 const box = railBoxes[spec.key];
                 if (!box || !chromes[slot]) return null;
-                return jsx33("div", {
+                return jsx34("div", {
                   style: {
                     position: "absolute",
                     top: 0,
@@ -7874,7 +8130,7 @@ function PromptMirror() {
               })
             ]
           }),
-          jsx33("div", {
+          jsx34("div", {
             ref: scrollRef,
             onScroll: onTapeScroll,
             className: "w-full fops-scroll",
@@ -7887,7 +8143,7 @@ function PromptMirror() {
               backgroundColor: WORKAREA_BG
             },
             children: [
-              jsxs30("div", {
+              jsxs31("div", {
                 ref: tapeRef,
                 style: {
                   display: "grid",
@@ -7910,21 +8166,98 @@ function PromptMirror() {
               }, "tape"),
               // Хвост — СОСЕДОМ сетки, прямым ребёнком скроллера (2026-10-02: он жил внутри сетки,
               // 40% от её auto-высоты схлопнулись в ноль, и последний вагон лёг на нижний край).
-              jsx33("div", { style: { height: TAIL_SPACE, pointerEvents: "none" } }, "tail-space")
+              jsx34("div", { style: { height: TAIL_SPACE, pointerEvents: "none" } }, "tail-space")
             ]
           })
         ]
       }),
-      jsx33(ConfirmModal, {
+      jsx34(ConfirmModal, {
         open: !!compact.confirming,
         anchor: applyAt,
         title: "Compact messages?",
+        // На 10% шире прочих: имена наборов в 4 колонки вылезали за край (владелица, 2026-10-16).
+        widthRem: 22,
         body: `This summarizes ${markedAddresses(compact.picked).length} ticked message(s) into one summary and removes the rest from the model's context. Irreversible.`,
         busy: !!compact.busy,
+        // Пожелание агенту к этой компакции (`Plan34` Task 6) — уходит в опрос директивой.
+        extra: jsxs31("div", { className: "flex flex-col gap-1.5", children: [
+          jsx34("textarea", {
+            value: compact.wish || "",
+            rows: 3,
+            disabled: !!compact.busy,
+            placeholder: "wish for the agent (optional): what to focus on, what to drop",
+            onChange: (e) => setCompactWish(e.target.value),
+            onKeyDown: (e) => e.stopPropagation(),
+            style: {
+              width: "100%",
+              boxSizing: "border-box",
+              resize: "vertical",
+              minHeight: "3.2rem",
+              maxHeight: "12rem",
+              fontSize: "0.72rem",
+              lineHeight: 1.4,
+              padding: "0.35rem 0.45rem",
+              borderRadius: "0.375rem",
+              border: "1px solid var(--ui-stroke-secondary)",
+              background: "transparent",
+              color: "inherit"
+            }
+          }, "wish"),
+          // Превью (`Plan35`): дистиллят — в окно LLMOps, в ленту — только по Replace. Первым, над
+          // наборами, отделено чертой (владелица, 2026-10-16). Галочки — стилем Config.
+          jsxs31("label", {
+            className: "inline-flex items-center gap-1 cursor-pointer select-none text-[0.65rem]",
+            title: "the distillate opens in the LLMOps window; the tape changes only when you press Replace there",
+            children: [
+              jsx34("input", {
+                type: "checkbox",
+                checked: !!compact.preview,
+                disabled: !!compact.busy,
+                style: CONFIRM_CHECKBOX,
+                onChange: () => toggleCompactPreview()
+              }),
+              "preview"
+            ]
+          }, "preview"),
+          // Подсказки — тем же неприметным шрифтом, что подпись наборов (владелица, 2026-10-16).
+          jsx34("span", {
+            className: CONFIRM_HINT,
+            style: { marginTop: "-0.3rem" },
+            children: "The result goes to the LLMOps window instead of straight into the tape: read it, edit it, and insert it into the tape from there with Replace."
+          }, "preview-hint"),
+          Array.isArray(compact.sets) ? jsx34("div", { style: { borderTop: "1px solid var(--ui-stroke-secondary)" } }, "rule") : null,
+          // Какие наборы опроса показать модели — на этот прогон (`Plan34` Task 8). Из настройки;
+          // тронул — уходит в прогон, фильтры молчат. Запасной (`general`) не снимается.
+          // Колонками, а не в строку (владелица, 2026-10-16): подпись сверху, наборы — сеткой по 4.
+          Array.isArray(compact.sets) ? jsx34("span", { className: CONFIRM_HINT, children: "question sets:" }, "sets-head") : null,
+          Array.isArray(compact.sets) ? jsx34("div", {
+            className: "text-[0.65rem]",
+            style: { display: "grid", gridTemplateColumns: "repeat(4, max-content)", columnGap: "1.25rem", rowGap: "0.15rem" },
+            children: compact.sets.map((s) => jsxs31("label", {
+              className: "inline-flex items-center gap-1 cursor-pointer select-none",
+              title: compactSetTitle(s),
+              children: [
+                jsx34("input", {
+                  type: "checkbox",
+                  checked: !!(compact.menu || {})[s.name],
+                  disabled: !!s.fallback || !!compact.busy,
+                  style: CONFIRM_CHECKBOX,
+                  onChange: () => toggleCompactMenu(s.name)
+                }),
+                compactSetLabel(s)
+              ]
+            }, s.name))
+          }, "sets") : null,
+          // Подсказка — ПОД галочками наборов (владелица, 2026-10-16).
+          Array.isArray(compact.sets) ? jsx34("span", {
+            className: CONFIRM_HINT,
+            children: "Sets of questions the agent is asked about the conversation. For each topic it picks on its own which set fits; untick a set to keep it out of this run. Hover a set to see its questions."
+          }, "sets-hint") : null
+        ] }),
         onConfirm: () => confirmCompact(),
         onCancel: () => cancelCompactConfirm()
       }, "confirm-compact"),
-      jsx33(ConfirmModal, {
+      jsx34(ConfirmModal, {
         open: dropConfirm,
         anchor: applyAt,
         title: addrOp.kind === "erase" ? "Erase messages?" : "Drop content?",
@@ -7938,11 +8271,11 @@ function PromptMirror() {
         },
         onCancel: () => setDropConfirm(false)
       }, "confirm-drop"),
-      jsx33(ConfirmModal, {
+      jsx34(ConfirmModal, {
         open: !!imp.open,
         anchor: importAt,
         title: "Import session from a folder?",
-        body: jsx33(ImportBody, { imp }),
+        body: jsx34(ImportBody, { imp }),
         busy: !!imp.busy,
         canConfirm: !!(imp.check && imp.check.ok === true && imp.check.folder === imp.folder),
         // Три режима (Plan27, владелец): главная — `Replace session`, крупнее.
@@ -7967,12 +8300,12 @@ function PromptMirror() {
 }
 
 // desktop/src/token-strip.js
-import { jsx as jsx35, jsxs as jsxs32 } from "react/jsx-runtime";
-import { useEffect as useEffect6, useState as useState13 } from "react";
+import { jsx as jsx36, jsxs as jsxs33 } from "react/jsx-runtime";
+import { useEffect as useEffect6, useState as useState14 } from "react";
 
 // desktop/src/token-bar.js
-import { jsx as jsx34, jsxs as jsxs31 } from "react/jsx-runtime";
-import { useState as useState12, useRef as useRef7 } from "react";
+import { jsx as jsx35, jsxs as jsxs32 } from "react/jsx-runtime";
+import { useState as useState13, useRef as useRef8 } from "react";
 var k = (x) => typeof x === "number" && isFinite(x) ? x >= 1e4 ? Math.round(x / 1e3) + "k" : (x / 1e3).toFixed(1) + "k" : "\u2014";
 var n = (x) => typeof x === "number" && isFinite(x) ? x.toLocaleString("en-US").replace(/,/g, " ") : "\u2014";
 var pad = (s, w) => (String(s) + " ".repeat(w)).slice(0, Math.max(w, String(s).length));
@@ -8051,11 +8384,11 @@ function tipText(r, main, win, auto, autoPercent, ticked) {
   return lines.join("\n");
 }
 function seg(key, width, color, extra) {
-  return width > 0 ? jsx34("div", { style: Object.assign({ width: width + "%", height: "100%", backgroundColor: color, flex: "none" }, extra || {}) }, key) : null;
+  return width > 0 ? jsx35("div", { style: Object.assign({ width: width + "%", height: "100%", backgroundColor: color, flex: "none" }, extra || {}) }, key) : null;
 }
 function TokenBar({ rep, autoPercent, ticked }) {
-  const [open, setOpen] = useState12(null);
-  const rootRef = useRef7(null);
+  const [open, setOpen] = useState13(null);
+  const rootRef = useRef8(null);
   const toggle = () => {
     if (open) {
       setOpen(null);
@@ -8083,10 +8416,10 @@ function TokenBar({ rep, autoPercent, ticked }) {
   const pick = Math.min(ticked || 0, Math.max(0, main.value - fixed - growth));
   const msgs = Math.max(0, main.value - fixed - growth - pick);
   const over = auto != null && main.value >= auto;
-  const bar = jsxs31("div", {
+  const bar = jsxs32("div", {
     style: { position: "relative", flex: "1 1 auto", minWidth: "4rem", height: "0.4rem" },
     children: [
-      jsxs31("div", {
+      jsxs32("div", {
         style: {
           position: "absolute",
           inset: 0,
@@ -8102,7 +8435,7 @@ function TokenBar({ rep, autoPercent, ticked }) {
           seg("growth", pct(growth), TOKEN_COLOR.growth)
         ]
       }),
-      auto != null ? jsx34("div", { style: {
+      auto != null ? jsx35("div", { style: {
         position: "absolute",
         left: `${pct(auto)}%`,
         top: "-0.15rem",
@@ -8112,23 +8445,23 @@ function TokenBar({ rep, autoPercent, ticked }) {
       } }, "auto") : null
     ]
   });
-  const text = jsxs31("span", {
+  const text = jsxs32("span", {
     style: { whiteSpace: "nowrap", flex: "none" },
     children: [
-      jsx34("span", {
+      jsx35("span", {
         className: "font-semibold",
         style: { color: "var(--ui-text-secondary)" },
         children: `${k(main.value)} / ${k(win)}`
       }),
       ` \xB7 ${Math.round(100 * main.value / win)}% ${main.mark}`,
-      auto != null ? jsx34("span", {
+      auto != null ? jsx35("span", {
         style: { color: over ? TOKEN_COLOR.over : void 0 },
         children: `   auto ${k(auto)} \xB7 ${over ? "over by " + k(main.value - auto) : k(auto - main.value) + " left"}`
       }) : null,
-      ticked ? jsx34("span", { style: { color: TOKEN_COLOR.ticked }, children: `   \u2192 \u2248${k(main.value - ticked)}` }) : null
+      ticked ? jsx35("span", { style: { color: TOKEN_COLOR.ticked }, children: `   \u2192 \u2248${k(main.value - ticked)}` }) : null
     ]
   });
-  return jsxs31("div", {
+  return jsxs32("div", {
     // Без `position: relative`: окошко встаёт относительно всей мини-панели и получает её
     // ширину целиком, вместе с колонкой кнопок (владелец: «окно узковатое»).
     style: { display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer" },
@@ -8136,12 +8469,12 @@ function TokenBar({ rep, autoPercent, ticked }) {
     ref: rootRef,
     onMouseLeave: () => setOpen(null),
     children: [
-      jsxs31("div", {
+      jsxs32("div", {
         style: { display: "flex", alignItems: "center", gap: "0.5rem", flex: "1 1 auto", minWidth: 0 },
         onClick: toggle,
         children: [bar, text]
       }),
-      open ? jsx34("div", {
+      open ? jsx35("div", {
         // Прозрачная подложка до самой полосы — мост для мыши; окошко сидит на её верхнем краю.
         style: {
           position: "fixed",
@@ -8151,7 +8484,7 @@ function TokenBar({ rep, autoPercent, ticked }) {
           maxWidth: open.maxWidth + "px",
           cursor: "text"
         },
-        children: jsx34("pre", {
+        children: jsx35("pre", {
           style: {
             margin: 0,
             padding: "0.4rem 0.5rem",
@@ -8178,7 +8511,7 @@ function TokenBar({ rep, autoPercent, ticked }) {
 
 // desktop/src/token-strip.js
 function btn(label, onClick, lit, title, disabled) {
-  return jsx35("button", {
+  return jsx36("button", {
     onClick,
     disabled,
     title,
@@ -8199,7 +8532,7 @@ function TokenStrip() {
   const t = useTokens();
   const compact = useCompact();
   const st = useMessages();
-  const [autoPercent, setAutoPercent] = useState13(null);
+  const [autoPercent, setAutoPercent] = useState14(null);
   useEffect6(() => {
     loadConfig().then((c) => {
       const p = c && c.compaction && c.compaction.auto_percent;
@@ -8212,8 +8545,8 @@ function TokenStrip() {
   const notLoaded = s.kind === "router" && (s.status === "unloaded" || s.status === "loading");
   const canCount = s.kind !== "none" && (s.status === "loaded" || s.status == null || !!s.via);
   const ticked = compact.mode ? (Array.isArray(st.messages) ? st.messages : []).reduce((sum, m) => sum + ((compact.picked || {})[m && m.msg] ? factTokens(m) : 0), 0) : 0;
-  const cell = (child) => jsx35("div", { className: "min-w-0", children: child });
-  return jsxs32("div", {
+  const cell = (child) => jsx36("div", { className: "min-w-0", children: child });
+  return jsxs33("div", {
     "data-token-strip": "1",
     // Зазоры ужаты (владелец, 2026-09-29: высота ~0.7 от прежней). `relative` — окошко полосы
     // встаёт относительно всей панели.
@@ -8232,7 +8565,7 @@ function TokenStrip() {
       paddingBottom: "0.15rem"
     },
     children: [
-      cell(t.rep ? jsx35(TokenBar, { rep: t.rep, autoPercent, ticked }) : jsx35("span", { children: t.note || "no token report yet" })),
+      cell(t.rep ? jsx36(TokenBar, { rep: t.rep, autoPercent, ticked }) : jsx36("span", { children: t.note || "no token report yet" })),
       btn(
         "count",
         () => loadTokens({ exact: true }),
@@ -8240,7 +8573,7 @@ function TokenStrip() {
         s.via ? `exact count now via ${s.via} (same tokenizer)` : "exact count by the model server now",
         t.busy || !canCount
       ),
-      cell(jsx35("div", {
+      cell(jsx36("div", {
         style: { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", userSelect: "text" },
         title: t.note || r.model || "",
         // Ошибка — ПЕРВОЙ (владелец: «ушла под срез»): иначе её не видно за длинным именем модели.
@@ -8260,178 +8593,6 @@ function TokenStrip() {
 // desktop/src/config-pane.js
 import { jsx as jsx38, jsxs as jsxs34 } from "react/jsx-runtime";
 import { useState as useState16, useEffect as useEffect8, useLayoutEffect as useLayoutEffect6, useRef as useRef10 } from "react";
-
-// desktop/src/config-tools-table.js
-import { jsx as jsx36, jsxs as jsxs33 } from "react/jsx-runtime";
-import { useState as useState14, useLayoutEffect as useLayoutEffect5, useRef as useRef8 } from "react";
-function InfoLabel({ id, text, info, openInfo, setOpenInfo, className }) {
-  const open = openInfo === id;
-  const popRef = useRef8(null);
-  const [flipLeft, setFlipLeft] = useState14(false);
-  useLayoutEffect5(() => {
-    if (!open) {
-      setFlipLeft(false);
-      return;
-    }
-    const el = popRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    if (rect.right > window.innerWidth) setFlipLeft(true);
-  }, [open]);
-  return jsxs33("span", { className: "relative inline-flex min-w-0 flex-1", children: [
-    jsx36("span", {
-      key: "label",
-      onClick: (e) => {
-        e.stopPropagation();
-        setOpenInfo(open ? null : id);
-      },
-      className: (className || "") + " cursor-pointer",
-      style: SELECTABLE,
-      children: text
-    }),
-    open ? jsx36("div", {
-      key: "pop",
-      ref: popRef,
-      onClick: (e) => e.stopPropagation(),
-      className: "absolute z-20 rounded-md p-2 text-[0.65rem] leading-snug whitespace-pre-wrap",
-      style: Object.assign(
-        { top: "100%", marginTop: "3px", width: "220px", maxWidth: "80vw", backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", boxShadow: "0 4px 12px rgba(0,0,0,0.35)" },
-        flipLeft ? { right: 0 } : { left: 0 },
-        SELECTABLE
-      ),
-      children: info || "\u2014"
-    }) : null
-  ] });
-}
-function sectionHead(text, infoId, info, openInfo, setOpenInfo) {
-  return jsx36("div", { className: "px-1 pt-1 pb-0.5", children: jsx36(InfoLabel, {
-    id: infoId,
-    info,
-    openInfo,
-    setOpenInfo,
-    className: "text-[0.65rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary)",
-    text
-  }) });
-}
-var SELECT_STYLE = { backgroundColor: "var(--ui-bg-elevated)", border: "1px solid var(--ui-stroke-secondary)", color: "var(--ui-text-primary)", height: "18px", margin: 0 };
-var CHECKBOX_STYLE = { accentColor: "var(--dt-primary)", width: "14px", height: "14px" };
-function disableRow(name, info, checked, onChange, openInfo, setOpenInfo) {
-  return jsxs33("div", {
-    className: "flex items-center justify-between gap-2 pl-1 pr-1 py-0 text-[10px] transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background)",
-    style: { borderRight: "1px solid var(--ui-stroke-quaternary)" },
-    children: [
-      // Hard clip, no ellipsis — the owner explicitly wants letters cut off, not "...": that
-      // reads as "still complete, just tight" instead of announcing a truncation.
-      jsx36(InfoLabel, { id: "dis-" + name, text: name, info, openInfo, setOpenInfo, className: "block w-full overflow-hidden whitespace-nowrap" }),
-      jsxs33("label", { className: "flex items-center gap-1 shrink-0 text-(--ui-text-quaternary) cursor-pointer", style: SELECTABLE, children: [
-        jsx36("span", { style: SELECTABLE, children: "disable" }),
-        jsx36("input", { type: "checkbox", checked, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE })
-      ] })
-    ]
-  }, name);
-}
-function paramControl(toolKey, param, onChange, openInfo, setOpenInfo) {
-  const id = "param-" + toolKey + "-" + param.key;
-  let control;
-  if (param.type === "bool") {
-    control = jsx36("input", { type: "checkbox", checked: param.value, onChange: (e) => onChange(e.currentTarget.checked), style: CHECKBOX_STYLE });
-  } else if (param.type === "number") {
-    control = jsx36("input", {
-      type: "text",
-      inputMode: "numeric",
-      maxLength: 3,
-      value: String(param.value),
-      onChange: (e) => {
-        const digits = e.currentTarget.value.replace(/\D/g, "").slice(0, 3);
-        onChange(digits === "" ? 0 : Number(digits));
-      },
-      className: "w-8 px-1 rounded text-[10px] text-center outline-none",
-      style: SELECT_STYLE
-    });
-  } else if (param.type === "enum") {
-    control = jsx36("select", {
-      value: param.value,
-      onChange: (e) => onChange(e.currentTarget.value),
-      className: "rounded text-[10px] outline-none",
-      style: SELECT_STYLE,
-      children: (param.options || []).map((o) => jsx36("option", { value: o, children: o }, o))
-    });
-  } else {
-    control = jsx36("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: String(param.value) });
-  }
-  return jsxs33("div", { className: "flex items-center justify-between gap-2 w-full", children: [
-    jsx36(InfoLabel, { id, text: param.key, info: param.help, openInfo, setOpenInfo, className: "text-[10px]" }),
-    control
-  ] }, param.key);
-}
-function paramsEditor(toolKey, params, onChange, openInfo, setOpenInfo) {
-  if (!params.length) return jsx36("span", { className: "text-[0.7rem] text-(--ui-text-quaternary)", style: SELECTABLE, children: "\u2014" });
-  return jsx36("div", {
-    className: "flex flex-col gap-0.5 w-full",
-    children: params.map((p) => paramControl(toolKey, p, (value) => onChange(p.key, value), openInfo, setOpenInfo))
-  });
-}
-function pathSelect(key, value, onChange) {
-  return jsx36("select", {
-    value,
-    onChange: (e) => onChange(e.currentTarget.value),
-    className: "rounded text-[10px] outline-none",
-    style: SELECT_STYLE,
-    children: ["old", "new"].map((o) => jsx36("option", { value: o, children: o }, o))
-  });
-}
-var COL_PX = { tool: 100, params: 120, enabled: 60, path: 70 };
-function toolTableRow(key, state, onChange, showParams, showPath, hoverKey, setHoverKey) {
-  const onEnter = () => setHoverKey(key);
-  const onLeave = () => setHoverKey(null);
-  const cellStyle = (extra) => Object.assign(
-    { display: "flex", alignItems: "flex-start", borderBottom: "1px solid var(--ui-stroke-quaternary)", backgroundColor: hoverKey === key ? "var(--ui-row-hover-background)" : "transparent" },
-    extra
-  );
-  const cells2 = [
-    jsx36("div", {
-      className: "px-1 py-0.5 min-w-0 text-[10px]",
-      style: cellStyle(),
-      onMouseEnter: onEnter,
-      onMouseLeave: onLeave,
-      // text-[0.8rem]: text-sm (0.875rem) was competing with the section header's own text-xs
-      // for visual weight; dialed back a touch while keeping the added font-semibold.
-      children: jsx36(InfoLabel, { id: "slot-" + key, text: key, info: state.help, openInfo: state.openInfo, setOpenInfo: state.setOpenInfo, className: "text-[10px] font-semibold truncate" })
-    }, key + "-name")
-  ];
-  if (showParams) {
-    cells2.push(jsx36("div", {
-      className: "px-1 py-0.5",
-      onMouseEnter: onEnter,
-      onMouseLeave: onLeave,
-      style: cellStyle({ borderRight: "1px solid var(--ui-stroke-quaternary)" }),
-      children: paramsEditor(
-        key,
-        state.params,
-        (paramKey, value) => onChange({ params: state.params.map((p) => p.key === paramKey ? Object.assign({}, p, { value }) : p) }),
-        state.openInfo,
-        state.setOpenInfo
-      )
-    }, key + "-params"));
-  }
-  cells2.push(jsx36("div", {
-    className: "px-1 py-0.5",
-    style: cellStyle({ justifyContent: "center" }),
-    onMouseEnter: onEnter,
-    onMouseLeave: onLeave,
-    children: jsx36("span", { className: "inline-flex items-center", children: jsx36("input", { type: "checkbox", checked: state.enabled, onChange: (e) => onChange({ enabled: e.currentTarget.checked }), style: CHECKBOX_STYLE }) })
-  }, key + "-enabled"));
-  if (showPath) {
-    cells2.push(jsx36("div", {
-      className: "px-1 py-0.5 text-[10px]",
-      style: cellStyle(),
-      onMouseEnter: onEnter,
-      onMouseLeave: onLeave,
-      children: pathSelect(key, state.path, (v) => onChange({ path: v }))
-    }, key + "-path"));
-  }
-  return cells2;
-}
 
 // desktop/src/config-widgets.js
 import { jsx as jsx37 } from "react/jsx-runtime";
@@ -8558,6 +8719,9 @@ function ConfigPane() {
   const [compactPauseMin, setCompactPauseMin] = useState16("3");
   const [compactSilenceMin, setCompactSilenceMin] = useState16("5");
   const [compactWaitTurnMin, setCompactWaitTurnMin] = useState16("10");
+  const [setsOff, setSetsOff] = useState16([]);
+  const [setsCatalog, setSetsCatalog] = useState16(null);
+  const [setsWhy, setSetsWhy] = useState16("");
   const [dataRoot, setDataRoot] = useState16("");
   const [settingsFile, setSettingsFile] = useState16("");
   const [exportRoot, setExportRoot] = useState16("");
@@ -8614,6 +8778,7 @@ function ConfigPane() {
     setCompactSilenceMin(String(compaction.silence_minutes ?? 5));
     setCompactWaitTurnMin(String(compaction.wait_turn_minutes ?? 10));
     setExportRoot(String(compaction.export_root ?? ""));
+    setSetsOff(Array.isArray(compaction.sets_off) ? compaction.sets_off.map(String) : []);
     setStatus("ready");
   }
   useEffect8(() => {
@@ -8628,6 +8793,11 @@ function ConfigPane() {
       if (cancelled) return;
       setErrorMsg(err && err.message || String(err));
       setStatus("error");
+    });
+    loadCompactSets().then((r) => {
+      if (cancelled) return;
+      if (r && r.ok === true && Array.isArray(r.sets)) setSetsCatalog(r.sets);
+      else setSetsWhy(r && r.error || "no answer");
     });
     return () => {
       cancelled = true;
@@ -8672,7 +8842,7 @@ function ConfigPane() {
           ["pause_minutes", compactPauseMin],
           ["silence_minutes", compactSilenceMin],
           ["wait_turn_minutes", compactWaitTurnMin]
-        ].filter(([, v]) => Number.isFinite(Number(v)) && String(v).trim() !== "").map(([k2, v]) => [k2, Number(v)]).concat([["export_root", exportRoot], ["auto_enabled", compactAutoOn]])
+        ].filter(([, v]) => Number.isFinite(Number(v)) && String(v).trim() !== "").map(([k2, v]) => [k2, Number(v)]).concat([["export_root", exportRoot], ["auto_enabled", compactAutoOn], ["sets_off", setsOff]])
       )
     };
     saveConfig(patch).then((data) => {
@@ -8838,6 +9008,46 @@ function ConfigPane() {
         )
       ].flat()
     }),
+    // Наборы опроса, которые видит модель (`Plan34` Task 8): снятая галочка — набор выключен для
+    // всех компакций (кнопка, команды, автомат); разово — в окне подтверждения. `general` — запасной.
+    // Как в окне подтверждения (владелица, 2026-10-16: «вывалил в кучу»): подпись, наборы сеткой по 4,
+    // под ними неприметная подсказка.
+    jsx38("div", { className: "px-1 pb-0.5 flex flex-col gap-1 text-[10px]", children: [
+      jsx38("span", {
+        style: SELECTABLE,
+        title: "compact_sets_off \u2014 question sets the interrogation model is NOT offered",
+        children: "question sets:"
+      }, "h"),
+      setsCatalog ? jsx38("div", {
+        style: { display: "grid", gridTemplateColumns: "repeat(4, max-content)", columnGap: "1.25rem", rowGap: "0.15rem" },
+        children: setsCatalog.map((s) => jsxs34("label", {
+          className: "inline-flex items-center gap-1 cursor-pointer select-none",
+          title: compactSetTitle(s),
+          children: [
+            jsx38("input", {
+              type: "checkbox",
+              checked: !!s.fallback || !setsOff.includes(s.name),
+              disabled: !!s.fallback,
+              style: Object.assign({}, CHECKBOX_STYLE, { width: "12px", height: "12px", cursor: "pointer" }),
+              onChange: (e) => {
+                const on = e.currentTarget.checked;
+                setSetsOff((cur) => on ? cur.filter((n2) => n2 !== s.name) : cur.concat([s.name]));
+              }
+            }),
+            compactSetLabel(s)
+          ]
+        }, s.name))
+      }, "grid") : jsx38("span", {
+        className: "text-(--ui-text-quaternary)",
+        style: SELECTABLE,
+        children: `off: ${setsOff.length ? setsOff.join(", ") : "none"} \u2014 ${setsWhy || "loading\u2026"}`
+      }, "why"),
+      jsx38("span", {
+        className: "leading-snug text-(--ui-text-quaternary)",
+        style: SELECTABLE,
+        children: "Sets of questions the agent is asked about the conversation. For each topic it picks on its own which set fits; an unticked set is never offered, in any compaction. For one run only \u2014 the ticks in the compaction confirm window. Hover a set to see its questions."
+      }, "hint")
+    ] }),
     // Предупреждение про направление третьего числа (владелец, 2026-09-22) — ставится тут же,
     // рядом с полем, а не только в комментарии кода: экран этот числа и меняет.
     jsx38("div", {
@@ -9456,6 +9666,63 @@ function Turn({ turn, index, editable, folded, onFold, onEdit, onCopy, onMove, m
     ]
   });
 }
+var LIVE_POLL_MS = 400;
+function LiveTurn({ live }) {
+  const tone = toneOf2("assistant");
+  const waiting = !live.text && !live.reasoning;
+  const thoughtRef = useRef11(null);
+  useEffect9(() => {
+    const el = thoughtRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [live.reasoning]);
+  const label = live.stopped ? "assistant \u2014 stopped, not in the conversation" : waiting ? "assistant \u2014 waiting for the first words\u2026" : "assistant \u2014 typing\u2026";
+  return jsxs36("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: "0.3rem",
+      padding: "0.5rem 0 0.4rem",
+      marginTop: "0.35rem",
+      borderTop: `2px dashed color-mix(in oklch, ${tone}, transparent 35%)`,
+      opacity: live.stopped ? 0.6 : 1
+    },
+    children: [
+      jsx40("div", {
+        style: {
+          fontSize: "0.62rem",
+          padding: "0.2rem 0.4rem",
+          borderRadius: "0.35rem",
+          userSelect: "none",
+          color: tone,
+          fontWeight: 700,
+          background: `color-mix(in oklch, ${tone} 15%, ${SURFACE})`
+        },
+        children: label
+      }),
+      live.reasoning ? jsx40("div", {
+        ref: thoughtRef,
+        className: "llmops-scroll",
+        style: {
+          fontSize: "0.65rem",
+          lineHeight: 1.4,
+          color: TEXT_DIM,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          maxHeight: "10rem",
+          overflowY: "auto",
+          borderLeft: STROKE,
+          paddingLeft: "0.45rem",
+          ...SEL
+        },
+        children: live.reasoning
+      }) : null,
+      live.text ? jsx40("div", {
+        style: { fontSize: "0.7rem", lineHeight: 1.45, whiteSpace: "pre-wrap", wordBreak: "break-word", ...SEL },
+        children: live.text
+      }) : null
+    ]
+  });
+}
 function FramePiece({ text, open, onToggle, note }) {
   const first = String(text || "").split("\n")[0];
   const long = String(text || "").includes("\n");
@@ -9481,7 +9748,7 @@ function FramePiece({ text, open, onToggle, note }) {
     ]
   });
 }
-function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp, markdown: md, onClose }) {
+function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp, markdown: md, onClose, draft }) {
   const [presets, setPresets] = useState17(presetsProp || []);
   const [frameTexts, setFrameTexts] = useState17(framesProp || {});
   const [data, setData] = useState17(null);
@@ -9498,12 +9765,18 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
   const [busy, setBusy] = useState17(false);
   const [status, setStatus] = useState17({ kind: "idle", note: "loading\u2026" });
   const [result, setResult] = useState17({ body: "", cleared: false });
+  const [fromDraft, setFromDraft] = useState17(!!(draft && draft.text));
   const [undoBody, setUndoBody] = useState17(null);
   const [rawTurns, setRawTurns] = useState17({});
   const [resultRaw, setResultRaw] = useState17(false);
   const [wrap, setWrap] = useState17((presets[0] || {}).wrap || "as-it-was");
   const tapeRef = useRef11(null);
   const chatRun = useRef11(0);
+  const [live, setLive] = useState17(null);
+  const livePoll = useRef11(0);
+  const liveTimer = useRef11(null);
+  const liveAt = useRef11({ t: 0, r: 0 });
+  const stuck = useRef11(true);
   const [chipPop, setChipPop] = useState17(null);
   const [headOpen, setHeadOpen] = useState17(false);
   const saved = useMemo3(() => placeOf(loadPlace(), window.innerWidth, window.innerHeight), []);
@@ -9561,10 +9834,14 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
         setPresetKey(p.presets[0].key);
         setWrap(p.presets[0].wrap || "as-it-was");
       }
+      if (draft && draft.text) {
+        setResult({ body: String(draft.text), cleared: false });
+        setWrap(draft.wrap || "compaction");
+      }
       setData(d);
       setModels(m);
       setModel(m.session || (m.list || [])[0] || "");
-      setStatus({ kind: "idle", note: "ready" });
+      setStatus({ kind: "idle", note: draft && draft.text ? "preview of compaction \u2014 nothing is in the tape until Replace" : "ready" });
     }, (err) => {
       if (!dead) setStatus({ kind: "error", note: `${err && err.message || err}` });
     });
@@ -9580,12 +9857,37 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
     const el = tapeRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [turns.length]);
+  useEffect9(() => {
+    const el = tapeRef.current;
+    if (el && live && stuck.current) el.scrollTop = el.scrollHeight;
+  }, [live]);
+  useEffect9(() => () => {
+    livePoll.current = 0;
+    clearTimeout(liveTimer.current);
+  }, []);
+  const pollLive = (run) => {
+    if (livePoll.current !== run || !transport.progress) return;
+    transport.progress(liveAt.current.t, liveAt.current.r).then((p) => {
+      if (livePoll.current !== run || !p || !p.ok || !p.running) return;
+      if (!p.text && !p.reasoning) return;
+      liveAt.current = { t: p.text_len, r: p.reasoning_len };
+      setLive((l) => l ? { ...l, text: l.text + p.text, reasoning: l.reasoning + p.reasoning } : l);
+    }, () => {
+    }).then(() => {
+      if (livePoll.current === run) liveTimer.current = setTimeout(() => pollLive(run), LIVE_POLL_MS);
+    });
+  };
+  const endLive = () => {
+    livePoll.current = 0;
+    clearTimeout(liveTimer.current);
+  };
   const choosePreset = (key) => {
     setPresetKey(key);
     setValues({});
     setWrap((presets.find((p) => p.key === key) || {}).wrap || "as-it-was");
     if (sent) {
       setSent(false);
+      setLive((l) => l && l.stopped ? null : l);
       setStatus({ kind: "idle", note: "preset changed \u2014 conversation restarted" });
     }
   };
@@ -9608,20 +9910,35 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
     const mine = (f) => (x) => {
       if (run === chatRun.current) f(x);
     };
+    setLive({ text: "", reasoning: "", stopped: false });
+    liveAt.current = { t: 0, r: 0 };
+    stuck.current = true;
+    livePoll.current = run;
+    liveTimer.current = setTimeout(() => pollLive(run), LIVE_POLL_MS);
     transport.chat({ messages: conv.map((t) => ({ role: t.role, content: t.content })), model, think }).then(mine((r) => {
+      endLive();
       if (!r || !r.ok) {
+        setLive(null);
         setStatus({ kind: "error", note: r && r.error || "no answer" });
         return;
       }
+      setLive(null);
       setTurns((c) => c.concat({ role: "assistant", content: r.text }));
       setResult((res) => dropReply(res, r.text));
+      setFromDraft(false);
       const tk = r.tokens || {};
       setStatus({ kind: "idle", note: `${r.model || model} \xB7 ${kLabel(tk.prompt)} \u2192 ${kLabel(tk.completion)}` });
-    }), mine((err) => setStatus({ kind: "error", note: String(err && err.message || err) }))).then(mine(() => setBusy(false)));
+    }), mine((err) => {
+      endLive();
+      setLive(null);
+      setStatus({ kind: "error", note: String(err && err.message || err) });
+    })).then(mine(() => setBusy(false)));
   };
   const stop = () => {
     if (!busy) return;
     chatRun.current++;
+    endLive();
+    setLive((l) => l && (l.text || l.reasoning) ? { ...l, stopped: true } : null);
     setBusy(false);
     setStatus({ kind: "idle", note: "stopped" });
     if (transport.stop) {
@@ -9639,7 +9956,13 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
     if (busy || !data || !result.body.trim()) return;
     setBusy(true);
     setStatus({ kind: "busy", note: "replacing\u2026" });
-    transport.replace({ addrs: data.addrs || data.target.map((m) => m.addr), text: result.body, wrap, preset: preset.key || "" }).then(
+    transport.replace({
+      addrs: data.addrs || data.target.map((m) => m.addr),
+      text: result.body,
+      wrap,
+      preset: preset.key || "",
+      ...fromDraft && draft && draft.origin ? { origin: draft.origin } : {}
+    }).then(
       (r) => setStatus(r && r.ok ? { kind: "done", note: `${r.report || "replaced"} \u2014 the tape is reloaded` } : { kind: "error", note: r && r.error || "replace failed" }),
       (err) => setStatus({ kind: "error", note: String(err && err.message || err) })
     ).then(() => setBusy(false));
@@ -9661,6 +9984,11 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
     style: { display: "flex", alignItems: "center", gap: "0.5rem", padding: "0.35rem 0.6rem", borderBottom: STROKE, userSelect: "none", fontSize: "0.65rem", cursor: "move" },
     children: [
       jsx40("span", { style: { fontWeight: 700, color: ACCENT, fontSize: "0.75rem" }, children: "LLMOps" }),
+      fromDraft ? jsx40("span", {
+        style: { fontWeight: 600, color: "var(--ui-yellow)", whiteSpace: "nowrap" },
+        title: "the result holds the compaction distillate \u2014 the tape is untouched until Replace",
+        children: "preview of compaction"
+      }) : null,
       jsx40(Select, {
         value: presetKey,
         title: "preset",
@@ -9730,6 +10058,10 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
       jsx40("div", {
         ref: tapeRef,
         className: "llmops-scroll",
+        onScroll: (e) => {
+          const el = e.currentTarget;
+          stuck.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+        },
         style: { flex: 1, minHeight: 0, overflowY: "auto", padding: "0 0.6rem" },
         children: turns.map((t, i) => jsx40(Turn, {
           turn: t,
@@ -9742,11 +10074,12 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
           onMove: () => {
             setUndoBody(null);
             setResult(moveToResult(t.content));
+            setFromDraft(false);
           },
           md,
           raw: !!rawTurns[i],
           onRaw: (v) => setRawTurns({ ...rawTurns, [i]: v })
-        }, i))
+        }, i)).concat(live ? [jsx40(LiveTurn, { live }, "live")] : [])
       }),
       jsxs36("div", {
         style: { display: "flex", alignItems: "flex-end", gap: "0.4rem", padding: "0.45rem 0.6rem", borderTop: STROKE },
@@ -9858,6 +10191,7 @@ function LLMOpsWindow({ transport, presets: presetsProp, frameTexts: framesProp,
         jsx40(Btn, { onClick: () => {
           setUndoBody(null);
           setResult(clearResult());
+          setFromDraft(false);
         }, title: "clear \u2014 replies stop dropping in by themselves", children: "\xD7" }),
         jsx40(Btn, {
           onClick: () => copyText(wrapped).then((ok) => setStatus({ kind: "idle", note: ok ? "copied (wrapped)" : "copy failed" })),
@@ -9940,7 +10274,7 @@ function LLMOpsHost() {
   const seq = win ? win.seq : 0;
   const transport = useMemo4(() => win ? llmopsTransport(win.sid, win.addrs) : null, [seq]);
   if (!win || !transport) return null;
-  return jsx41(LLMOpsWindow, { transport, markdown, onClose: closeLLMOpsWindow }, seq);
+  return jsx41(LLMOpsWindow, { transport, markdown, onClose: closeLLMOpsWindow, draft: win.draft || null }, seq);
 }
 
 // desktop/src/file-ops-pane.js

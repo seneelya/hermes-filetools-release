@@ -2140,11 +2140,34 @@ def _load_compact_state():
     return mod
 
 
+WISH_MAX = 4000   # the user's wish for a compaction is prose, not data; longer is cut
+
+
+@router.get("/compact-sets")
+def compact_sets(session: str = ""):
+    """`GET /compact-sets?session` — the interrogation's question sets for the panel (`Plan34` Task 8,
+    amendment 29): `{ok, sets: [{name, word, pick, asks, fallback}], off: [names]}`. Only the agent
+    half knows the catalog (this module loads by path, without the package) — so it comes from the
+    live engine of the session."""
+    engine, err = _llmops_engine(session, "compact_sets")
+    if err:
+        return err
+    try:
+        return engine.compact_sets()
+    except Exception as exc:  # noqa: BLE001 - report, never raise
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 @router.post("/context-compact-start")
 async def context_compact_start_post(request: Request):
     """`POST /context-compact-start` — the compaction button's second click, confirmed.
 
-    Body: `{session, addrs}` — `addrs` is the rail's ticked m-addresses AS-IS, no `ops`
+    Body: `{session, addrs, wish?, menu?, preview?}` — `wish` is the user's prose for this compaction (`Plan34`,
+    amendment 28; trimmed, capped at `WISH_MAX` chars; empty — as before); `menu` — the question
+    sets the user left on for THIS run (amendment 29; absent — the `compact_sets_off` setting);
+    `preview` — strictly `true`: nothing is written, the distillate lands in the status's `draft`
+    (`Plan35`, amendment 30).
+    `addrs` is the rail's ticked m-addresses AS-IS, no `ops`
     resolution. Answers immediately (`{"ok": True}` = started, not "applied") — the run
     itself is minutes long; its outcome is `GET /context-compact-status`.
     """
@@ -2169,8 +2192,14 @@ async def context_compact_start_post(request: Request):
     engine, reason = _engine_for(session)
     if engine is None:
         return {"ok": False, "session": session, "error": reason}
+    wish = str(body.get("wish") or "").strip()[:WISH_MAX]
+    menu = body.get("menu")
+    menu = [str(m).strip() for m in menu if str(m).strip()][:32] if isinstance(menu, list) else []
     try:
-        report = engine.start_compact(addrs)
+        # Without wish/menu — the old call: an engine from before the client restart knows neither.
+        extra = {**({"wish": wish} if wish else {}), **({"menu": menu} if menu else {}),
+                 **({"preview": True} if body.get("preview") is True else {})}
+        report = engine.start_compact(addrs, **extra) if extra else engine.start_compact(addrs)
     except Exception as exc:  # noqa: BLE001 - report, never raise
         return {"ok": False, "session": session, "error": f"{type(exc).__name__}: {exc}"}
     if not isinstance(report, dict):
@@ -2243,6 +2272,20 @@ async def llmops_chat(request: Request):
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+@router.get("/llmops-progress")
+def llmops_progress(session: str = "", text: int = 0, reasoning: int = 0):
+    """`GET /llmops-progress?session&text=N&reasoning=M` — что модель уже напечатала в идущем
+    `/llmops-chat` (окно опрашивает, пока ждёт): новое после `N`/`M` символов.
+    `{ok, running, text, reasoning, text_len, reasoning_len}` (поправка 27)."""
+    engine, err = _llmops_engine(session, "llmops_progress")
+    if err:
+        return err
+    try:
+        return engine.llmops_progress(text, reasoning)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 @router.post("/llmops-stop")
 async def llmops_stop(request: Request):
     """`POST /llmops-stop {session}` — ■ Stop окна: оборвать идущий `/llmops-chat` (его сокет к
@@ -2299,7 +2342,9 @@ async def llmops_replace_post(request: Request):
     closing line goes as a separate message after them, which only the compaction plan knows.
     Runs as a compaction run (same lock, same state file): `{"ok": True}` = started, the outcome
     is `GET /context-compact-status`. `preset` — the window's preset key, recorded in the
-    ledger's absorption record only (ledger contract amendment 10).
+    ledger's absorption record only (ledger contract amendment 10). `origin` — `{by: "compact",
+    sets, wish}` when the text came from a compaction PREVIEW (`Plan35`, amendment 30): the ledger
+    records the insertion as a compaction (ledger amendment 12); anything else — ignored.
     """
     try:
         body = await request.json()
@@ -2323,6 +2368,16 @@ async def llmops_replace_post(request: Request):
     if wrap not in ("compaction", "summarisation", "none", "as-it-was"):
         return {"ok": False, "error": "wrap must be compaction, summarisation, none or as-it-was"}
     preset = str(body.get("preset") or "").strip()[:64]
+    origin = body.get("origin")
+    if isinstance(origin, dict) and origin.get("by") == "compact":
+        sets = origin.get("sets")
+        # `sets` — the run's classification `[{topic, set}]` (ledger amendment 9), kept as such.
+        origin = {"by": "compact",
+                  "sets": [{"topic": str(x.get("topic") or "")[:200], "set": str(x.get("set") or "")[:64]}
+                           for x in sets if isinstance(x, dict)][:32] if isinstance(sets, list) else [],
+                  "wish": str(origin.get("wish") or "").strip()[:WISH_MAX]}
+    else:
+        origin = None
 
     engine, reason = _engine_for(session)
     if engine is None:
@@ -2331,7 +2386,9 @@ async def llmops_replace_post(request: Request):
         return {"ok": False, "session": session,
                 "error": "the live engine has no start_ready yet — restart the Hermes client"}
     try:
-        report = engine.start_ready(addrs, text, wrap, preset)
+        # Without `origin` — the old call: an engine from before the client restart does not know it.
+        report = (engine.start_ready(addrs, text, wrap, preset, origin=origin) if origin
+                  else engine.start_ready(addrs, text, wrap, preset))
     except Exception as exc:  # noqa: BLE001 - report, never raise
         return {"ok": False, "session": session, "error": f"{type(exc).__name__}: {exc}"}
     if not isinstance(report, dict):
@@ -2839,6 +2896,9 @@ def read_config() -> dict:
             # Куда панель сохраняет сообщения и сессии в `.md` (`Vision09`). Строка, и ПУСТАЯ
             # строка законна: она значит «дом плагина по умолчанию», а не «не задано».
             "export_root": str(ctx.get("compact_export_root") or ""),
+            # Question sets NOT shown to the interrogation model (`Plan34` Task 8): names, the
+            # setting itself is a comma string. The catalog comes from `GET /compact-sets`.
+            "sets_off": _set_names(ctx.get("compact_sets_off")),
         },
         # "Temporary parameters" (owner, 2026-09-22) — empty since 2026-09-29 (Plan24).
         "temp_params": {},
@@ -2880,6 +2940,18 @@ def _apply_tools(data, tools_patch) -> None:
                     continue
             else:
                 params_node[key] = str(new)
+
+
+def _set_names(raw) -> list:
+    """Question-set names from the setting (comma string, or whatever YAML made of it) or a body list:
+    lower-case words, de-duplicated, `general` dropped (the fallback cannot be switched off). The
+    names are not checked against the catalog here — this half does not have it. Names before
+    2026-10-16 read as the new ones (= the word the model sees; copy of `_questionnaires.OLD_NAMES`)."""
+    import re
+    old = {"recon": "investigation", "talk": "conversation", "free": "freeform"}
+    text = " ".join(str(x) for x in raw) if isinstance(raw, (list, tuple)) else str(raw or "")
+    words = [old.get(w, w) for w in re.findall(r"[a-z_]+", text.lower())]
+    return [w for w in dict.fromkeys(words) if w != "general"]
 
 
 _COMPACT_KEYS = {
@@ -2931,6 +3003,9 @@ def write_config(patch: dict) -> dict:
             # Путь — любая строка законна, включая пустую («дом плагина»).
             if "export_root" in comp:
                 ctx["compact_export_root"] = str(comp["export_root"] or "")
+            # Выключенные наборы опроса — строкой через запятую (плоский ключ, как остальные).
+            if isinstance(comp.get("sets_off"), list):
+                ctx["compact_sets_off"] = ",".join(_set_names(comp["sets_off"]))
 
     try:
         home.save_settings(home.diff(data, base))

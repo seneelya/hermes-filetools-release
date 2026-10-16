@@ -30,7 +30,7 @@ from ._envelope import (
     is_bridge, service_kind,
     distill_frame, distill_end,
     wrap_distillate, WRAPS, summary_mark, summary_end_mark, llmops_voice, bridge_texts, summary_frame, summary_end, is_summary,
-    wrap_ready, persona, other_distillates_note, sys_cold, _ZONE_RULE, info,
+    wrap_ready, persona, other_distillates_note, sys_cold, wish_legend, wish_block, _ZONE_RULE, info,
     zone_open, zone_close, zone_context_title, zone_work_title, zone_prefix_note,
     zone_work_note, zone_suffix_note, zone_note, zone_map, rules_block,
     past_distillate_tag, _FRAME_HEADS_PAST, _FRAME_ENDS_PAST, known_frame_lines,
@@ -45,11 +45,11 @@ from ._interrogation import (
     q_gate, C_GATE_FIELDS, C_GATE_FIELDS2, C_GATE_RENAMED, gate_field, s_gate,
     q_pending_task, q_errors_fixes, q_critical_values, q_constraints_verbatim,
     CONSTRAINTS_KEY, s_constraints_verbatim, kind_work, kind_recon, kind_design,
-    kind_rules, kind_talk, kind_general, kind_brief, q_which_set, which_set_lead, q_talk,
+    kind_rules, kind_talk, kind_general, kind_brief, kind_free, q_free, q_which_set, which_set_lead, q_talk,
 )
 from ._document import (
     doc_title, doc_topic_head, doc_filler_head, doc_settled_head, doc_open_head,
     doc_pack_head, doc_additions_head, doc_suspect,
     doc_pending_head, doc_errors_head, doc_values_head, doc_constraints_head,
-    doc_talk_head,
+    doc_talk_head, doc_free_head,
 )

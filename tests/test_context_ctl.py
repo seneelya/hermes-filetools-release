@@ -223,6 +223,34 @@ def test_forced_compress_from_the_host_reaches_our_compress(bridge, monkeypatch)
                         "Task 0 больше не верна, Plan13 надо перечитать")
 
 
+def test_manual_compress_focus_reaches_compress():
+    """Шов `ctxctl.manual_compress_focus` (`Plan34`, `Recon34`): проза их `/compress <текст>` — это
+    `focus_topic` при `force=True`; `here N` — голова нам, хвост `verbatim_tail`, прозу их разбор
+    при этом отбрасывает."""
+    from agent.conversation_compression_manual import compress_now, parse_compress_args
+
+    class _Agent:
+        context_compressor = None
+
+        def __init__(self):
+            self.calls = []
+
+        def _compress_context(self, head, system_message, **kw):
+            self.calls.append((list(head), kw))
+            return list(head), None
+
+    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"} for i in range(8)]
+    agent = _Agent()
+    compress_now(agent, history, parse_compress_args("выбрось отладку, оставь решения"))
+    head, kw = agent.calls[-1]
+    assert kw["focus_topic"] == "выбрось отладку, оставь решения" and kw["force"] is True
+    assert head == history and "verbatim_tail" not in kw
+    compress_now(agent, history, parse_compress_args("here 2 выбрось отладку"))
+    head, kw = agent.calls[-1]
+    assert kw["force"] is True and kw["focus_topic"] is None, "here N: проза их разбором отброшена"
+    assert len(head) + len(kw["verbatim_tail"]) == len(history) and head == history[:len(head)]
+
+
 # --- движок ------------------------------------------------------------------------
 
 

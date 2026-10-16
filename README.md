@@ -12,13 +12,14 @@ message the model receives, and you decide what stays, what gets edited, cut or 
   honest token counter.
 - **Compaction by interrogation**: the model is questioned about the old part of the session,
   with a question set picked per topic, and the code builds the distillate from the answers.
-  By hand or automatically.
+  By hand or automatically. Tell it in your own words what to keep and what to drop, and look at
+  the result **before** it goes into the session.
 - **LLM operations** on any selection of messages: summarise, remove repetitions or your own
   prompt — then put the result in their place.
 - **The price, known and chosen:** changing the past costs the provider's prompt cache — the
   prefix is computed again from the changed point. The plugin is aimed at **local LLMs** and at
   getting the most out of them, where a recomputed prefix costs time, not money.
-- Verified on Hermes `c0ef5af520` (2026-10-11).
+- Verified on Hermes `d923a5eb48` (2026-10-16).
 
 ## Install
 
@@ -129,8 +130,9 @@ token strip in the panel and the auto-compaction threshold use it.
 
 Tick messages in the Mirror and open the LLMOps window: talk to a model about exactly those messages
 (summarise them, remove repetitions, or your own prompt), edit the answer, and put it into the
-conversation in their place. Replies render as Markdown (the book view), raw text is one click away;
-the window remembers its size and place.
+conversation in their place. The reply is shown live as the model types it, and ■ Stop cuts it
+off at once. Replies render as Markdown (the book view), raw text is one click away; the window
+remembers its size and place.
 
 ### Compaction
 
@@ -166,6 +168,34 @@ from the answers, never glued together by the model.
 
 You can start a compaction from the panel (pick the messages or take the suggested ones), and the
 engine can do it automatically when the context fills up to a threshold you set in Config.
+
+### Your wish for this compaction
+
+Say in your own words what matters this time — *"keep only what we decided about plan 10, drop the
+rest"*, *"this is a test, be as short as possible"*. The wish goes to the model as an instruction
+with every question it is asked. Where to write it:
+
+- the field in the panel's **Compact messages?** window;
+- Hermes' own console command: `/compact <your wish>` (or `/compress <your wish>`) — it now runs
+  **our** compaction, not Hermes' summary;
+- our command: `/ctx-compact <what> <your wish>`, where `<what>` is a share (`0.8`, `80%`), message
+  addresses (`m0001-m0010`) or `all` (every message, no protected head or tail). A bare number
+  without `%` is an address: `80` means `m0080`.
+
+### Which question sets the model may choose from
+
+Config → Compaction → **question sets**: an unticked set is never offered, in any compaction —
+switch off a set that works badly for you. The same ticks in the **Compact messages?** window apply
+to that one run only. Hover a set to see its questions. `general` is the fallback and always stays.
+`freeform` — no fixed questions, the model says in its own words what of the topic must survive —
+is off by default.
+
+### Preview before it touches the session
+
+Tick **preview** in the **Compact messages?** window: the compaction runs as usual, but nothing is
+written into the session. The distillate opens in the LLMOps window — read it, edit it by hand,
+and press **Replace** to put it in; close the window and the session stays as it was. Compaction
+cannot be undone, so this is the place to look first, or to run it again with another wish.
 
 ## What Hermes' config must have
 
@@ -242,13 +272,17 @@ Every answer starts with its operation number (above).
 
 Hermes gives the model a set of tools to **drive the desktop app itself** — open a preview, focus
 a pane, take a guided tour, switch a workspace, and so on (`desktop_preview`, `focus_pane`,
-`apply_layout`, `gui_tour`, `desktop_project`, `read_terminal`, `show_tip`, …). We did not ask for them, they
+`set_theme`, `gui_tour`, `desktop_project`, `read_terminal`, `show_tip`, …). We did not ask for them, they
 cost context on every request, and Hermes has no setting that removes them. So the plugin hides
 them by default: the model does not see them at all. The panels themselves keep working — only the
 model loses the ability to drive them.
 
 Want one back? Config → **Disabled Hermes tools**: untick it, Save. Your choice is kept in your
 settings and survives updates.
+
+Once you have saved this list, it is **yours**: a tool Hermes adds later is not hidden by itself —
+the plugin's own list only applies while you have not saved one. After a Hermes update, look at
+this list in Config and tick the new names (this release adds `set_theme`).
 
 ## What changes in Hermes' own chat
 
@@ -258,6 +292,9 @@ render — so the app's chat no longer shows those cards for `patch`, `write_fil
 replaced tools. Nothing is lost: every call and its full answer is in our panel (Mirror), in
 more detail than before.
 
+Hermes' console commands `/compress` and `/compact` run **our** compaction (the same as the
+panel's, with your wish if you add text after the command) instead of Hermes' own summary.
+
 ## Checking compatibility after a Hermes update
 
 **Much of this plugin depends on Hermes code that is not a public API** — the context engine's
@@ -265,7 +302,7 @@ access to the session, the gateway's memory, the tool registry, the way results 
 There is no other way to reach these things, and a Hermes update can move or change them. That is
 why every release names the Hermes commit it was verified on:
 
-**This version was verified on Hermes `c0ef5af520` (2026-10-11).**
+**This version was verified on Hermes `d923a5eb48` (2026-10-16).**
 
 The same line is shown in the panel next to the check buttons. Running a newer Hermes? Run the
 check below before trusting the plugin.

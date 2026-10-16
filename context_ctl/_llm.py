@@ -107,6 +107,9 @@ _step_of: dict = {}
 # ■ Stop: `_llmops.stop` гасит сокет из другого потока — `urlopen` падает, сервер модели видит обрыв
 # и бросает генерацию). Не поставлено — обычный `urlopen`.
 conn_sink: contextvars.ContextVar = contextvars.ContextVar("filetools_llm_conn_sink", default=None)
+# Кто поставил сюда функцию `(text, reasoning)`, получает куски ПОТОКОВОГО ответа по мере прихода
+# (`_from_sse`; окно LLMOps печатает ответ вживую — `_llmops.progress`).
+delta_sink: contextvars.ContextVar = contextvars.ContextVar("filetools_llm_delta_sink", default=None)
 
 
 class _HttpError(RuntimeError):
@@ -259,9 +262,10 @@ def _post(route: dict, body: dict, timeout: float) -> dict:
 
 def _from_sse(lines) -> dict:
     """Потоковый ответ (`stream: true`, строки `data: {…}`) — собранный в форму обычного: текст из
-    `delta.content`, модель, `usage` последнего куска. Рассуждение (`reasoning_content`) не берём —
-    как и в обычном ответе."""
+    `delta.content`, модель, `usage` последнего куска. Рассуждение (`reasoning_content`) в ответ не
+    берём — как и в обычном; куски того и другого уходят в `delta_sink`, если он поставлен."""
     parts, model, usage = [], "", {}
+    sink = delta_sink.get()
     for raw in lines:
         line = raw.decode("utf-8", "replace").strip() if isinstance(raw, bytes) else str(raw).strip()
         if not line.startswith("data:"):
@@ -276,7 +280,12 @@ def _from_sse(lines) -> dict:
         model = chunk.get("model") or model
         usage = chunk.get("usage") or usage
         for choice in chunk.get("choices") or []:
-            parts.append(str((choice.get("delta") or {}).get("content") or ""))
+            delta = choice.get("delta") or {}
+            text = str(delta.get("content") or "")
+            parts.append(text)
+            thought = str(delta.get("reasoning_content") or "")
+            if sink and (text or thought):
+                sink(text, thought)
     return {"choices": [{"message": {"content": "".join(parts)}}], "model": model, "usage": usage}
 
 

@@ -87,6 +87,9 @@ def finish(session_id: str, facts: dict | None = None, error: str = "") -> None:
     facts = facts or {}
     STATE.update({"running": False, "lines": list(facts.get("lines") or []), "beat": time.time(),
                   "ok": bool(facts.get("ok") or facts.get("delivered"))})
+    if facts.get("draft"):
+        # Превью (`Plan35`): дистиллят для окна LLMOps; `begin` следующего прогона его стирает.
+        STATE["draft"] = dict(facts["draft"])
     if error:
         STATE["error"] = error
     _write(session_id)

@@ -403,8 +403,12 @@ def zoned_block(rows, positions, addr_of, kept, work) -> tuple:
 
 
 def interrogate(session_id: str, rows, positions, addr_of, lines=None, kept=None,
-                work=None) -> dict:
+                work=None, wish: str = "", menu=None) -> dict:
     """ЯДРО холодного опроса: из готовых строк и позиций — готовый документ.
+
+    `wish` — пожелание пользователя к компакции (`Plan34`): уходит в `Run`, в отчёт —
+    строкой `пожелание: «…»`; пустое — прогон байт в байт прежний. `menu` — наборы, выбранные
+    человеком на этот прогон (`Plan34` Task 8); `None` — по настройке `compact_sets_off`.
 
     ОДНО НА ДВЕ ДВЕРИ. Сюда приходит и сухой `/ctx-distill`, и боевой `/ctx-compact`; всё,
     что их различает, — записывает ли вызывающий результат. Решение владельца 2026-09-21:
@@ -420,9 +424,13 @@ def interrogate(session_id: str, rows, positions, addr_of, lines=None, kept=None
     facts = {"ok": False, "session": session_id, "asked": 0, "topics": 0,
              "text": "", "path": ""}
     lines = lines if lines is not None else []
+    wish = str(wish or "").strip()
+    if wish:
+        facts["wish"] = wish
+        lines.append(f"пожелание: «{wish}»")
     kept = sorted(set(kept or ()))
     body, map_text = zoned_block(rows, positions, addr_of, kept, work or positions)
-    system = _prompts.sys_cold(map_text)
+    system = _prompts.sys_cold(map_text, wish=bool(wish))
     # Список пузырьков ПОВТОРЯЕТСЯ в конце данных: ярлык над строкой остаётся далеко наверху
     # длинной ленты, а побеждает ближнее к ответу. Стоит в общем префиксе — платим один раз.
     notice = _prompts.kept_notice([addr_of.get(i, "") for i in kept])
@@ -450,7 +458,7 @@ def interrogate(session_id: str, rows, positions, addr_of, lines=None, kept=None
         except Exception as exc:  # noqa: BLE001
             _state_now["error"] = f"отчёт не пишется: {exc}"
 
-    run = _scenario.Run(session_id, data, system, lines, _state_now, save)
+    run = _scenario.Run(session_id, data, system, lines, _state_now, save, wish=wish, menu=menu)
 
     if WARMUP:
         _progress.progress(session_id, stage="warmup")
@@ -519,8 +527,19 @@ def _compaction(s, run, facts: dict, lines: list, doc: dict, save, work_rows: in
     # модели показываем оставшиеся — для чего каждый и что он спросит, — и она выбирает набор
     # каждой теме. Вопрос про ошибки и файлы в разговоре про жизнь не просто пустой: технический
     # словарь разворачивает модель в техническую рамку и портит ответ (владелец, 2026-09-21).
-    sets = _questionnaires.offered({"work_rows": work_rows, "topics": full})
-    picked = s.ask(_questionnaires.which_set(sets), names=full)
+    # Какие наборы показывать — ещё и человек (`Plan34` Task 8): настройка `compact_sets_off`,
+    # разовый выбор окна (`run.menu`). Что показали — строкой в отчёт.
+    sets = _questionnaires.offered({"work_rows": work_rows, "topics": full, "wish": run.wish,
+                                    "off": _settings.compaction().get("compact_sets_off", ""),
+                                    "menu": run.menu})
+    lines.append("меню: " + ", ".join(q.name for q in sets)
+                 + (" (выбрано на этот прогон)" if run.menu else ""))
+    if len(sets) == 1:
+        # Один набор — спрашивать не о чем: вырожденный случай решает код (`Doc__prompting.md`).
+        picked = {t: sets[0] for t in full}
+        lines.append("  в меню один набор — вопрос выбора не задан")
+    else:
+        picked = s.ask(_questionnaires.which_set(sets), names=full)
     # КЛАССИФИКАЦИЯ — в итог прогона и дальше в запись о поглощении (владелец, 2026-10-11: «на
     # всякий случай, вдруг пригодится»): какой набор модель выбрала каждой теме.
     facts["sets"] = [{"topic": t, "set": picked[t].name} for t in full]

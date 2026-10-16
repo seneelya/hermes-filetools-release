@@ -971,6 +971,9 @@ def _note_absorptions(session_id: str, fresh_by_msg: dict, runs, new_rows, summa
         # Вставка окна: каким пресетом и в какой обёртке (поправка 10) — у компакции их нет.
         extra = ({"preset": mine.get("preset"), "wrap": mine.get("wrap_chosen")}
                  if by == "llmops" else {})
+        # Пожелание пользователя к компакции (поправка 11, `Plan34`) — у сводки компакции.
+        if mine.get("wish"):
+            extra["wish"] = mine["wish"]
         if _ledger.note_absorbed(session_id, addr, run_info["addresses"], by=by, sets=sets,
                                  **extra):
             written.append({"summary": addr, "members": run_info["addresses"]})

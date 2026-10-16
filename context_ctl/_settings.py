@@ -58,6 +58,10 @@ DEFAULTS = {
     "compact_route_base_url": "",
     "compact_route_model": "",
     "compact_route_key_env": "",
+    # Наборы опроса, которые НЕ показывать модели (`Plan34` Task 8): имена через запятую; пусто —
+    # все. Список выключенных, а не включённых: новый набор появляется включённым сам.
+    # `free` — выход из меню (`Plan34`), выключен по умолчанию (владелец, 2026-10-15).
+    "compact_sets_off": "freeform",
 }
 
 _cache = {"key": None, "value": dict(DEFAULTS)}

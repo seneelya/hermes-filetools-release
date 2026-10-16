@@ -56,6 +56,33 @@ def _sink(run: dict):
     return take
 
 
+def _collect(run: dict):
+    """Приёмник кусков `_llm.delta_sink` для разговора `run`: текст и рассуждение копятся по мере прихода."""
+    def take(text: str, reasoning: str):
+        with _run_lock:
+            if text:
+                run["text"].append(text)
+            if reasoning:
+                run["reasoning"].append(reasoning)
+    return take
+
+
+def progress(text_at: int = 0, reasoning_at: int = 0) -> dict:
+    """Что модель уже напечатала в идущем разговоре — окно показывает ответ вживую, пока `chat` ждёт.
+    `text_at`/`reasoning_at` — сколько символов окно уже получило; отдаём только новое.
+    `{ok, running, text, reasoning, text_len, reasoning_len}`; разговора нет — `running: False`.
+    Итог всё равно берётся из ответа `chat`: куски — только показ."""
+    with _run_lock:
+        run = _run
+        if run is None or run["stopped"]:
+            return {"ok": True, "running": False, "text": "", "reasoning": "", "text_len": 0, "reasoning_len": 0}
+        text = "".join(run["text"])
+        reasoning = "".join(run["reasoning"])
+    t, r = max(0, int(text_at or 0)), max(0, int(reasoning_at or 0))
+    return {"ok": True, "running": True, "text": text[t:], "reasoning": reasoning[r:],
+            "text_len": len(text), "reasoning_len": len(reasoning)}
+
+
 def stop() -> dict:
     """■ Stop окна: гасим сокеты идущего разговора — `urlopen` в его потоке падает, сервер модели
     видит обрыв. `{ok, cut}` — сколько соединений оборвали (0 — нечего было или ещё не открыто)."""
@@ -173,13 +200,15 @@ def chat(messages: list, model: str = "", think: bool = False, timeout: float | 
     Маршрут ставит вызывающий (`_llm.use_route`). `model` — из выбора окна, пусто — модель маршрута.
     Ждёт до `CHAT_TIMEOUT_S`; `stop()` обрывает его (ответ `{ok: False, stopped: True}`)."""
     global _run
-    run = {"socks": [], "stopped": False}
+    run = {"socks": [], "stopped": False, "text": [], "reasoning": []}
     with _run_lock:
         _run = run
     token = _llm.conn_sink.set(_sink(run))
+    deltas = _llm.delta_sink.set(_collect(run))
     try:
         out = _chat(messages, model, think, timeout or CHAT_TIMEOUT_S)
     finally:
+        _llm.delta_sink.reset(deltas)
         _llm.conn_sink.reset(token)
         with _run_lock:
             if _run is run:
@@ -295,9 +324,12 @@ def frame_texts() -> dict:
 # писал. Ход и итог — в общем файле состояния операции (`_progress`, `who: "llmops"`).
 
 
-def replace(session_id: str, engine, addrs: list, text: str, wrap: str, preset: str = "") -> dict:
+def replace(session_id: str, engine, addrs: list, text: str, wrap: str, preset: str = "",
+            origin: dict | None = None) -> dict:
     """Поставить готовый текст на место адресов. Замок уже взят вызывающим. `{ok, lines, …}`;
-    `ok` — лента изменена. `preset` — ключ пресета окна, только для журнала (поправка 10)."""
+    `ok` — лента изменена. `preset` — ключ пресета окна, только для журнала (поправка 10).
+    `origin={"by": "compact", "sets", "wish"}` — текст пришёл из ПРЕВЬЮ компакции (`Plan35`): журнал
+    пишет вставку как компакцию (поправка 12); вставка та же."""
     spec = ",".join(str(a).strip() for a in addrs or [] if str(a or "").strip())
     facts = {"ok": False, "session": session_id, "spec": spec, "runs": 0,
              "absorbed": [], "summaries": [], "lines": []}
@@ -364,15 +396,22 @@ def replace(session_id: str, engine, addrs: list, text: str, wrap: str, preset: 
     summaries = [{"ok": True, "text": body, "wrap": wrap, "wrap_chosen": chosen,
                   "preset": str(preset or ""), "provider": "llmops", "model": "window",
                   "tokens": 0, "prompt_chars": 0, "input_chars": 0, "path": ""}]
+    if isinstance(origin, dict) and origin.get("by") == "compact":
+        # Превью компакции: поставщик — опрос, не окно. `_insert._note_absorptions` по нему пишет
+        # `by: compact` с классификацией и пожеланием прогона, без `preset`/`wrap` окна.
+        summaries[0].update({"provider": "distill", "sets": list(origin.get("sets") or []),
+                             "wish": str(origin.get("wish") or "")})
+        lines.append("из превью компакции — журнал запишет вставку как компакцию")
     return _insert._assemble_until_written(session_id, session, agent, rows, by_msg, runs, patch,
                                            hollow, replaced, summaries, None, spec, wanted, facts,
                                            lines)
 
 
-def _worker(session_id, engine, addrs, text, wrap, preset="") -> None:
+def _worker(session_id, engine, addrs, text, wrap, preset="", origin=None) -> None:
     facts, error = {}, ""
     try:
-        facts = replace(session_id, engine, addrs, text, wrap, preset)
+        facts = replace(session_id, engine, addrs, text, wrap, preset,
+                        **({"origin": origin} if origin else {}))
     except Exception as exc:  # noqa: BLE001 — поток не роняем: человек увидит «ошибка», а не вечное «идёт»
         error = f"{type(exc).__name__}: {exc}"
     finally:
@@ -381,7 +420,7 @@ def _worker(session_id, engine, addrs, text, wrap, preset="") -> None:
 
 
 def start_replace(session_id: str, engine, addrs: list, text: str, wrap: str,
-                  preset: str = "") -> dict:
+                  preset: str = "", origin: dict | None = None) -> dict:
     """Запустить замену в фоне: запись может ждать конца хода. `{ok: True}` — замок наш, поток
     пошёл; итог — файл состояния (`GET /context-compact-status`, `who: "llmops"`)."""
     if not [a for a in addrs or [] if str(a or "").strip()]:
@@ -391,7 +430,7 @@ def start_replace(session_id: str, engine, addrs: list, text: str, wrap: str,
                                       "вторая запись не ставится в очередь"}
     _progress.begin(session_id, "llmops")
     try:
-        threading.Thread(target=_worker, args=(session_id, engine, list(addrs), text, wrap, preset),
+        threading.Thread(target=_worker, args=(session_id, engine, list(addrs), text, wrap, preset, origin),
                          daemon=True, name="llmops-replace").start()
     except Exception as exc:  # noqa: BLE001
         _insert._busy.release()

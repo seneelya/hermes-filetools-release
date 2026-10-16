@@ -693,7 +693,7 @@ EVENT_ABSORBED = "absorbed"
 
 
 def note_absorbed(session: str | None, summary: str, members,
-                  by: str = "compact", sets=None, preset=None, wrap=None) -> bool:
+                  by: str = "compact", sets=None, preset=None, wrap=None, wish=None) -> bool:
     """Записать, что сводка `summary` поглотила сообщения `members`. Никогда не бросает.
 
     `summary` и `members` — АДРЕСА сообщений (`m0015`, `["m0002", …]`), не `id` базы: `id`
@@ -705,6 +705,8 @@ def note_absorbed(session: str | None, summary: str, members,
 
     `preset`, `wrap` — у вставки окна LLMOps: ключ пресета окна в момент `Replace` (`dedup`,
     `summarise`, …) и обёртка, выбранная в окне (`as-it-was`, …) — поправка 10. Нет — полей нет.
+
+    `wish` — пожелание пользователя к компакции (`Plan34`, поправка 11), его текст. Нет — поля нет.
     """
     try:
         summary = str(summary or "").strip()
@@ -724,6 +726,7 @@ def note_absorbed(session: str | None, summary: str, members,
                          for x in sets if isinstance(x, dict)]} if sets else {}),
             **({"preset": str(preset)} if preset else {}),
             **({"wrap": str(wrap)} if wrap else {}),
+            **({"wish": str(wish).strip()} if wish and str(wish).strip() else {}),
         }, session)
     except Exception as e:  # noqa: BLE001 — свидетельство не отменяет работы
         logger.debug("filetools ledger: skipped an absorption record for %r: %s",

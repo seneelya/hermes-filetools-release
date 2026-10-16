@@ -34,12 +34,15 @@ NL_ = "\n"
 class Q:
     """Вопрос. `text(**kw)` — наш построитель; `kw` — тема (`title`, `n`, `total`) и то, что
     передал сценарий. `form=None` — проза без схемы. `scoped` — ставить ли рамку темы перед
-    текстом (у ворот и самопроверки своя рамка внутри — им `False`)."""
+    текстом (у ворот и самопроверки своя рамка внутри — им `False`). `takes_wish` — узел
+    принимает пожелание пользователя (`Plan34`): блок `_prompts.wish_block` встаёт ПОСЛЕДНИМ, после
+    текста вопроса и его правил ответа; узлы факта (ворота, самопроверка, запреты) его не берут."""
     key: str
     text: Callable[..., str]
     form: "Form | None" = None
     think: bool = False
     scoped: bool = True
+    takes_wish: bool = False
 
 
 class Form:
@@ -160,12 +163,16 @@ class Gate(Form):
 class Run:
     """Один прогон опроса. `data` и `system` — ОДНИ на все вопросы: общий префикс запроса,
     десять вопросов подряд стоят один префилл. `state` — общий словарь состояния (`done`),
-    `save()` — отчёт на диск после каждого шага."""
+    `save()` — отчёт на диск после каждого шага. `wish` — проза пользователя к прогону
+    (`Plan34`); каждый вопрос получает её в `kw`, узел, который её не берёт, просто не читает."""
 
     def __init__(self, session_id: str, data: str, system: str, lines: list,
-                 state: dict, save: Callable[[], None]):
+                 state: dict, save: Callable[[], None], wish: str = "", menu=None):
         self.session_id, self.data, self.system = session_id, data, system
         self.lines, self.state, self.save = lines, state, save
+        self.wish = str(wish or "").strip()
+        # Наборы, выбранные человеком на этот прогон (`Plan34` Task 8); `None` — по настройке.
+        self.menu = list(menu) if menu else None
         self.steps: list = []
         self.plan = {"total": 0, "topics": 0}       # ход для панели (`_progress`)
 
@@ -215,8 +222,13 @@ class View:
 
     def ask(self, q: Q, **kw):
         """Задать вопрос. Проза → `str`; JSON → то, что читает форма вопроса."""
-        kw = {"title": self.title, "n": self.n, "total": self.total, **kw}
+        kw = {"title": self.title, "n": self.n, "total": self.total, "wish": self.run.wish, **kw}
         text = q.text(**kw)
+        if q.takes_wish and self.run.wish:
+            # ПОСЛЕДНИМ, после вопроса и его правил ответа (живой прогон 2026-10-15): стоявшее перед
+            # вопросом пожелание «выброси всё» перебила наша же фраза «as fully as the transcript
+            # allows» — побеждает ближнее к ответу (`Doc__prompting.md`).
+            text = text + NL_ * 2 + _prompts.wish_block(self.run.wish)
         if q.scoped and self.n:
             text = self.scope + text
         key = f"{q.key}[{self.n}]" if self.n else q.key

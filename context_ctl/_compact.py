@@ -98,6 +98,25 @@ class Busy(RuntimeError):
 
 
 
+def split_wish(raw: str) -> tuple:
+    """`/ctx-compact m0003-m0010 выбрось отладку` → `("m0003-m0010", "выбрось отладку")`.
+
+    Слева берутся слова, похожие на заказ: адрес с `m` или число, диапазон, доля, `all`, и их
+    `,`-списки; с первого непохожего слова и до конца — пожелание (`Plan34`). Голое шестнадцатеричное
+    слово без `m` (`add`, `face`) заказом НЕ считается — иначе английское пожелание съелось бы
+    адресами."""
+    words = str(raw or "").split()
+    for k, word in enumerate(words):
+        parts = [p for p in word.replace(";", ",").split(",") if p]
+        if not parts or not all(_SPEC_WORD.match(p) or parse_share(p) is not None
+                                or p.lower() in ("all", "всё", "все") for p in parts):
+            return " ".join(words[:k]), " ".join(words[k:])
+    return " ".join(words), ""
+
+
+_SPEC_WORD = re.compile(r"^(m[0-9a-f]+|[0-9]+)(-(m[0-9a-f]+|[0-9]+))?$", re.I)
+
+
 def parse_share(raw: str):
     """`0.5` или `50%` — ДОЛЯ сессии. Не доля — `None`, и аргумент читается адресами.
 
@@ -151,7 +170,7 @@ def _wrap(summary_text: str, kept: bool = False) -> str:
 
 
 
-def distill_summary(session_id, rows, run_info, by_msg, lines=None) -> dict:
+def distill_summary(session_id, rows, run_info, by_msg, lines=None, wish: str = "", menu=None) -> dict:
     """Сводка НАШИМ ядром (`Vision08`). Форма ответа — словарь с `ok`/`text`/`error`.
 
     ДВА МНОЖЕСТВА, и путать их нельзя. В модель уезжает сессия С НАЧАЛА до конца пробега
@@ -170,16 +189,17 @@ def distill_summary(session_id, rows, run_info, by_msg, lines=None) -> dict:
     eaten = run_info.get("eaten") or run_info["positions"]
     out = _distill.interrogate(session_id, rows, positions, addr_of, lines,
                                kept=run_info.get("kept") or [],
-                               work=list(range(min(eaten), max(eaten) + 1)))
+                               work=list(range(min(eaten), max(eaten) + 1)), wish=wish, menu=menu)
     return {"ok": bool(out.get("ok")), "text": out.get("text", ""),
             "error": "" if out.get("ok") else (out.get("error") or "холодный опрос не дал документа"),
             "provider": "distill", "model": f"{out.get('asked', 0)} вопросов",
             "tokens": 0, "prompt_chars": 0,
             "input_chars": out.get("data_chars", 0), "path": out.get("path", ""),
-            "sets": out.get("sets") or []}
+            "sets": out.get("sets") or [], "wish": out.get("wish", "")}
 
 
-def run(session_id: str, engine, raw_args: str = "", owned: bool = False, deliver: dict | None = None) -> dict:
+def run(session_id: str, engine, raw_args: str = "", owned: bool = False, deliver: dict | None = None,
+        wish: str = "", menu=None, draft: bool = False) -> dict:
     """Сжать названные сообщения сессии. ОДНА реализация; сегодня зовёт слеш-команда.
 
     Ключ `ok` означает ровно одно: контекст ИЗМЕНЁН. Все прочие исходы (нечего сжимать,
@@ -197,6 +217,14 @@ def run(session_id: str, engine, raw_args: str = "", owned: bool = False, delive
     свободно» и «взяли» помещается второй вызов (`__HQ/deferred/03`, чинится этим). Прямой
     синхронный вызов по-прежнему берёт замок сам — default выбран так, чтобы забытый аргумент
     давал ЛИШНЮЮ защиту, а не её отсутствие.
+
+    `wish` — пожелание пользователя к компакции (`Plan34`), проза; доходит до опроса
+    (`_distill.interrogate`). Пустое — прогон прежний. `menu` — наборы опроса, выбранные человеком на
+    этот прогон (Task 8); `None` — по настройке.
+
+    `draft=True` — ПРЕВЬЮ (`Plan35`): всё до записи, но в ленту не пишем — дистиллят без рамки в
+    `facts["draft"]` (`addrs`, `text`, `wrap`, `kept`, `sets`, `wish`), его открывает окно LLMOps.
+    Имя не `preview`: так здесь зовётся предпросмотр реза (вызов без аргументов).
     """
     spec = str(raw_args or "").strip()
     facts = {"ok": False, "session": session_id, "spec": spec, "runs": 0,
@@ -216,7 +244,8 @@ def run(session_id: str, engine, raw_args: str = "", owned: bool = False, delive
     try:
         # Маршрут к модели сессии — на этот поток, на весь прогон (`_llm`, шапка).
         with _llm.use_route(engine.live_agent()):
-            return _run_guarded(session_id, engine, raw_args, facts, lines, preview, deliver)
+            return _run_guarded(session_id, engine, raw_args, facts, lines, preview, deliver, wish, menu,
+                                draft)
     finally:
         # Снятие в `finally` обязательно: прогон может упасть где угодно, а замок, повисший
         # после смерти прогона, заклинил бы компакцию до перезапуска клиента. Чужой замок не
@@ -226,7 +255,8 @@ def run(session_id: str, engine, raw_args: str = "", owned: bool = False, delive
             _insert._busy.release()
 
 
-def _run_guarded(session_id, engine, raw_args, facts, lines, preview, deliver=None) -> dict:
+def _run_guarded(session_id, engine, raw_args, facts, lines, preview, deliver=None, wish="",
+                 menu=None, draft=False) -> dict:
     """Тело `run()` под уже взятым замком — разнесено только ради `finally`."""
     spec = str(raw_args or "").strip()
     # ЧТО ИМЕННО ДОЕХАЛО, дословно и первой строкой. Панель и слеш-команда сходятся здесь, и
@@ -358,13 +388,20 @@ def _run_guarded(session_id, engine, raw_args, facts, lines, preview, deliver=No
         facts["runs"] = len(runs)
         return facts
 
+    if draft and len(runs) > 1:
+        # Окно LLMOps держит ОДИН кусок. Сторож: `_insert._plan` сегодня сводит пробеги в один
+        # пролёт, сюда не попасть; если начнёт — отказ до модели, а не минуты опроса впустую.
+        lines.append(f"ИТОГ: контекст не тронут — превью берёт один сплошной кусок, а пробегов "
+                     f"{len(runs)}. Отметь кусок без дырок")
+        return facts
+
     # ── Модель. Один вызов на пробег, до единой правки базы: упасть на третьем из пяти
     # и оставить контекст наполовину сжатым хуже, чем не начать вовсе.
     summaries = []
     for run_info in runs:
         _progress.progress(session_id, stage="prepare", step=0, total=0, label="", topic="",
                  span=f"{run_info['addresses'][0]}…{run_info['addresses'][-1]}")
-        answer = distill_summary(session_id, rows, run_info, by_msg, lines)
+        answer = distill_summary(session_id, rows, run_info, by_msg, lines, wish, menu)
         if not answer.get("ok"):
             lines.append(f"ИТОГ: контекст не тронут — модель не дала сводку для "
                          f"{run_info['addresses'][0]}…{run_info['addresses'][-1]}: "
@@ -376,6 +413,16 @@ def _run_guarded(session_id, engine, raw_args, facts, lines, preview, deliver=No
                      f"из {answer['input_chars']} "
                      f"({answer.get('provider')}/{answer.get('model')}, "
                      f"{answer.get('tokens')} токенов)")
+
+    if draft:
+        # ПРЕВЬЮ: запись не зовём. Текст — ровно тот, что `_insert._head_content` обернул бы
+        # рамкой `compaction`; `kept` — тот же признак пузырей, что у записи.
+        answer, run_info = summaries[0], runs[0]
+        facts["draft"] = {"addrs": list(run_info["addresses"]), "text": answer["text"],
+                          "wrap": "compaction", "kept": bool(run_info.get("kept")),
+                          "sets": list(answer.get("sets") or []), "wish": answer.get("wish", "")}
+        lines.append("превью: в ленту не записано — дистиллят в окне LLMOps")
+        return facts
 
     return _insert._assemble_until_written(session_id, session, agent, rows, by_msg, runs, patch, hollow,
                                    replaced, summaries, deliver, spec, wanted, facts, lines)
@@ -456,7 +503,7 @@ def status_lines() -> list:
     return out
 
 
-def _worker(session_id, engine, args) -> None:
+def _worker(session_id, engine, args, wish: str = "", menu=None, draft: bool = False) -> None:
     """Тело боевого прогона в отдельном потоке. Исключений наружу не выпускает: поток,
     умерший молча, оставил бы человека с вечным «идёт».
 
@@ -470,7 +517,9 @@ def _worker(session_id, engine, args) -> None:
     global _busy_since
     facts, error = {}, ""
     try:
-        facts = run(session_id, engine, args, owned=True)
+        # `draft` — только когда есть: без превью вызов прежний, байт в байт (`Plan35`).
+        extra = {"draft": True} if draft else {}
+        facts = run(session_id, engine, args, owned=True, wish=wish, menu=menu, **extra)
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
     finally:
@@ -479,7 +528,8 @@ def _worker(session_id, engine, args) -> None:
         _insert._busy.release()
 
 
-def start_background(session_id: str, engine, args: str) -> dict:
+def start_background(session_id: str, engine, args: str, wish: str = "", menu=None,
+                     draft: bool = False) -> dict:
     """Запустить компакцию в фоне. Общее тело для слэш-команды и маршрута панели
     (`POST /context-compact-start`) — ОДНА реализация замка+потока, а не две разные копии
     одного и того же риска (двойной запуск, поток без `finally`).
@@ -512,7 +562,7 @@ def start_background(session_id: str, engine, args: str) -> dict:
     # чужой прогресс значит отнимать у человека вид на работу, которая идёт.
     _progress.begin(session_id, "button")
     try:
-        threading.Thread(target=_worker, args=(session_id, engine, spec),
+        threading.Thread(target=_worker, args=(session_id, engine, spec, wish, menu, draft),
                          daemon=True, name="ctx-compact").start()
     except Exception as exc:  # noqa: BLE001 — поток не завёлся: замок наш, вернуть некому
         _busy_since = 0.0
@@ -541,6 +591,11 @@ def handle(raw_args: str = "") -> str:
     session_id, engine, args, lines = _pick(raw_args, mark)
     if engine is None:
         return "\n".join(lines)
+    # Проза после адресов/доли — пожелание к компакции (`Plan34` Task 5).
+    args, wish = split_wish(args)
+    if wish and not args:
+        return "\n".join(lines + [f"пожелание: «{wish}»", "ИТОГ: ничего не сделано — перед "
+                                  "пожеланием нужен заказ: адреса, доля (`50%`) или `all`"])
     if not args:
         return "\n".join(lines + list(run(session_id, engine, args).get("lines") or []))
 
@@ -556,7 +611,7 @@ def handle(raw_args: str = "") -> str:
     # отказ стал стоить лишнего похода в базу — а на фальшивом движке в тестах чтение и вовсе
     # подвисло. Поэтому сначала решаем и захватываем, и только потом объясняем рез: в ответе
     # человеку он всё равно окажется выше, порядок строк мы задаём сами.
-    started = start_background(session_id, engine, args)
+    started = start_background(session_id, engine, args, wish)
     if not started.get("ok"):
         return "\n".join(lines + [started.get("error") or "не запущено"] + status_lines())
 

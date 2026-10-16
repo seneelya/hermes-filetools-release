@@ -30,7 +30,7 @@ def doc_pack_head(kind: str) -> str:
     C_PACK_HEAD_PLAN2 = "### Decisions taken and rejected"
     C_PACK_HEAD_RECON2 = "### What we found out"
     C_PACK_HEAD_RULES2 = "### Rules stated here"
-    heads = {"work": C_PACK_HEAD_CODE2, "recon": C_PACK_HEAD_RECON2,
+    heads = {"work": C_PACK_HEAD_CODE2, "investigation": C_PACK_HEAD_RECON2, "recon": C_PACK_HEAD_RECON2,
              "design": C_PACK_HEAD_PLAN2, "rules": C_PACK_HEAD_RULES2,
              "code": C_PACK_HEAD_CODE2, "canon": C_PACK_HEAD_CANON2,
              "general": C_PACK_HEAD_CANON2,
@@ -71,3 +71,8 @@ def doc_talk_head() -> str:
     C_DOC_TALK_HEAD2 = "### What the conversation was about"
     out__doc_talk_head = C_DOC_TALK_HEAD2
     return out__doc_talk_head
+def doc_free_head() -> str:
+    """Раздел темы, ответ на которую агент дал сам (`free`, `Plan34`)."""
+    C_DOC_FREE_HEAD = "### In my own words"
+    out__doc_free_head = C_DOC_FREE_HEAD
+    return out__doc_free_head

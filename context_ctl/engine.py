@@ -2,8 +2,9 @@
 
 ЧТО ОН ДЕЛАЕТ:
 - честно ведёт учёт токенов, который `run_agent.py` читает напрямую с движка;
-- `compress()` — единственная точка, которой мы меняем историю. Ветвится по `focus_topic`:
-  наша метка → механизм 1 (заглушки по файлу-выбору); что угодно другое → вход как есть;
+- `compress()` — отдаёт их конвейеру новую ленту: автомат (наше «да», `pending`) и ручной
+  `/compress <текст>` (`force`, текст — пожелание, `Plan34`); наша метка `ctxdrop` в `focus_topic` —
+  вход как есть;
 - `should_compress()` — решение нашим счётом и порогом (`Plan24-Task07`); «да» только при
   `compact_auto_enabled: true` в нашем `plugin.yaml`, сжатие по «да» — `Plan16` п.1.
 
@@ -30,7 +31,7 @@ import time
 
 from agent.context_engine import ContextEngine
 
-from . import _bridge, _state, _tokcount
+from . import _bridge, _state, _stubs, _tokcount
 from . import _insert
 
 # Как часто перезаписываем статус-файл на «скучных» событиях (учёт токенов). События,
@@ -206,7 +207,10 @@ class ContextCtlEngine(ContextEngine):
 
     def compress(self, messages, current_tokens=None, focus_topic=None,
                  force=False, memory_context="") -> list:
-        """Identity. Мы НЕ меняем историю через этот метод — и это решение, не заглушка.
+        """Автомат и ручной `/compress` (`Plan34`) отдают отсюда новую ленту, её пишет их конвейер;
+        всё прочее — identity. История ниже — почему ПРАВКИ (`/ctx-drop`, вставки) идут не сюда.
+
+        Было: identity. Мы НЕ меняем историю через этот метод — и это решение, не заглушка.
 
         Так было не всегда: до 2026-09-08 ручные механизмы 1/2 применялись именно здесь,
         через форсированный `agent._compress_context(...)`. Живой прогон владельца показал,
@@ -228,10 +232,14 @@ class ContextCtlEngine(ContextEngine):
         out = messages
         # АВТОМАТ (Plan16 п.1, задача E; путь B — `DECISIONS.md`): «да» нашего `should_compress`
         # взвело `pending`. Сжимаем ЗДЕСЬ, синхронно: ход стоит, сервер занят только компакцией;
-        # новую ленту отдаём, пишет её Hermes. Ручной `/compress` (`force`) — по-прежнему identity.
+        # новую ленту отдаём, пишет её Hermes.
         if not force and self._tok.auto.get("pending") and messages:
             self._tok.auto["pending"] = False
             out, applied = self._auto_compact(messages)
+        # РУЧНОЙ `/compress` / `/compact` (`force`, `Plan34` Task 5): тот же путь, что у автомата,
+        # проза после команды — пожелание (`focus_topic`). Наша метка механизма 1 — не трогаем.
+        elif force and messages and not _stubs.is_manual_apply(focus_topic):
+            out, applied = self._manual_compact(messages, focus_topic)
         with self._lock:
             self._compress_log.append({
                 "at": time.time(),
@@ -303,6 +311,68 @@ class ContextCtlEngine(ContextEngine):
         _tokcount.auto_finished(self._tok.auto, True, why, time.time(), pause)
         self._say("автокомпакция готова — " + why + "; ленту записывает Hermes")
         return facts["new_history"], "auto: " + why
+
+    def _manual_compact(self, messages, wish=None) -> tuple:
+        """Ручной `/compress` / `/compact` (`Plan34` Task 5, `Recon34`): путь автомата — выгрузка →
+        отбор `compact_pick` → `_compact.run(…, deliver=, wish=)`; `(новая лента, пояснение)` или
+        `(messages, причина)`. Паузу автомата не взводит и не ждёт. `here N`: нам приходит только
+        голова (хвост пришивают они) — отбор режется по переданной ленте (`_in_tape`)."""
+        from . import _progress
+        _progress.begin(self._session_id, "console")
+        lines: list = []
+        result = (messages, "manual: не выполнено — упало")
+        try:
+            result = self._manual_compact_run(messages, str(wish or "").strip(), lines)
+            return result
+        finally:
+            done = result[0] is not messages
+            _progress.finish(self._session_id, {"ok": done, "lines": lines},
+                             "" if done else result[1])
+
+    def _manual_compact_run(self, messages, wish: str, lines: list) -> tuple:
+        from . import _compact, _progress
+        started = time.time()
+        self._say("компакция: начинаю" + (f" — пожелание: «{wish}»" if wish else ""))
+        _progress.progress(self._session_id, stage="export")
+        self._say("выгрузка сессии: " + self._export_before_compaction())
+        pick = self.compact_pick()
+        picked = self._in_tape(pick.get("picked") or [], messages) if pick.get("ok") else []
+        if not picked:
+            why = "; ".join(pick.get("lines") or []) if not pick.get("ok") else \
+                "отобранное лежит вне переданной ленты (here N?) — сжимать нечего"
+            why = why or "нечего сжимать"
+            lines.append("ИТОГ: " + why)
+            self._say("компакция не выполнена — " + why)
+            return messages, "manual: не выполнено — " + why
+        self._say(f"компакция: сжимаю {len(picked)} сообщений")
+        facts = _compact.run(self._session_id, self, ",".join(picked),
+                             deliver={"history": list(messages)}, wish=wish)
+        lines.extend(facts.get("lines") or [])
+        if not facts.get("delivered"):
+            why = (facts.get("lines") or ["без причины"])[-1]
+            self._say("компакция не выполнена — " + why)
+            return messages, "manual: не выполнено — " + why
+        self._pending_finalize = facts["finalize"]
+        self.note_rewrite()
+        why = (f"строк {facts['rows_before']} → {facts['rows_after']}, "
+               f"{int(time.time() - started)} с")
+        self._say("компакция готова — " + why + "; ленту записывает Hermes")
+        return facts["new_history"], "manual: " + why
+
+    def _in_tape(self, picked: list, messages) -> list:
+        """Отобранные адреса, чьи строки базы есть в переданной ленте (`Recon34`, `here N`: адрес из
+        хвоста, которого в ленте нет, сшить нельзя). Граница — ПОСЛЕДНЯЯ строка базы, найденная в
+        ленте: строку из середины их загрузчик может склеить с соседней той же роли, и поштучная
+        сверка резала бы зря (`splice_for_delivery`, живьём 2026-10-07)."""
+        from . import _apply
+        rows, why = _apply.db_history(self.live_agent())
+        if why:
+            return []
+        by_msg = _insert._index(self._session_id, rows)
+        in_tape = {_insert._key(m) for m in messages or []}
+        last = max((i for i, r in enumerate(rows) if _insert._key(r) in in_tape), default=-1)
+        place = {id(r): i for i, r in enumerate(rows)}
+        return [a for a in picked if a in by_msg and place.get(id(by_msg[a]), last + 1) <= last]
 
     def _export_before_compaction(self) -> str:
         """Выгрузка всей сессии снимком перед автокомпакцией (задача D): сессия не теряется."""
@@ -471,8 +541,11 @@ class ContextCtlEngine(ContextEngine):
         return _command.run_import(self._session_id, self, str(folder or ""),
                                    str(mode or "replace"))
 
-    def start_compact(self, addrs) -> dict:
+    def start_compact(self, addrs, wish: str = "", menu=None, preview: bool = False) -> dict:
         """Запустить компакцию В ФОНЕ для НАЗВАННЫХ m-адресов этой сессии (Plan16-Task03).
+        `wish` — пожелание из окна подтверждения (`Plan34` Task 6); `menu` — наборы опроса,
+        выбранные там же на этот прогон (Task 8); `preview` — галочка превью (`Plan35`): в ленту не
+        пишем, дистиллят — в `draft` файла состояния, его открывает окно LLMOps.
 
         Рельса компакции отдаёт голые m-адреса (`m0001`, `m0007`, …) как есть — для неё, в
         отличие от прежнего `apply_drop`, предметом работы являются сами сообщения, а не операции
@@ -489,16 +562,27 @@ class ContextCtlEngine(ContextEngine):
         """
         from . import _compact
         spec = ",".join(str(a).strip() for a in (addrs or []) if str(a or "").strip())
-        return _compact.start_background(self._session_id, self, spec)
+        extra = {"draft": True} if preview else {}
+        return _compact.start_background(self._session_id, self, spec, str(wish or "").strip(),
+                                         list(menu) if menu else None, **extra)
 
-    def start_ready(self, addrs, text: str, wrap: str, preset: str = "") -> dict:
+    def compact_sets(self) -> dict:
+        """Каталог наборов опроса для панели (`Plan34` Task 8, `GET /compact-sets`) и выключенные
+        настройкой: каталог знает только эта половина — панель грузится по пути, без пакета."""
+        from . import _questionnaires, _settings
+        return {"ok": True, "sets": _questionnaires.catalog(),
+                "off": _questionnaires.names_of(_settings.compaction().get("compact_sets_off", ""))}
+
+    def start_ready(self, addrs, text: str, wrap: str, preset: str = "", origin=None) -> dict:
         """LLMOps (Plan31): поставить ГОТОВЫЙ текст на место m-адресов ВСТАВКОЙ В ЛЕНТУ (`_insert`) —
         операция `llm ops`, не компакция. В фоне, общим замком записи; итог — файл состояния
         (`GET /context-compact-status`, `who: "llmops"`). `wrap` — `compaction` / `summarisation` / `none`;
-        `preset` — ключ пресета окна, только для журнала."""
+        `preset` — ключ пресета окна, только для журнала; `origin` — текст из превью компакции
+        (`Plan35`): журнал пишет `by: compact` с `sets`/`wish`."""
         from . import _llmops
+        extra = {"origin": dict(origin)} if isinstance(origin, dict) else {}
         return _llmops.start_replace(self._session_id, self, list(addrs or []),
-                                     str(text or ""), str(wrap or ""), str(preset or ""))
+                                     str(text or ""), str(wrap or ""), str(preset or ""), **extra)
 
     # ── LLMOps (Plan31 Таск 2): окно зовёт движок тем же приёмом, что `start_compact` —
     # дашбордная половина наш пакет не импортирует. Маршрут к модели — маршрут опроса компакции.
@@ -527,6 +611,11 @@ class ContextCtlEngine(ContextEngine):
         """■ Stop окна: оборвать идущий разговор (`_llmops.stop`)."""
         from . import _llmops
         return _llmops.stop()
+
+    def llmops_progress(self, text_at: int = 0, reasoning_at: int = 0) -> dict:
+        """Что модель уже напечатала в идущем разговоре окна (`_llmops.progress`)."""
+        from . import _llmops
+        return _llmops.progress(text_at, reasoning_at)
 
     def llmops_models(self) -> dict:
         """Модели сервера маршрута (`_llmops.models`)."""

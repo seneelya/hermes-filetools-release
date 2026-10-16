@@ -27,6 +27,16 @@
 # yet — write that down instead of a guess.
 
 meta:
+  # Rebased 2026-10-16 to d923a5eb48 = their release tag v0.22.2 (3012 commits
+  # from c0ef5af520). First update onto a STABLE TAG: `hermes update` now
+  # installs releases, not origin/main. Prepared by Claude on Windows
+  # (recon/subjects/hermes-updates-changelogs/2026-10-16__prepare_update.md):
+  # checked first on origin/main acc3cada0d (2 files moved there, safe_worker
+  # early exit - none of it in the release), then on d923a5eb48 itself: FAIL 0,
+  # CODE CHANGED 4, all hold. One fix before the update: `set_theme` (new
+  # desktop_ui tool, replaces apply_layout) added to plugin.yaml
+  # disabled_tools. Full check on live: 70 OK + 2 TEST-OK, 181 tests green.
+  #
   # Rebased 2026-10-11 to c0ef5af520 after the live update from b79c45bd3e
   # (2556 commits; live HEAD = the audited TO exactly). Prepared by
   # HowTo__PrepareForUpdate.md: no risks, 3 ATTENTION (forced_compress_entry:
@@ -90,8 +100,8 @@ meta:
   # bridge.tool_stubs's tuple shape changed (name dropped, was redundant
   # with the dict key) - file_ops/_execute_code_bridge.py now detects the
   # shape instead of assuming it.
-  baseline_taken: "2026-10-11"
-  baseline_head: "c0ef5af520"
+  baseline_taken: "2026-10-16"
+  baseline_head: "d923a5eb48"
   # Fallback only. The checker resolves the live checkout itself:
   # HERMES_AGENT_ROOT, else <HERMES_HOME>/hermes-agent (installer layout).
   prod_root: "Y:/Hermess/body/hermes-agent"
@@ -340,6 +350,26 @@ seams:
       way to trigger anything, and automatic compaction (which we deliberately
       do not implement yet) would be the only path left.
     asserted_by: tests/test_context_ctl.py::test_forced_compress_from_the_host_reaches_our_compress
+
+  - id: ctxctl.manual_compress_focus
+    level: 1
+    file: agent/conversation_compression_manual.py
+    kind: symbol
+    symbol: focus_topic=request.focus_topic, force=True
+    baseline_count: 1
+    we_do: >-
+      Their manual `/compress <text>` / `/compact <text>` (one parser,
+      `parse_compress_args`, for every surface) reaches our `compress()` through
+      `compress_now` -> `agent._compress_context(head, ..., focus_topic=<text>,
+      force=True)`; we read `focus_topic` as the user's compaction wish (Plan34).
+      `here N` gives us only the head, the tail goes as `verbatim_tail` and is
+      rejoined by them - we cut our pick to the head (`engine._in_tape`). With
+      `here N` their parser DROPS any prose (focus_topic None) - by their design.
+    breaks: >-
+      The prose stops arriving as `focus_topic`, or `force` stops being True ->
+      manual `/compress` runs our compaction without the wish, or not at all
+      (identity); a changed `here N` split -> we may pick rows they re-append.
+    asserted_by: tests/test_context_ctl.py::test_manual_compress_focus_reaches_compress
 
   - id: ctxctl.gateway_session_registry
     level: 1

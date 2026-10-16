@@ -256,6 +256,17 @@ def test_k7d_the_llmops_absorption_keeps_preset_and_wrap(tmp_path, monkeypatch):
     assert "preset" not in got["m0036"] and "wrap" not in got["m0036"]
 
 
+def test_k7e_the_absorption_keeps_the_wish(tmp_path, monkeypatch):
+    """Поправка 11 журнала (2026-10-15, `Plan34`): пожелание пользователя к компакции — в записи
+    о поглощении; нет или пустое — поля нет."""
+    monkeypatch.setattr(_ledger, "ledger_dir", lambda: tmp_path)
+    assert _ledger.note_absorbed("s-5", "m0015", ["m0002"], wish=" выбрось отладку ") is True
+    assert _ledger.note_absorbed("s-5", "m0016", ["m0004"], wish="  ") is True
+    got = _ledger.absorptions(_ledger.read_ledger("s-5"))
+    assert got["m0015"]["wish"] == "выбрось отладку"
+    assert "wish" not in got["m0016"]
+
+
 def test_k7b_an_absorption_without_members_is_not_written(tmp_path, monkeypatch):
     monkeypatch.setattr(_ledger, "ledger_dir", lambda: tmp_path)
     # «Сводка не поглотила ничего» — не факт, а пустая запись; писать её значило бы
@@ -364,7 +375,7 @@ def test_b3_start_background_answers_immediately_and_persists_the_outcome(tmp_pa
     monkeypatch.setattr(_compact_state, "state_dir", lambda: tmp_path / "compact_state")
     monkeypatch.setattr(_compact, "threading", _FakeThreadModule)
     monkeypatch.setattr(_compact, "run",
-                        lambda sid, engine, args, owned=False:
+                        lambda sid, engine, args, owned=False, wish="", menu=None:
                             {"ok": True, "lines": ["ИТОГ: применено"]})
 
     out = _compact.start_background("s-1", object(), "m0001,m0002")
@@ -384,7 +395,7 @@ def test_b4_a_worker_that_raises_still_ends_running_and_reports_the_error(tmp_pa
     monkeypatch.setattr(_compact_state, "state_dir", lambda: tmp_path / "compact_state")
     monkeypatch.setattr(_compact, "threading", _FakeThreadModule)
 
-    def _boom(sid, engine, args, owned=False):
+    def _boom(sid, engine, args, owned=False, wish="", menu=None):
         raise RuntimeError("шов пропал")
     monkeypatch.setattr(_compact, "run", _boom)
 
@@ -571,6 +582,48 @@ def test_e5_middle_changed_while_waiting_is_a_refusal(monkeypatch):
     assert "изменилась середина" in facts["lines"][-1]
 
 
+def test_k11_draft_writes_nothing_and_carries_the_distillate(monkeypatch):
+    """`Plan35`: превью доходит до записи и не пишет; черновик — тот текст, что лёг бы в ленту."""
+    db, written, engine = _wait_setup(monkeypatch, [(True, "применено")])
+    rows_before = list(db["rows"])
+    facts = _compact.run("s-1", engine, "m0002-m0003", draft=True)
+    assert written == [] and db["rows"] == rows_before, "превью базу не трогает"
+    assert facts["ok"] is False
+    draft = facts["draft"]
+    assert draft["addrs"] == ["m0002", "m0003"]
+    assert draft["text"] == "СВОДКА" and draft["wrap"] == "compaction" and draft["kept"] is False
+    assert "превью:" in facts["lines"][-1]
+
+    # Тот же прогон без превью кладёт в ленту ровно `_head_content` черновика.
+    db, written, engine = _wait_setup(monkeypatch, [(True, "применено")])
+    assert _compact.run("s-1", engine, "m0002-m0003")["ok"]
+    assert _insert._head_content(draft, kept=draft["kept"]) in written[0]
+
+
+def test_k11b_draft_with_a_hole_keeps_the_bubble_flag(monkeypatch):
+    """Дырка в выборе — пузыри (`_plan` сводит в один пролёт): `kept` черновика = признак записи."""
+    db, written, engine = _wait_setup(monkeypatch, [(True, "применено")])
+    draft = _compact.run("s-1", engine, "m0002,m0005", draft=True)["draft"]
+    assert written == [] and draft["kept"] is True
+
+    db, written, engine = _wait_setup(monkeypatch, [(True, "применено")])
+    assert _compact.run("s-1", engine, "m0002,m0005")["ok"]
+    assert _insert._head_content(draft, kept=True) in written[0]
+
+
+def test_k11c_worker_passes_draft_only_when_set(tmp_path, monkeypatch):
+    """Без превью вызов `run` прежний — ключа `draft` в нём нет вовсе."""
+    from hermes_filetools.context_ctl import _compact_state
+
+    monkeypatch.setattr(_compact_state, "state_dir", lambda: tmp_path / "compact_state")
+    monkeypatch.setattr(_compact, "threading", _FakeThreadModule)
+    seen = []
+    monkeypatch.setattr(_compact, "run", lambda sid, engine, args, **kw: seen.append(kw) or {"lines": []})
+    _compact.start_background("s-1", object(), "m0001")
+    _compact.start_background("s-1", object(), "m0001", draft=True)
+    assert "draft" not in seen[0] and seen[1]["draft"] is True
+
+
 def test_k9_splice_check_compares_like_with_like():
     """Сессия `20261002_012006_4fb201` (2026-10-03): голова под `head_keep` — человек, ответ,
     СТАРЫЙ дистиллят от ассистента; в базе это пара ассистентов, их загрузчик в памяти хода её
@@ -593,3 +646,17 @@ def test_k9_splice_check_compares_like_with_like():
     out, why = _insert.splice_for_delivery(rows, new_rows, history)
     assert out is not None, why
     assert [m["role"] for m in out][-2:] == ["user", "assistant"]
+
+
+def test_k10_split_wish_takes_the_order_and_leaves_the_prose():
+    """`Plan34` Task 5: `/ctx-compact <заказ> <пожелание>` — слева заказ, с первого непохожего слова —
+    пожелание. Голое шестнадцатеричное слово (`add`) заказом не считается."""
+    sw = _compact.split_wish
+    assert sw("m0003-m0010 выбрось отладку") == ("m0003-m0010", "выбрось отладку")
+    assert sw("m0001,m0003 m0007 оставь решения") == ("m0001,m0003 m0007", "оставь решения")
+    assert sw("50% keep it short") == ("50%", "keep it short")
+    assert sw("all add the numbers") == ("all", "add the numbers")
+    assert sw("m0001-m0004") == ("m0001-m0004", "")
+    assert sw("сожми всё") == ("", "сожми всё")
+    assert sw("") == ("", "")
+

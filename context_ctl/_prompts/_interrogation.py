@@ -217,7 +217,7 @@ def q7_pack(kind: str, settled: str, open_text: str) -> str:
     C_PACK_RULES = (
         "Which rules, preferences and prohibitions were stated here? Quote each one "
         "verbatim - a paraphrase of a rule is not the rule - and say what it applies to.")
-    packs = {"work": C_PACK_CODE, "recon": C_PACK_RECON, "design": C_PACK_PLAN,
+    packs = {"work": C_PACK_CODE, "investigation": C_PACK_RECON, "recon": C_PACK_RECON, "design": C_PACK_PLAN,
              "rules": C_PACK_RULES, "general": C_PACK_CANON,
              "code": C_PACK_CODE, "canon": C_PACK_CANON, "plan": C_PACK_PLAN}
     out__q7_pack = C_PACK_HEAD.format(settled=frame_block("SETTLED", settled), open=frame_block("OPEN", open_text)) \
@@ -587,7 +587,42 @@ def kind_brief() -> str:
                     "and what is still open.")
     out__kind_brief = C_KIND_BRIEF
     return out__kind_brief
-def q_which_set(titles_block: str, menu: str) -> str:
+def kind_free() -> str:
+    """ВЫХОД ИЗ МЕНЮ (`Plan34`, владелец 2026-10-14: «как в телефонном разговоре — ни один вариант,
+    соедините с оператором»): ни один набор не подошёл — агент сам говорит, что из темы должно
+    остаться. По умолчанию ВЫКЛЮЧЕН (`compact_sets_off`) — включается галочкой. Той же формы и
+    длины, что остальные описания; первое слово сильное."""
+    C_KIND_FREE = ("Free: none of the sets above fits this topic - I say in my own words what of "
+                   "it must survive, in the form that suits it.")
+    # Слово `freeform` и описание БЕЗ отрицания (владелец, 2026-10-15): вариант читается целиком —
+    # «the set that fits this topic best is (free): none of the sets fits» спорил сам с собой и
+    # звучал отказом; `free` двусмысленно («бесплатный», «пустой»).
+    C_KIND_FREE2 = ("Freeform: no fixed questions - I say in my own words what of this topic must "
+                    "survive, in the form that suits it.")
+    out__kind_free = C_KIND_FREE2
+    return out__kind_free
+def q_free() -> str:
+    """Единственный вопрос набора `free`. Без общего `answer_style`: тот запрещает свои заголовки
+    и говорит «другие аспекты — в других вопросах», а здесь других вопросов нет — ответ и есть вся
+    тема. Язык, зачин и обрезанный вывод тулов — те же правила, что у всех."""
+    C_Q_FREE = (
+        "None of the sets of questions fitted this topic, so there is no list of questions for "
+        "it. Say yourself what of this topic you will need in order to go on with the work - in "
+        "the form that suits it: your own subheadings, your own order.\n\n"
+        "Keep what was settled and why, what is still open or unfinished, and the exact names, "
+        "numbers and wording that a retelling would lose. Leave out what no longer matters. "
+        "Answer as fully as the transcript allows: this answer is all that will remain of the "
+        "topic."
+    )
+    C_Q_FREE_TAIL = (
+        "\n\nBegin with the content itself: no opening sentence announcing what you are about "
+        "to write, no sign-off.\n\n"
+        "Where a tool output is cut short, you know the call was made; you do NOT know what it "
+        "printed. Never fill that in."
+    )
+    out__q_free = C_Q_FREE + lang_note() + C_Q_FREE_TAIL
+    return out__q_free
+def q_which_set(titles_block: str, menu: str, exit_word: str = "") -> str:
     """УЗЕЛ ВЫБОРА ОПРОСНИКА (`Plan32.1`, замысел владельца 2026-10-11): модели показываем ВСЕ
     наборы вопросов, которые можем задать, — что каждый спросит, — и она выбирает набор для
     каждой темы. Заменил `q_kinds`: тот выбирал «вид темы», и от вида зависела одна пачка;
@@ -611,7 +646,13 @@ def q_which_set(titles_block: str, menu: str) -> str:
         "Reply with JSON only: one field per topic title, its value one of the given "
         "options, copied exactly."
     )
-    out__q_which_set = C_Q_WHICH_SET.format(titles=titles_block, menu=menu)
+    # Выход из меню (`free`, `Plan34`) в меню — «ни один не подходит» указывает на него, а не на
+    # последний вариант (тот — запасной `general`, обычный нейтральный набор). Нет — текст прежний.
+    C_WHICH_SET_LAST = "Choose the last option if none of them really fits"
+    C_WHICH_SET_EXIT = "Choose ({exit}) if none of the other sets really fits"
+    text = C_Q_WHICH_SET.replace(C_WHICH_SET_LAST, C_WHICH_SET_EXIT.format(exit=exit_word)) \
+        if exit_word else C_Q_WHICH_SET
+    out__q_which_set = text.format(titles=titles_block, menu=menu)
     return out__q_which_set
 def which_set_lead() -> str:
     """Зачин каждого варианта выбора набора: общий разгон, точка расхождения — имя набора в
